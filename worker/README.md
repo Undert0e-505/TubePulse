@@ -1,6 +1,6 @@
 # TubePulse — Cloud Services
 
-This document describes the TubePulse backend: the two Cloudflare Workers, the Cloudflare KV store, the YouTube Data API surface we use, and the Firebase Cloud Messaging integration. For the current endpoint, cron, KV, notification, and known-drift inventory, start with [CONTRACTS.md](CONTRACTS.md). Live API route state was last verified on 2026-06-25; review Cloudflare settings before changing routing. The Android app is documented separately in the project root README.
+This document describes the TubePulse backend: the HTTP API Worker, five active scheduled Workers, the shared Cloudflare KV store, YouTube integrations, and Firebase Cloud Messaging. For the current endpoint, trigger, KV, notification, and deployment inventory, start with [CONTRACTS.md](CONTRACTS.md). The Android app is documented separately in the project root README.
 
 ---
 
@@ -11,11 +11,11 @@ This document describes the TubePulse backend: the two Cloudflare Workers, the C
                                                 │     YouTube RSS feed        │
                                                 │  (free, no auth, no quota)  │
                                                 └──────────────┬──────────────┘
-                                                               │ every 5 min
+                                                               │ rotating poll
                                                                ▼
 ┌────────────┐     HTTPS     ┌────────────────────┐    fan-out    ┌────────────────────┐
-│ Android    │──────────────▶│ tubepulse-api      │◀──────────────│ tubepulse-cron     │
-│ app        │               │ (Cloudflare Worker)│               │ (Cloudflare Worker)│
+│ Android    │──────────────▶│ tubepulse-api      │◀──────────────│ RSS/posts/aux      │
+│ app        │               │ (Cloudflare Worker)│               │ scheduled Workers  │
 │            │◀── FCM push ──│                    │── FCM v1 API ─▶│ YouTube Data API   │
 └────────────┘               └────────┬───────────┘               │ (subscribe-time    │
                                      │                           │  only, 1-2 units)  │
@@ -27,61 +27,59 @@ This document describes the TubePulse backend: the two Cloudflare Workers, the C
                                        ▲
                                        │ same KV
                                        │
-                            ┌──────────┴──────┐
-                            │ tubepulse-cron  │
-                            │ (also reads/writes same KV)
-                            └─────────────────┘
+                            ┌──────────┴──────────┐
+                            │ five active workers │
+                            │ (same shared KV)    │
+                            └─────────────────────┘
 ```
 
-**Two workers, one KV namespace, one Firebase project.**
+**One API Worker, five scheduled Workers, one KV namespace, one Firebase project.**
 
 | Component | Repo path/config | Purpose | Route/deploy evidence |
 |-----------|------------------|---------|-----------------------|
 | `tubepulse-api` | `worker/tubepulse-api/` | Current live app-facing API worker source + dormant WebSub callback | `GET /` at `https://tubepulse-api.jimothyoakley55.workers.dev` returned Cloudflare-served health JSON on 2026-06-25. Wrangler route comments are stale/incomplete. |
-| `tubepulse-cron` | `worker/tubepulse-cron/` | Scheduled jobs (every 5 min): upcoming-events drain, prewarn, RSS poll, community posts, nag cycle, WebSub lease renewal | `wrangler.toml` has `triggers.crons = ["*/5 * * * *"]`; no `fetch()` handler is expected. |
+| `tubepulse-rss-0/1/2` | `worker/tubepulse-rss-{0,1,2}/` | Time-derived RSS shards; one channel per active shard per minute | One-minute triggers, distinct shard indexes, no HTTP handlers. |
+| `tubepulse-posts` | `worker/tubepulse-posts/` | Rotating community-post poller; one eligible channel per invocation | One-minute trigger; with six channels each is selected approximately hourly. |
+| `tubepulse-aux` | `worker/tubepulse-aux/` | Bounded nag/prewarn processing and legacy upcoming-bucket drain | One-minute trigger; no HTTP handler. |
+| `tubepulse-cron` | `worker/tubepulse-cron/` | Retired compatibility stub | Deliberate no-op with `triggers.crons = []`; do not deploy it as the active scheduler. |
 | `tubepulse-resolver` | `worker/archive/tubepulse-resolver/` | Historical standalone resolver worker | Archived for reference only; do not deploy unless deliberately restoring historical resolver behaviour. |
-| `TUBEPULSE_KV` | KV namespace `52e77ca9f5f6493e89d2478c8d3055ec` | All current API/cron persistent state | Shared by `tubepulse-api` and `tubepulse-cron` configs. |
+| `TUBEPULSE_KV` | KV namespace `52e77ca9f5f6493e89d2478c8d3055ec` | All current backend persistent state | Shared by the API and all five scheduled workers. |
 
 > **Verified route:** on 2026-06-25, `GET /` at the app API URL returned `200 OK` with `{"status":"ok","version":"3.0.0","worker":"tubepulse-api","architecture":"channel-first"}`. The health `version` is an API worker label and appears stale or independent from the app release version `3.3.3`. `worker/tubepulse-api/wrangler.toml` has no explicit route setting and still contains a stale/incomplete "No HTTP routes" comment.
 
-The two workers share the **same KV namespace** so they can read each other's writes. The cron writes `channel:{id}:recent` and `channel:{id}:meta`; the API reads them when serving `/feed`.
+The active workers share the **same KV namespace** so scheduled workers can update state that the API reads when serving `/feed`.
 
 ---
 
-## 2. Why two workers, not one?
+## 2. Why split scheduled workers?
 
-The cron worker is `scheduled`-trigger only — it has no `fetch()` handler. This is deliberate:
+The scheduled workers have no `fetch()` handler. This is deliberate:
 
 - **No public HTTP surface** — no attack surface, no auth concerns
-- **Different scaling profile** — the cron is a CPU-bound fan-out over all subscribers, the API is request/response. They have different failure modes.
-- **Independent deploy cadence** — the cron changes more often (new RSS parsing logic, throttling tweaks) than the API. Keeping them separate means less risk of breaking one while changing the other.
+- **Free-tier CPU bounds** — each invocation performs one RSS/post channel or a bounded aux batch rather than one large combined scan.
+- **Independent deploy cadence** — RSS, posts, aux, and API changes can be deployed separately.
 
-Both workers use the same KV namespace, so the cron can write state that the API reads directly.
+All scheduled workers use the same KV namespace, so they can write state that the API reads directly.
 
 ---
 
-## 3. The cron worker
+## 3. Scheduled workers
 
-`worker/tubepulse-cron/index.js` - scheduled/background worker source. Line counts in older notes may be stale; check the file directly when needed.
+The active entry points are `worker/tubepulse-rss-0/1/2/index.js`, `worker/tubepulse-posts/index.js`, and `worker/tubepulse-aux/index.js`. Shared runtime helpers live in `worker/tubepulse-cron/shared.mjs`; `worker/tubepulse-cron/index.js` itself is a retired no-op.
 
-**Schedule:** `*/5 * * * *` (every 5 minutes), configured in `wrangler.toml`.
+**Schedule:** all five active workers use `* * * * *` (every minute).
 
 See [CONTRACTS.md](CONTRACTS.md) for the active worker contract/inventory reference before changing worker behavior.
 
-The worker has **one** `scheduled()` handler that dispatches to six jobs based on the current minute:
-
-| # | Job | Trigger | Function | What it does |
-|---|-----|---------|----------|--------------|
-| 1 | Upcoming-events drain | every 5 min | `runUpcomingCron` | Reads `upcoming:{bucket}` for the current 5-min window and deletes it. **Drain-only since v3.1** — clears any pre-v3.1 bucket entries so the old "going live in 30 minutes" / "is live now!" pushes cannot fire for events scheduled before the upgrade. No new pushes are written to buckets. |
-| 2 | Prewarn (v3.1) | every 5 min | `runPrewarnCron` | Iterates `upcoming:events:list` and fires a per-device "going live soon" FCM push when each device's prewarn window opens. The prewarn offset is per-device: per-channel override → global setting → default 60 min. Sent state tracked in `upcoming:prewarn:{videoId}:{deviceId}` to prevent double-send. Events pruned 24 h after `scheduledFor`. |
-| 3 | RSS poll | every 5 min | `runRssPollCron` | Reads `channels:active`, fetches the RSS feed for each channel, diffs against `channel:{id}:recent`. New videos → FCM fan-out. **Active new-video detection path** since the 2024 WebSub hub shutdown. |
-| 4 | Community posts (v3.1) | every hour (`mins === 0`) | `runCommunityPostsCron` | Polls YouTube InnerTube `youtubei/v1/browse` Posts tab for each channel in `channels:active`. Captures text, image, and poll community posts. First-run guard populates the recent list without firing notifications. Cost: 0 YouTube Data API units (InnerTube is free). When `TUBEPULSE_ENABLE_COMMUNITY_POSTS` is enabled and `TUBEPULSE_COMMUNITY_POST_CHANNEL_ALLOWLIST` is missing/blank, all active channels are polled. A non-empty allowlist narrows polling to listed channels only. |
-| 5 | Nag cycle | every 5 min | `runNagCron` | Timestamp-based nag system. On every 5-min cron tick, iterates all active channels and their subscribers. For each subscriber with unwatched items, checks `state.lastNagAt` against the device's nag interval. If enough time has passed, sends an FCM reminder push and updates `lastNagAt`/`nagCount`. Replaces the old 15-min bucket system (which was broken for sub-15-min intervals). |
-| 6 | Lease renewal | every 6 h | `runLeaseCron` | **Dormant no-op** — Google's PubSubHubbub hub was shut down in 2024. Code path remains for future revival. |
+| Worker | Selection/work |
+|---|---|
+| RSS 0/1/2 | Sort `channels:active`, choose the active shard count (one per five channels, up to three), then rotate one channel per shard using the current minute. A durable known-video watermark prevents deletion/restoration notification cascades. |
+| Posts | Filter active channels through the optional allowlist and use minute-derived spacing to select one channel. First-poll seeding sends no notification. |
+| Aux | Drain one legacy upcoming bucket, process at most five `nag:active` entries, then check prewarns when no nag fired. |
 
 ### 3.1 RSS poll — the active new-video detection path
 
-Since WebSub hub shutdown, the cron detects new videos by polling YouTube's public RSS feed:
+Since WebSub hub shutdown, the RSS shards detect new videos by polling YouTube's public RSS feed:
 
 ```
 https://www.youtube.com/feeds/videos.xml?channel_id=UCxxxxxxxxxxxxxxxxxxxxxx
@@ -89,10 +87,10 @@ https://www.youtube.com/feeds/videos.xml?channel_id=UCxxxxxxxxxxxxxxxxxxxxxx
 
 Each entry in the Atom feed carries: `videoId`, `title`, `publishedAt`, `thumbnail`, `link`, **view count** (from `media:community/media:statistics/@_views`), **like count** (from `media:starRating/@_count`), and **dislike count** (from `media:statistics/@_dislikes` — usually `0` for public videos since YouTube removed public dislike counts in Nov 2021; the field is still captured for completeness).
 
-**Flow per channel per tick:**
+**Flow for the selected channel:**
 
-1. Read `channels:active` (KV list)
-2. For each channelId:
+1. Read `channels:active` and select this shard's channel for the current minute.
+2. For that channelId:
    - GET the RSS feed (with `User-Agent` + `SOCS` cookie to bypass the EU/UK consent wall)
    - Parse with a regex-based Atom parser (no XML library needed in the worker)
    - Read `channel:{id}:recent` from KV
@@ -112,7 +110,7 @@ For each new video, the cron does the standard fan-out (which is identical to wh
    - Skip if muted via override, or if DND is active and the override doesn't bypass it
    - Sign a JWT using the Firebase service account, exchange for an OAuth token, POST to `fcm.googleapis.com/v1/projects/{projectId}/messages:send`
 3. Update `device:{id}:state:{channelId}` with the new `unwatched` list
-4. Nag scheduling is handled by `runNagCron` in the cron worker (timestamp-based, every 5 min) — the RSS poller no longer pre-schedules nags into buckets.
+4. Nag scheduling is handled by the aux worker's timestamp-based bounded processor; RSS adds newly unread channel/device pairs to `nag:active`.
 
 ---
 
@@ -152,7 +150,7 @@ When a new device subscribes to a channel, the API worker does **the only work t
 4. Add the channel to `channels:active` (if this device is the first subscriber)
 5. Try a dormant WebSub subscription (no quota cost, just a POST that 404s — kept for future hub revival)
 
-**The YouTube Data API is called at most once per new channel** (the avatar resolve, on the very first subscribe for that channel). After that, all writes to `channel:{id}:meta` and `channel:{id}:recent` come from the cron worker via RSS, which costs 0 quota units.
+**The YouTube Data API is called at most once per new channel** (the avatar resolve, on the very first subscribe for that channel). After that, RSS shard Workers refresh `channel:{id}:meta` and `channel:{id}:recent` at zero quota cost.
 
 ### 4.3 WebSub (dormant)
 
@@ -339,13 +337,13 @@ KV writes are the primary budget concern. The free tier allows 1,000 writes/day 
 
 | Worker | Invocations/day | CPU per | Notes |
 |--------|-----------------|---------|-------|
-| `tubepulse-cron` (scheduled) | 288 | ~3ms | Every 5 min, ~2.7s wall for 8 channels in the actual test |
+| RSS/posts/aux scheduled workers | One invocation/worker/minute | Bounded | One RSS/post channel or bounded aux batch per invocation |
 | `tubepulse-api` (HTTP) | ~20-50 | ~5ms | Depends on app open frequency and action count |
 
 ### 6.3 Cloudflare KV (free tier: 100K reads, 1K writes, 1K list, 1GB storage)
 
 **Reads per day (1 user, 4 channels):**
-- Cron: 1 `channels:active` + 4 `channel:{id}:recent` + 1 `upcoming:{bucket}` per 5 min = 6 × 288 = **1,728 reads/day** (nag cron now iterates channels/subscribers directly, no bucket reads)
+- Scheduled workers: each RSS tick reads `channels:active` and one selected channel; posts reads the active set and one selected channel; aux performs a bounded nag/prewarn batch. Exact reads depend on subscriptions and due work.
 - API (per app open): 4 `channel:{id}:*` reads × 4 channels = 16 reads × 20 opens = **320 reads/day**
 - **Total: ~2,400 reads/day = 2.4% of free tier**
 
@@ -361,7 +359,7 @@ KV writes are the primary budget concern. The free tier allows 1,000 writes/day 
 
 ### 6.4 Engagement-metric write throttle (since v3.0.18, refined v3.1)
 
-Originally, the cron re-stamped view counts on every video in the recent list on every 5-min tick, causing **~576 writes/day for 4 channels** — about 58% of the free tier just for view counts.
+Originally, the combined cron re-stamped view counts on every video in the recent list on every tick, causing excessive writes.
 
 New policy:
 - Only the **latest video's** view count is considered for writes
@@ -370,13 +368,13 @@ New policy:
 - Prior videos (index 1-14) keep their last-stored view counts — view counts are slightly stale on older videos, which is fine because the newest video is the one the user actually looks at
 - **v3.1**: likes and dislikes follow the same hourly top-of-list rule but with a **stricter** threshold (any change) — they're useful at any scale, so we don't wait for a 5% swing
 
-Net effect: cron writes drop from ~576/day to ~96/day worst case, often much less.
+Net effect: engagement writes are bounded to at most one latest-video refresh per channel per hour, and are often much lower.
 
 ---
 
 ## 7. Firebase Cloud Messaging (FCM)
 
-The API worker uses FCM v1 HTTP API to push notifications. The cron worker does the same for new-video fan-out.
+The API and scheduled workers use FCM v1 HTTP API for notification fan-out.
 
 **Required secret:** `FIREBASE_SERVICE_ACCOUNT` (JSON blob stored in Cloudflare Workers secret manager). This is the Firebase service account key — `secrets/fcm-service-account.json` in the local repo (gitignored).
 
@@ -412,7 +410,7 @@ The API worker uses FCM v1 HTTP API to push notifications. The cron worker does 
 ### 8.1 Running a worker locally
 
 ```bash
-# In worker/tubepulse-api/ or worker/tubepulse-cron/
+# In one worker directory
 source ../../secrets/load-secrets.sh   # sets CLOUDFLARE_* and YOUTUBE_API_KEY
 npx wrangler dev                       # starts local miniflare on port 8787
 ```
@@ -424,28 +422,34 @@ The local miniflare has its own KV simulator. The state is cached in `worker/*/.
 ### 8.2 Deploying to production
 
 ```bash
-cd worker/tubepulse-cron
-source ../../secrets/load-secrets.sh
-npx wrangler deploy
+source secrets/load-secrets.sh
+for worker in tubepulse-rss-0 tubepulse-rss-1 tubepulse-rss-2 tubepulse-posts tubepulse-aux; do
+  (cd "worker/$worker" && npx wrangler deploy)
+done
 ```
 
-This uploads the worker and triggers a redeploy. The `triggers.crons` config in `wrangler.toml` controls the schedule.
+Deploy only affected workers during ordinary changes. The loop is the full scheduled-worker rollout. Each `triggers.crons` entry controls that worker's schedule; `tubepulse-cron` deliberately has none.
 
 ### 8.3 Pushing secrets to a worker
 
 ```bash
 ./secrets/set-worker-secrets.sh tubepulse-api
-./secrets/set-worker-secrets.sh tubepulse-cron
+./secrets/set-worker-secrets.sh tubepulse-rss-0
+./secrets/set-worker-secrets.sh tubepulse-rss-1
+./secrets/set-worker-secrets.sh tubepulse-rss-2
+./secrets/set-worker-secrets.sh tubepulse-posts
+./secrets/set-worker-secrets.sh tubepulse-aux
 ```
 
-This pushes `YOUTUBE_API_KEY` and `FIREBASE_SERVICE_ACCOUNT` to the worker's secret manager via `wrangler secret put`. Run it once on initial setup and again any time those secrets change.
+This pushes the secrets required by each worker via `wrangler secret put`. The API uses `YOUTUBE_API_KEY` and Firebase credentials; RSS, posts, and aux require Firebase credentials for notification paths.
 
 ### 8.4 Tailing live logs
 
 ```bash
-cd worker/tubepulse-cron
-source ../../secrets/load-secrets.sh
-npx wrangler tail
+source secrets/load-secrets.sh
+npx wrangler tail tubepulse-rss-0
+npx wrangler tail tubepulse-posts
+npx wrangler tail tubepulse-aux
 ```
 
 Live-streamed logs from the deployed worker. Useful for watching a cron tick fire or debugging an FCM error.
@@ -463,17 +467,16 @@ Live-streamed logs from the deployed worker. Useful for watching a cron tick fir
 
 ### Adding a new scheduled job
 
-1. Add the function in `worker/tubepulse-cron/index.js` (e.g. `runXxxCron(env)`)
-2. Add a `if (mins % N === 0) { results.xxx = await runXxxCron(env); }` block in the main `scheduled()` handler
-3. Test by tailing and waiting for the next matching tick
-4. Deploy with `npx wrangler deploy`
+1. Add the bounded job to the appropriate RSS, posts, or aux worker; keep the retired `tubepulse-cron/index.js` unchanged.
+2. Update that worker's `scheduled()` handler and focused tests.
+3. Run `npm run check:workers`, deploy only that worker, then verify a Cron Event or bounded live tail.
 
 ### Rotating the FCM service account
 
 1. Generate a new key in the Firebase console: `https://console.firebase.google.com/project/tubepulse-470a1/settings/serviceaccounts/adminsdk`
 2. Save the new JSON to `secrets/fcm-service-account.json` (overwrite)
 3. Verify the new key is the right size: `node -e "const k=JSON.parse(require('fs').readFileSync('secrets/fcm-service-account.json','utf8')); const b=Buffer.from(k.private_key.replace(/-----[^-]+-----|\n/g,''),'base64'); console.log('PKCS8 DER bytes:', b.length);"` — should print `1217`. Anything else is corrupted.
-4. Push: `./secrets/set-worker-secrets.sh tubepulse-api && ./secrets/set-worker-secrets.sh tubepulse-cron`
+4. Push the replacement to `tubepulse-api`, RSS 0/1/2, posts, and aux using `set-worker-secrets.sh`.
 5. Test by triggering a push (next cron tick with a new video, or manually: `curl or invoke the configured API route only after verifying live Cloudflare route state; otherwise use `wrangler dev` for local testing)
 
 ### Debugging KV state
@@ -507,12 +510,16 @@ worker/
 ├── README.md                  ← you are here
 ├── archive/
 │   └── tubepulse-resolver/    ← legacy resolver worker archive; reference only
-├── tubepulse-api/
-│   ├── index.js               ← API worker source (line count may be stale)
-│   └── wrangler.toml          ← deployment config
+├── tubepulse-api/             ← app-facing HTTP worker
+├── tubepulse-rss-0/           ← active RSS shard 0
+├── tubepulse-rss-1/           ← active RSS shard 1
+├── tubepulse-rss-2/           ← active RSS shard 2
+├── tubepulse-posts/           ← active community-post worker
+├── tubepulse-aux/             ← active nag/prewarn worker
 └── tubepulse-cron/
-    ├── index.js               ← cron worker source (line count may be stale)
-    └── wrangler.toml          ← deployment config
+    ├── index.js               ← retired no-op entrypoint
+    ├── shared.mjs             ← shared scheduled-worker helpers
+    └── wrangler.toml          ← no Cron Trigger
 
 secrets/                       ← live credentials, ALL gitignored
 ├── cloudflare.env             ← CF account ID + API token
@@ -562,9 +569,9 @@ async function cleanupDeadDevice(deviceId, env, reason)
 
 **Why no time-based expiry for unused channels?** Same reason — the user might be on holiday, between projects, or temporarily using a different device. The KV cost of a few hundred cached channels is negligible; the user-experience cost of "I came back and my watch list is empty" is high.
 
-**Where the helpers live:** `cleanupDeadChannel` and `cleanupDeadDevice` are defined in **both** `worker/tubepulse-api/index.js` and `worker/tubepulse-cron/index.js`. The API-worker copy is for the WebSub push path; the cron-worker copy is for the three scheduled jobs (`runRssPollCron`, `runNagCron`, `runUpcomingCron`). The cron copy uses the `deleteKV` wrapper so deletes count toward the worker's `kvOps` totals (§6.3).
+**Where the helpers live:** the API retains its WebSub-path cleanup implementation; scheduled workers import shared cleanup helpers from `worker/tubepulse-cron/shared.mjs`.
 
-**Idempotency and races:** `kv.delete()` is a no-op on missing keys. If both workers detect the same dead device in the same window (e.g. WebSub push and a 5-min cron tick both call `cleanupDeadDevice` for the same `deviceId`), the second call is essentially free — a few extra reads, a few no-op deletes, no data corruption. The worst case is a small amount of double-counted KV ops in the wrangler tail.
+**Idempotency and races:** `kv.delete()` is a no-op on missing keys. If the API and a scheduled worker detect the same dead device in the same window, the second cleanup performs a few extra reads and no-op deletes without corrupting state.
 
 **Log format:** every cleanup emits a single structured line. Watch for sudden spikes — >5 cleanups in a day usually means an app-version bug, a mass uninstall, or someone manually nuking test devices:
 

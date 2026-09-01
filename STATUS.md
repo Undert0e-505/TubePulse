@@ -1,6 +1,6 @@
 # TubePulse - Project Status
 
-**Last updated:** 2026-06-27
+**Last updated:** 2026-09-01
 **Current repo branch:** `master`
 **Current app version in repo:** `3.3.1`
 **Android versionCode/versionName in repo:** `331` / `3.3.1`
@@ -22,7 +22,7 @@ Repo evidence as of this document update:
 | API base URL | `src/utils/api.js` points to `https://tubepulse-api.jimothyoakley55.workers.dev`; live `GET /` verified reachable on 2026-06-25 |
 | Release script | `build-and-release.ps1` is the current local release path |
 | API worker config | `worker/tubepulse-api/wrangler.toml` defines worker `tubepulse-api`, KV namespace `52e77ca9f5f6493e89d2478c8d3055ec`; its route comment is stale/incomplete because live `workers.dev` is reachable |
-| Cron worker config | `worker/tubepulse-cron/wrangler.toml` defines worker `tubepulse-cron`, the same KV namespace, and cron `*/5 * * * *` |
+| Scheduled worker configs | `worker/tubepulse-rss-0/1/2`, `worker/tubepulse-posts`, and `worker/tubepulse-aux` share the production KV namespace and run every minute; `worker/tubepulse-cron` is a retired no-op with no trigger |
 | Legacy resolver archive | `worker/archive/tubepulse-resolver/` preserves the old `tubepulse-resolver` source/config for reference only |
 
 Live route verification on 2026-06-25 confirmed Cloudflare serves the app-facing API at `https://tubepulse-api.jimothyoakley55.workers.dev/`. Old notes claiming the `workers.dev` API route is unreachable are stale.
@@ -31,11 +31,16 @@ Live route verification on 2026-06-25 confirmed Cloudflare serves the app-facing
 
 ## Worker Deployment Status
 
-Last worker deploy recorded: 2026-06-25.
+The five active scheduled workers were restored and redeployed on 2026-09-01 after stale Cron Trigger records stopped dispatching. Current deployment IDs and post-deploy invocation evidence are recorded below.
 
 | Worker | Deployment state |
 |---|---|
-| `tubepulse-cron` | Deployed on 2026-06-25 at `2026-06-25T14:04:54.907Z` to Cloudflare account `77bb7769185bbfeb53feef16b9f72803`; worker version ID `7b2900aa-6c8b-4116-a3e6-56d53d1004e1`; upload `40.07 KiB` / gzip `9.65 KiB`; binding `TUBEPULSE_KV` namespace `52e77ca9f5f6493e89d2478c8d3055ec`; trigger `*/5 * * * *`. This deploy included the cron-only runtime fixes for normalized FCM notification payloads and aligned cron cleanup helper key deletion. |
+| `tubepulse-rss-0` | Version `3a9dbd8e-a8f0-4865-8099-92b3a3317d28`; one-minute trigger created at `2026-09-01T14:59:05Z`; scheduled invocation and channel processing verified at `15:33:18Z`. |
+| `tubepulse-rss-1` | Version `c0042cf4-924d-4af7-8e85-6f69c1f5a8f1`; one-minute trigger created at `2026-09-01T15:02:09Z`; scheduled invocation and channel processing verified at `15:33:20Z`. |
+| `tubepulse-rss-2` | Version `f8edb715-8610-4743-9dce-4b77e26ad884`; one-minute trigger created at `2026-09-01T15:02:21Z`; successful scheduled invocation verified at `15:33:20Z` (expected early return while six channels require only two active shards). |
+| `tubepulse-posts` | Version `ed33187c-9c79-4fa7-b215-72194117feb6`; one-minute trigger created at `2026-09-01T15:02:34Z`; scheduled invocation and channel processing verified at `15:33:20Z`; community-post gate enabled. |
+| `tubepulse-aux` | Version `ea9347cf-67db-4a49-a8d6-7bd671cedd08`; one-minute trigger created at `2026-09-01T15:02:46Z`; successful scheduled invocation verified at `15:32:20Z`; shared KV and Firebase secret preserved. |
+| `tubepulse-cron` | Retired no-op retained under its historical name with `crons = []`. |
 | `tubepulse-api` | Not deployed as part of the 2026-06-25 cron worker deployment. |
 | `worker/archive/tubepulse-resolver` | Not deployed; archive remains reference-only. |
 
@@ -54,7 +59,10 @@ Community-post worker/app support is enabled only when `TUBEPULSE_ENABLE_COMMUNI
 | Native Android project | `android/` | Expo prebuild/native Android support, widget receiver/resources, release APK build target |
 | Release script | `build-and-release.ps1` | Windows-native local APK build/sign/copy, version bump, commit/push, GitHub release creation/upload |
 | API worker | `worker/tubepulse-api/` | App-facing HTTP API worker in source: register, subscribe/unsubscribe, feed, resolve, bootstrap, settings, seen, dormant WebSub endpoints |
-| Cron worker | `worker/tubepulse-cron/` | Scheduled/background worker: RSS polling, nag/prewarn/background jobs, FCM fan-out paths, shared KV state |
+| RSS shard workers | `worker/tubepulse-rss-0/`, `worker/tubepulse-rss-1/`, `worker/tubepulse-rss-2/` | Rotating RSS polling and video notification fan-out |
+| Posts worker | `worker/tubepulse-posts/` | Rotating community-post polling and notification fan-out |
+| Aux worker | `worker/tubepulse-aux/` | Bounded nag/prewarn work and legacy upcoming-bucket drain |
+| Retired cron stub | `worker/tubepulse-cron/index.js` | No-op compatibility deployment; shared helpers remain in `shared.mjs` |
 | Legacy resolver archive | `worker/archive/tubepulse-resolver/` | Historical standalone resolver worker (`tubepulse-resolver`), superseded by `worker/tubepulse-api` `/resolve`; reference only |
 
 ---
@@ -102,9 +110,9 @@ Known risks and the intended safer target flow are documented in [RELEASE.md](RE
 
 ## Current Backend Summary
 
-- Video detection is cron-driven via YouTube RSS polling.
+- Video detection is driven by the three minute-scheduled rotating RSS shard Workers.
 - YouTube Data API usage is intended for handle/channel resolution and avatar/bootstrap fallback paths. Community-post cron polling uses the isolated InnerTube latest-post helper and remains inert unless the global community-post gate is enabled. When enabled, it polls active subscribed channels; a non-empty allowlist can narrow that set.
-- API and cron workers share the same KV namespace according to their wrangler configs.
+- API and all five active scheduled workers share the same KV namespace according to their wrangler configs.
 - WebSub code remains present but should be treated as dormant unless live verification proves otherwise.
 - KV schema and helper logic are duplicated between worker files and have known drift; see [worker/CONTRACTS.md](worker/CONTRACTS.md) before changing worker behavior.
 

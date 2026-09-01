@@ -9,7 +9,7 @@ import {
 } from './community-posts.mjs';
 
 import {
-  key, getKV, putKV, putKVIfChanged, stableSort,
+  key, getKV, putKV, putKVIfChanged, selectCommunityPostWork,
   isDndActive, getCachedFcmAccessToken, sendFCMPush, cleanupDeadDevice,
   addToNagActive, removeFromNagActive,
   getCommunityPostSeenId, getCachedCommunityPostIds,
@@ -33,18 +33,15 @@ export default {
     const allowlist = parseCommunityPostChannelAllowlist(env);
     const allowlistEnabled = allowlist.size > 0;
     const active = await getKV(env.TUBEPULSE_KV, key.channelsActive()) || [];
-    const channels = stableSort(
-      active.filter((ch) => !allowlistEnabled || allowlist.has(ch))
-    );
-    if (channels.length === 0) return;
-
-    const stepMinutes = Math.max(3, Math.floor(60 / channels.length));
     const minuteSlot = Math.floor(Date.now() / 60000);
-    const channelIndex = Math.floor(minuteSlot / stepMinutes) % channels.length;
-    const channelId = channels[channelIndex];
+    const work = selectCommunityPostWork(
+      active.filter((ch) => !allowlistEnabled || allowlist.has(ch)),
+      minuteSlot,
+    );
+    if (!work) return;
 
-    console.log(`[Posts] channel=${channelId} (${channelIndex + 1}/${channels.length}) step=${stepMinutes}m`);
-    await pollSingleCommunityChannel(env, ctx, channelId, isCommunityPostsDebugEnabled(env));
+    console.log(`[Posts] channel=${work.channelId} (${work.channelIndex + 1}/${work.channelCount}) step=${work.stepMinutes}m`);
+    await pollSingleCommunityChannel(env, ctx, work.channelId, isCommunityPostsDebugEnabled(env));
   },
 };
 

@@ -2,7 +2,7 @@
 // Scheduled every minute. Each shard processes one channel from its slice.
 
 import {
-  key, getKV, putKV, putKVIfChanged, stableSort,
+  key, getKV, putKV, putKVIfChanged, selectRssShardWork,
   fetchChannelRSS, classifyVideo, isDndActive,
   getCachedFcmAccessToken, sendFCMPush, cleanupDeadDevice,
   addToNagActive,
@@ -19,18 +19,12 @@ export default {
     const active = await getKV(env.TUBEPULSE_KV, key.channelsActive()) || [];
     if (active.length === 0) return;
 
-    const channels = stableSort(active);
-    const activeShardCount = Math.min(maxShards, Math.max(1, Math.ceil(channels.length / 5)));
-    if (shardIndex >= activeShardCount) return;
-
-    const shardChannels = channels.filter((_, i) => i % activeShardCount === shardIndex);
-    if (shardChannels.length === 0) return;
-
     const minuteSlot = Math.floor(Date.now() / 60000);
-    const channel = shardChannels[minuteSlot % shardChannels.length];
+    const work = selectRssShardWork(active, shardIndex, maxShards, minuteSlot);
+    if (!work) return;
 
-    console.log(`[RSS] shard=${shardIndex}/${activeShardCount} channel=${channel}`);
-    await pollSingleRssChannel(env, ctx, channel);
+    console.log(`[RSS] shard=${shardIndex}/${work.activeShardCount} channel=${work.channelId}`);
+    await pollSingleRssChannel(env, ctx, work.channelId);
   },
 };
 

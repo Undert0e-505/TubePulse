@@ -1,9 +1,9 @@
 # Active Worker Contracts
 
-**Last updated:** 2026-06-28
+**Last updated:** 2026-09-01
 **Status:** Current-state inventory for the active Cloudflare Workers. This document records observed contracts, coupling, and known drift. It is not a refactor plan, and it does not imply that every behavior described here is ideal.
 
-Use this file before changing `worker/tubepulse-api/` or `worker/tubepulse-cron/`. If code changes alter endpoint behavior, KV keys, notification payloads, cron cadence, bindings, or deployment assumptions, update this contract in the same commit.
+Use this file before changing `worker/tubepulse-api/` or any active scheduled worker. If code changes alter endpoint behavior, KV keys, notification payloads, cron cadence, bindings, or deployment assumptions, update this contract in the same commit.
 
 ---
 
@@ -12,15 +12,18 @@ Use this file before changing `worker/tubepulse-api/` or `worker/tubepulse-cron/
 | Worker | Path | Role | Trigger type | KV binding | KV namespace | Deployment note |
 |---|---|---|---|---|---|---|
 | `tubepulse-api` | `worker/tubepulse-api/` | Live app-facing REST API plus dormant WebSub callback endpoints | HTTP `fetch` | `TUBEPULSE_KV` | `52e77ca9f5f6493e89d2478c8d3055ec` | Live `workers.dev` route was verified on 2026-06-25. `GET /` identifies `worker: "tubepulse-api"`. Wrangler config has no explicit route and contains a stale/incomplete route comment. |
-| `tubepulse-cron` | `worker/tubepulse-cron/` | Scheduled/background worker for RSS polling, prewarns, nags, community posts, and stale bucket drain | Cloudflare scheduled event, `*/5 * * * *` | `TUBEPULSE_KV` | `52e77ca9f5f6493e89d2478c8d3055ec` | Scheduled-only worker. No public HTTP handler is expected. Deployed on 2026-06-28; cron worker version ID `3fdba5e2-3be9-4e37-b82e-beb108fffe65`. |
+| `tubepulse-rss-0/1/2` | `worker/tubepulse-rss-{0,1,2}/` | RSS/video detection shards; one selected channel per active shard per tick | Cloudflare scheduled event, `* * * * *` | `TUBEPULSE_KV` | `52e77ca9f5f6493e89d2478c8d3055ec` | Scheduled-only. Distinct `RSS_SHARD_INDEX`; durable `known:videos` watermark prevents deletion cascades. |
+| `tubepulse-posts` | `worker/tubepulse-posts/` | Time-rotated community-post polling | Cloudflare scheduled event, `* * * * *` | `TUBEPULSE_KV` | `52e77ca9f5f6493e89d2478c8d3055ec` | Selects one eligible channel per tick and spaces selections across an hour. |
+| `tubepulse-aux` | `worker/tubepulse-aux/` | Bounded nag/prewarn work and legacy bucket drain | Cloudflare scheduled event, `* * * * *` | `TUBEPULSE_KV` | `52e77ca9f5f6493e89d2478c8d3055ec` | Processes at most five nag entries per invocation. |
+| `tubepulse-cron` | `worker/tubepulse-cron/` | Retired compatibility stub; shared helpers remain in `shared.mjs` | None (`crons = []`) | `TUBEPULSE_KV` | `52e77ca9f5f6493e89d2478c8d3055ec` | Deliberate no-op. Never use as the active background deployment target. |
 
-Both active workers use `compatibility_date = "2025-04-01"` and Cloudflare account `77bb7769185bbfeb53feef16b9f72803` in their wrangler configs.
+All active workers use `compatibility_date = "2025-04-01"` and Cloudflare account `77bb7769185bbfeb53feef16b9f72803` in their wrangler configs.
 
-Community-post runtime behavior is behind `TUBEPULSE_ENABLE_COMMUNITY_POSTS`. The feature is enabled only when the value is `1`, `true`, or `yes` after trimming and lowercasing. Missing or any other value means disabled. Do not set this variable to true in production config until the community-post contract is deliberately re-enabled.
+Community-post runtime behavior is behind `TUBEPULSE_ENABLE_COMMUNITY_POSTS`. The production posts config currently enables it with `true`; missing or any value other than `1`, `true`, or `yes` disables it.
 
-Community-post runtime behavior is controlled by the global `TUBEPULSE_ENABLE_COMMUNITY_POSTS` kill switch. When enabled, community-post polling applies to all channel IDs in `channels:active`. `TUBEPULSE_COMMUNITY_POST_CHANNEL_ALLOWLIST` is an optional staged-rollout/debug narrowing control: when it contains channel IDs, only those active channels are polled; when it is missing or blank, all active channels are eligible. Do not set this variable in `wrangler.toml`.
+When enabled, community-post polling applies to all channel IDs in `channels:active`. `TUBEPULSE_COMMUNITY_POST_CHANNEL_ALLOWLIST` is an optional staged-rollout/debug narrowing control: a non-empty value restricts polling; missing or blank means all active channels are eligible.
 
-The API health endpoint currently returns `version: "3.0.0"`. App release evidence in the repo is `3.3.3` with Android `versionCode 337`. Treat these as separate labels until the worker health version is intentionally changed. The 2026-06-25 cron worker deployment did not deploy `tubepulse-api`, did not deploy the archived resolver, and did not change the app release/version.
+The API health endpoint currently returns `version: "3.0.0"`. App release evidence in the repo is `3.3.3` with Android `versionCode 337`. Treat these as separate labels until the worker health version is intentionally changed. The 2026-09-01 scheduled-worker repair did not deploy `tubepulse-api`, did not deploy the archived resolver, and did not change the app release/version.
 
 ## Archived Workers
 
@@ -44,9 +47,9 @@ The API health endpoint currently returns `version: "3.0.0"`. App release eviden
 | `POST` | `/settings` | Replace device-level notification settings. | Bearer deviceId | Writes `device:{id}:settings`. | None | Changes future notification filtering/nag/prewarn behavior. | Medium |
 | `POST` | `/channel-override` | Set or delete per-channel notification override. | Bearer deviceId | Writes or deletes `device:{id}:override:{channelId}`. | None | Changes future notification filtering/nag/prewarn/community-post behavior. | Medium |
 | `GET` | `/websub` | Dormant WebSub verification handshake. | None | Reads/writes/deletes `channel:{id}:websub`. | None | None | Dormant/Medium |
-| `POST` | `/websub` | Dormant WebSub push processing path. Parses feed XML, writes recent/meta/state, fans out FCM. No longer schedules nags (handled by `runNagCron` in cron worker). | HMAC when matching WebSub state exists | Reads/writes channel recent/meta/subscribers, device profile/settings/override/state, `upcoming:events:list`; can cleanup dead devices. | FCM; only called if a WebSub-compatible source posts to it. | Sends push notifications and can prune dead devices. | Dormant/High |
+| `POST` | `/websub` | Dormant WebSub push processing path. Parses feed XML, writes recent/meta/state, and fans out FCM. Nag processing is owned by `tubepulse-aux`. | HMAC when matching WebSub state exists | Reads/writes channel recent/meta/subscribers, device profile/settings/override/state, `upcoming:events:list`; can cleanup dead devices. | FCM; only called if a WebSub-compatible source posts to it. | Sends push notifications and can prune dead devices. | Dormant/High |
 
-Important exception: `/register` intentionally uses `KV.list({ prefix: 'device:' })` for slow-path FCM-token migration. Documentation should not claim zero `KV.list()` calls globally. The cron worker itself is designed not to call `KV.list()`.
+Important exception: `/register` intentionally uses `KV.list({ prefix: 'device:' })` for slow-path FCM-token migration. Documentation should not claim zero `KV.list()` calls globally. Active scheduled workers are designed not to call `KV.list()`.
 
 ---
 
@@ -54,12 +57,9 @@ Important exception: `/register` intentionally uses `KV.list({ prefix: 'device:'
 
 | Function | Cadence | Purpose | KV effects | External calls | FCM side effects | Risk | Notes |
 |---|---|---|---|---|---|---|---|
-| `runUpcomingCron` | Every 5 minutes | Drain legacy `upcoming:{bucket}` entries from the pre-v3.1 scheduled-live scheme. | Reads and deletes current `upcoming:{bucket}`. | None | None | Low | Drain-only. Does not send old live-soon/live-now pushes. |
-| `runPrewarnCron` | Every 5 minutes | Iterate `upcoming:events:list` and send per-device scheduled-live prewarns when each device's window opens. | Reads/writes `upcoming:events:list`, `upcoming:prewarn:{videoId}:{deviceId}`, channel meta/subscribers, device profile/settings/override; deletes stale prewarn keys. | FCM OAuth token exchange and message send. | Sends prewarn pushes; can cleanup dead devices. | High | Cron `sendFCMPush` accepts both flat `title`/`body` payloads and nested `notification.title`/`notification.body` payloads. This compatibility fix was deployed with cron worker version `7b2900aa-6c8b-4116-a3e6-56d53d1004e1` on 2026-06-25. |
-| `runRssPollCron` | Every 5 minutes | Active new-video detection via YouTube RSS for each `channels:active` channel. | Reads `channels:active`, channel recent/meta/subscribers, device profile/settings/override/state; writes channel recent/meta, device state, `upcoming:events:list`; can cleanup dead devices. No longer writes `nag:{bucket}` keys (nag scheduling is handled by `runNagCron`). | YouTube RSS; FCM OAuth/message send. | Sends upload/live pushes; can prune dead devices. | High | Primary detection path. |
-| `runNagCron` | Every 5 minutes | Timestamp-based nag system. Iterates `channels:active` → `channel:{id}:subscribers` → `device:{id}:state:{channelId}`. For each subscriber with unwatched items, checks `now - state.lastNagAt >= getNagIntervalMs(effective, state)`. If enough time has passed, sends an FCM reminder push and updates `state.lastNagAt`/`state.nagCount`. Relentless 5-min backs off to 15-min after 12 nags (1 hour). Chill uses 4-hour interval. No bucket KV keys are read or written. | Reads `channels:active`, `channel:{id}:subscribers`, `channel:{id}:meta`, `channel:{id}:recent`, `device:{id}:profile`, `device:{id}:settings`, `device:{id}:override:{channelId}`, `device:{id}:state:{channelId}`; writes `device:{id}:state:{channelId}` (lastNagAt, nagCount). | FCM OAuth token exchange and message send. | Sends reminder pushes; can cleanup dead devices. | High | Replaces the old 15-min bucket system. The old `nag:{bucket}` KV keys are no longer read or written by any code path. `nagCount`/`lastNagAt` are reset by `/seen` when `unwatched` becomes empty. |
-| `runCommunityPostsCron` | Hourly when `minute === 0`, only when `TUBEPULSE_ENABLE_COMMUNITY_POSTS` is enabled | Poll active channels via YouTube InnerTube browse Posts tab as latest-channel-post state. A non-empty `TUBEPULSE_COMMUNITY_POST_CHANNEL_ALLOWLIST` narrows polling to listed active channels; missing/blank allowlist means all active channels. First poll seeds latest only with no notification; same latest ID is a no-op/compact; no latest clears cached post state; changed latest IDs are compared against `channel:{id}:known:posts`; unknown IDs are treated as new and notify, known IDs are treated as rollback/restoration and suppress notification. | Disabled global gate: no KV reads/writes and no external calls. Enabled: reads `channels:active`, then eligible active channels' `channel:{id}:firstPollAt:posts`, posts, known post IDs, subscribers, profile/settings/override/state; writes latest post, first-poll marker, bounded known post ID list, and device state. Clearing or replacing cached posts removes only stale `post:*` IDs from subscriber `device:{id}:state:{channelId}.unwatched`; video IDs are preserved. | Disabled global gate: none. Enabled: InnerTube `youtubei/v1/browse` only for eligible active channels; no YouTube Data API `activities.list` use for community posts. | Disabled global gate: none. Enabled: sends community-post pushes only for unknown new canonical post IDs after the first-poll sentinel exists; rollback to known older post IDs is suppressed; notification titles use channel display metadata when available, then post author, then handle, then channel ID; reuses one FCM OAuth token per cron run; can cleanup dead devices. | High | Payload construction is compatible with cron `sendFCMPush`; the compatibility fix was deployed with cron worker version `7b2900aa-6c8b-4116-a3e6-56d53d1004e1` on 2026-06-25. Nag worker was last deployed on 2026-06-28 (version `3fdba5e2-3be9-4e37-b82e-beb108fffe65`) with timestamp-based nag scheduling and relentless 5-min backoff. |
-| `runLeaseCron` | Every 6 hours when `minute === 0 && hour % 6 === 0` | Calls `renewSubscriptions`. | Effectively none. | None in current implementation. | None | Low/Stale | `renewSubscriptions` is a no-op because the WebSub hub is believed defunct/dormant. |
+| RSS shard scheduled handler | Every minute per Worker | Select one channel from the active shard and run watermark-protected RSS detection. | Reads active/recent/known/meta/subscriber/device state; writes changed cache/watermark/device state and `nag:active`. | YouTube RSS; FCM only for new eligible content. | Sends upload/live pushes; can prune dead devices. | High | With six active channels, two shards cover all channels in three minutes; shard 2 exits without work. |
+| Posts scheduled handler | Every minute | Select one eligible channel using an hour-spaced time rotation and reconcile its latest InnerTube post. | Reads/writes post cache, known IDs, first-poll sentinel, subscriber/device state, and `nag:active`. | InnerTube; FCM only for an unknown new post. | First poll is silent; rollback/restoration is suppressed. | High | With six channels, each channel is selected once per hour. |
+| Aux `runNag` / `runPrewarn` | Every minute | Drain current legacy bucket, process a bounded nag batch, then check prewarns if no nag fired. | Reads/writes `nag:active`, upcoming events/prewarn sentinels, and device state. | FCM when due. | Sends reminder and prewarn pushes; can prune dead devices. | High | Nag cadence remains timestamp-based; per-minute invocation does not imply per-minute notifications. |
 
 ---
 
@@ -124,10 +124,14 @@ Run this lightweight syntax check before and after worker behavior changes:
 npm run check:workers
 ```
 
-The command currently runs `node --check` against both active worker entrypoints:
+The command runs syntax checks against the API, retired stub/shared module, all five active scheduled entrypoints, and the posts parser, then runs focused schedule/rotation coverage:
 
 - `worker/tubepulse-api/index.js`
-- `worker/tubepulse-cron/index.js`
+- `worker/tubepulse-cron/index.js` and `shared.mjs`
+- `worker/tubepulse-rss-0/1/2/index.js`
+- `worker/tubepulse-posts/index.js` and `community-posts.mjs`
+- `worker/tubepulse-aux/index.js`
+- `worker/test-scheduled-worker-rotation.mjs`
 
 This is intentionally narrow. It catches JavaScript parse errors without deploying workers, calling live APIs, changing KV state, or requiring a test framework.
 

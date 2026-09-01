@@ -67,6 +67,38 @@ export function stableSort(arr) {
   return [...arr].sort();
 }
 
+// Time-derived work selection keeps shard workers stateless. These helpers
+// are shared with focused tests so cadence/config drift cannot strand channels.
+export function selectRssShardWork(activeChannels, shardIndex, maxShards, minuteSlot) {
+  const channels = stableSort(activeChannels || []);
+  if (channels.length === 0) return null;
+
+  const activeShardCount = Math.min(maxShards, Math.max(1, Math.ceil(channels.length / 5)));
+  if (shardIndex < 0 || shardIndex >= activeShardCount) return null;
+
+  const shardChannels = channels.filter((_, index) => index % activeShardCount === shardIndex);
+  if (shardChannels.length === 0) return null;
+
+  return {
+    activeShardCount,
+    channelId: shardChannels[minuteSlot % shardChannels.length],
+  };
+}
+
+export function selectCommunityPostWork(eligibleChannels, minuteSlot) {
+  const channels = stableSort(eligibleChannels || []);
+  if (channels.length === 0) return null;
+
+  const stepMinutes = Math.max(3, Math.floor(60 / channels.length));
+  const channelIndex = Math.floor(minuteSlot / stepMinutes) % channels.length;
+  return {
+    channelId: channels[channelIndex],
+    channelIndex,
+    channelCount: channels.length,
+    stepMinutes,
+  };
+}
+
 // ─── DND logic ──────────────────────────────────────────────────────────
 
 export function isDndActive(dndStart, dndEnd, timezone = 'UTC') {
@@ -159,7 +191,7 @@ export async function fetchChannelRSS(channelId) {
       signal: controller.signal,
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Cookie': 'SOCS=C…S+cb',
+        'Cookie': 'SOCS=CAESEwgDEgk2MTcxNTcyNjAaAmVuIAEaBgiA_LyaBg; CONSENT=YES+cb',
         'Accept-Language': 'en-US,en;q=0.9',
         'Accept': 'application/atom+xml,application/xml,text/xml,*/*;q=0.8',
       },

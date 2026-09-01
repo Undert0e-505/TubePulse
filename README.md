@@ -17,7 +17,7 @@ It is designed for people who want direct, lightweight YouTube notifications wit
 ## Features
 
 - Subscribe to YouTube channels by handle (`@handle`) or channel ID
-- Receive Android push notifications for new videos (via RSS polling, ~5 min latency)
+- Receive Android push notifications for new videos (via minute-scheduled rotating RSS shards)
 - Receive Android push notifications for YouTube community posts (text, images, polls)
 - Home screen feed showing latest videos and posts from all tracked channels
 - Android home screen widget with latest videos and posts
@@ -54,10 +54,10 @@ YouTube's in-app notifications can be inconsistent, especially for community pos
 |-------|-----------|
 | Android app | React Native + Expo |
 | Push notifications | Firebase Cloud Messaging (FCM) via HTTP v1 API |
-| Backend | Cloudflare Workers (API + Cron) |
+| Backend | Cloudflare Workers (API + five scheduled workers) |
 | Storage | Cloudflare KV |
-| Video detection | YouTube RSS feed polling (cron-driven, every 5 min, zero Data API quota) |
-| Community post detection | YouTube Data API `activities.list` polling (hourly per active channel) |
+| Video detection | YouTube RSS feed polling (minute-scheduled rotating shards, zero Data API quota) |
+| Community post detection | Rotating InnerTube polling (approximately hourly per active channel) |
 | Widgets | react-native-android-widget |
 | Auth | Persistent device UUID (Bearer token, independent of FCM token rotation) |
 
@@ -103,21 +103,21 @@ v3.3.1 fixes widget/HomeScreen feed parity so the widget uses the same latest vi
 > **Note:** Each device registers independently. There's no cross-device sync — if you install TubePulse on two phones, each manages its own channel list and settings.
 
 ### ⚡ New-Video Detection
-TubePulse detects new uploads via a **YouTube RSS feed poller** running on a Cloudflare Worker cron (every 5 min). Originally it used **WebSub** (PubSubHubbub) for push-style detection, but Google's `pubsubhubbub.appspot.com` hub was shut down in 2024, and the v3.0.18 build abandoned the YouTube Data API poller because RSS provides the same data at zero quota cost.
+TubePulse detects new uploads via **three rotating YouTube RSS shard Workers** scheduled every minute. Originally it used **WebSub** (PubSubHubbub) for push-style detection, but Google's `pubsubhubbub.appspot.com` hub was shut down in 2024, and the v3.0.18 build abandoned the YouTube Data API poller because RSS provides the same data at zero quota cost.
 
 **Active path (since v3.0.18):**
-- **RSS-based polling** — cron hits `https://www.youtube.com/feeds/videos.xml?channel_id=...` every 5 min for every channel with at least one subscriber
+- **RSS-based polling** — active shards rotate over `channels:active`, polling one channel per shard per minute
 - **Zero YouTube Data API quota cost** — RSS is a free public feed
-- **Latency** — up to 5 min between upload and detection
+- **Latency** — up to one shard rotation (about 3 minutes with the current six active channels)
 - **Includes view counts, likes & dislikes** — RSS carries `media:statistics/@_views`, `media:starRating/@_count` (likes), and `media:statistics/@_dislikes` (usually `0` since YouTube removed public dislike counts in Nov 2021, but the field is still captured)
-- **The YouTube Data API is reserved for subscribe-time only** — handle→channelId resolve (1 unit, cached 7 days) and avatar fetch (1 unit per new channel, cached forever). The community-posts polling in v3.1 is the only other API consumer (1 unit/channel/hour, ~100 units/day for 4 channels).
+- **The YouTube Data API is reserved for subscribe-time only** — handle→channelId resolve (1 unit, cached 7 days) and avatar fetch (1 unit per new channel, cached forever). Community-post polling uses InnerTube rather than Data API quota.
 
 **WebSub (dormant):** the `/websub` endpoints and handler code remain in the workers for:
 - Manual testing
 - Future YouTube-compatible hub revival
 - Self-hosted hub integration
 
-When a new video is detected, the worker pushes it to all eligible devices via FCM. New videos appear within 5 minutes of upload. WebSub leases would expire (typically 5 days), so a cron job would renew subscriptions 24 hours before expiry if the hub were active. The last device to remove a channel would trigger an unsubscribe.
+When a new video is detected, the RSS shard pushes it to all eligible devices via FCM. Detection latency is bounded by a shard's channel rotation. Dormant WebSub state remains for a future compatible hub; the last device to remove a channel triggers an unsubscribe.
 
 **Scheduled event detection (v3.1):** RSS entries with a future `publishedAt` are treated as scheduled livestreams/premieres:
 - Stored silently when detected — no immediate notification
@@ -125,7 +125,7 @@ When a new video is detected, the worker pushes it to all eligible devices via F
 - **At the scheduled time, the regular new-video push fires** — the same `type: 'live'` notification as any other upload. There is no separate "is live now!" notification; the prewarn is the heads-up, the regular push is the "this just appeared" notification. Livestreams bypass DND.
 - Then nagged like any other unwatched video until you watch it
 
-**Community posts (v3.1):** a separate cron job polls YouTube's Data API `activities.list` once per hour per active channel. Captures text posts, image posts, and polls. First-run guard prevents notification floods on first install. Posts respect the same global `includeCommunityPosts` setting and per-channel override as videos. Posts do not enter the nag cycle — only the initial push fires.
+**Community posts (v3.1):** the posts Worker runs every minute and time-rotates eligible channels so each is polled approximately hourly through InnerTube. It captures text posts, image posts, and polls. A first-run guard prevents notification floods on first install. Posts respect the same global `includeCommunityPosts` setting and per-channel override as videos. Posts do not enter the nag cycle — only the initial push fires.
 
 Shorts are currently not filtered — they're treated as regular uploads.
 
@@ -140,7 +140,7 @@ TubePulse's notification system is built around **nagging**, not polling. You co
 - **DND scheduling** — blocks non-livestream pushes during custom silent hours (default 22:00–07:00). Livestreams (`type: 'live'`) bypass DND by default; regular new-video, prewarn, and post pushes respect DND unless the per-channel override sets `dndBypass: true`. Videos that arrive during DND are held and delivered when DND ends by the nag cycle.
 - **DND batching** — when DND ends and multiple unwatched videos are pending for the same channel, TubePulse sends a single per-channel summary (e.g. `ChannelName - 3 unwatched`) instead of flooding you with individual notifications. The batch groups by channel — you'll get one notification per channel with its unwatched count, not one per video.
 
-When the RSS poller detects a new video (every 5 min), TubePulse immediately notifies all eligible devices (unless DND is active). The nag cycle then handles re-notifications on the user's chosen schedule.
+When an RSS shard detects a new video, TubePulse immediately notifies all eligible devices (unless DND is active). The aux worker then handles re-notifications on the user's chosen schedule.
 
 ### 👆 Tap Actions — Video vs Channel
 
@@ -176,17 +176,17 @@ This is the key interaction: video tap for "I've seen this one", channel tap for
 ### Overview - Current Repo Evidence
 
 ```
-YouTube RSS feed ──poll every 5 min──▶ Cron Worker ──new videos──▶ API Worker ──FCM push──▶ Phone
+YouTube RSS feed ──rotating shard poll──▶ RSS Workers ──new videos/FCM push──▶ Phone
   (free, no auth)        │                                       │                       │
                           │                                       │   ┌── prewarn push   │
                           │                                       │   │  (per-device,    │
-                          │                                       │   │   5-min tick)    │
+                          │                                       │   │   aux tick)      │
                           ▼                                       │   │                  │
-                    Cloudflare KV                           YouTube Data API             │
+                    Cloudflare KV                           YouTube / InnerTube          │
                     (channels:active,                       (subscribe-time:             │
                      channel meta/recent/subs/               handle→channelId,            │
-                     channel recent:posts,                  avatar; posts cron:           │
-                     device profile/settings/state/override) activities.list/hour)        │
+                     channel recent:posts,                  avatar; posts worker:         │
+                     device profile/settings/state/override) rotating InnerTube poll)     │
                                                                                        ▼
                                                                                    Phone
                                                                   (also: nag cycle, WebSub dormant)
@@ -199,11 +199,11 @@ Every operation asks "what's happening to this channel" first, then "who cares a
 This inverts the old device-first approach and eliminates `KV.list()` entirely.
 
 **Detection paths in v3.1:**
-- **Active (videos):** Cron Worker polls YouTube's public RSS feed every 5 min, diffs against `channel:{id}:recent.lastVideoId`, fans out new videos via the API Worker. Zero Data API quota cost.
-- **Active (posts, v3.1):** Cron Worker polls `activities.list` every hour per active channel. ~1 unit/channel/hour, ~100 units/day for 4 channels.
-- **Active (prewarn, v3.1):** Cron Worker iterates the global `upcoming:events:list` every 5 min and fires per-device prewarn pushes when each device's prewarn window is active.
+- **Active (videos):** RSS shard Workers rotate over active channels, compare against a durable known-video watermark, and fan out new videos. Zero Data API quota cost.
+- **Active (posts, v3.1):** The posts Worker rotates active channels through InnerTube at roughly hourly-per-channel cadence. Zero Data API quota cost.
+- **Active (prewarn, v3.1):** The aux Worker checks `upcoming:events:list` and fires per-device prewarn pushes when each device's window is active.
 - **Dormant:** WebSub handlers in both workers exist but the hub is shut down; `/websub` endpoint still works for manual testing or future hub revival.
-- **YouTube Data API:** reserved for one-time subscribe-time operations (handle resolve + avatar fetch) and the posts cron. The v3.0 cron and FCM push paths consume zero Data API quota.
+- **YouTube Data API:** reserved for subscribe-time operations (handle resolve + avatar fetch). RSS, posts, aux, and FCM push paths consume zero Data API quota.
 
 ### API Worker (`tubepulse-api`)
 
@@ -233,49 +233,19 @@ The central Cloudflare Worker. Handles:
 6. Add `channelId` to `channels:active` (if this is the first subscriber)
 7. Return the channel meta + recent videos to the app
 
-**YouTube Data API usage:** Subscribe-time handle→channelId resolve (cached 7 days) and avatar fetch (cached forever). The posts cron consumes ~1 unit/channel/hour. All video detection is via RSS polling in the cron worker. Zero Data API calls from the cron-driven video path or the FCM push path.
+**YouTube Data API usage:** Subscribe-time handle→channelId resolve (cached 7 days) and avatar fetch (cached forever). Video detection uses RSS shards and community posts use InnerTube, so neither scheduled path consumes Data API quota.
 
-### Cron Worker (`tubepulse-cron`)
+### Scheduled Workers
 
-Runs every 5 minutes. Six jobs:
+The old `tubepulse-cron` deployment is a retired no-op with no Cron Trigger. Background work is split across five small scheduled Workers so each invocation remains within the Cloudflare free-tier CPU budget:
 
-#### Job 1: Upcoming Events Drain
+| Worker | Cadence | Work per invocation |
+|---|---|---|
+| `tubepulse-rss-0/1/2` | Every minute | Each active shard polls one channel. Time-derived rotation covers every active channel without cursor writes. RSS is the active zero-quota video detection path. |
+| `tubepulse-posts` | Every minute | Selects one eligible channel on a time-derived rotation; with six channels each is polled approximately hourly. Uses InnerTube and silently seeds first-poll state. |
+| `tubepulse-aux` | Every minute | Processes a bounded `nag:active` batch, drains legacy upcoming buckets, and checks scheduled-live prewarns. |
 
-Reads the current 5-min `upcoming:` bucket and deletes it without firing. Stale pre-v3.1 bucket entries are cleared on the first tick after upgrade, so the old "going live in 30 minutes" / "is live now!" pushes cannot fire for events scheduled before the upgrade. In v3.1 the bucket scheme is dead — the prewarn logic uses `runPrewarnCron` instead.
-
-#### Job 2: Prewarn (per-device, v3.1)
-
-Iterates `upcoming:events:list` and fires per-device "going live soon" pushes when each device's prewarn window is active. The prewarn time is per-device: per-channel override → global setting → default (60 min). Sent state tracked in `upcoming:prewarn:{videoId}:{deviceId}` to prevent double-send. Events pruned 24h after `scheduledFor` with their sent keys cleaned up.
-
-#### Job 3: YouTube RSS Polling — **active new-video detection**
-
-Iterates `channels:active` and fetches `https://www.youtube.com/feeds/videos.xml?channel_id=...` for each. Parses the Atom feed (videoId, title, publishedAt, thumbnail, link, **views** from `media:community/media:statistics/@_views`, **likes** from `media:starRating/@_count`, **dislikes** from `media:statistics/@_dislikes`). Diffs against `channel:{channelId}:recent` to find new videoIds. For each new video, looks up subscribers and writes an entry to the API Worker for fan-out to FCM.
-
-For `type: 'live_scheduled'` entries: append to `upcoming:events:list` (so the prewarn cron can iterate them) but do not write to the `upcoming:` bucket and do not fire any push immediately. The prewarn and live-time pushes are handled separately.
-
-Cost: 0 YouTube Data API quota units. RSS is a free, public feed (no auth, no key). Cloudflare KV cost: ~1 read per channel per tick, with writes only when engagement metrics change or a new video is detected.
-
-#### Job 4: Community Posts (v3.1)
-
-Iterates `channels:active` and polls YouTube's Data API `activities.list` for each. Captures text, image, and poll community posts. First-run guard: on first poll, populates the recent list without firing notifications (no flood on first install or feature enable). New posts are appended to `device:{deviceId}:state:{channelId}.unwatched` (namespaced with `post:`) and trigger an FCM push to subscribers that haven't opted out globally or per-channel. Cost: ~1 unit/channel/hour.
-
-#### Job 5: Nag Cycle
-
-Scans time-bucketed `nag:` keys for unwatched videos that need re-notifying:
-
-1. For each nag entry, read device profile + settings + per-channel override
-2. Skip if DND is active (global or per-channel)
-3. Re-validate against current `device:{id}:state:{channelId}.unwatched` — if the user has since marked videos as seen, drop them from the batch
-4. Send FCM push, update nag state in KV
-5. Schedule the next nag into the appropriate bucket (chill: +4h, relentless: +nagInterval)
-
-Also acts as a safety net — if the RSS poller missed a new video (RSS unreachable, network error), the nag cycle will eventually surface it once a future tick successfully re-stamps the recent list. The nag cycle itself is bucket-driven from the `nag:` keys scheduled by the RSS poller and the upcoming-events cron, not by re-reading `/feed`.
-
-**Posts do not enter the nag cycle** — only the initial push fires for posts. The plan did not require post nagging; adding it would need a parallel nag bucket and FCM payload differentiation. Flagged for v3.2.
-
-#### Job 6: WebSub Lease Renewal (DORMANT)
-
-WebSub subscriptions would expire (typically 4–10 days) if active. Currently a no-op because Google's `pubsubhubbub.appspot.com` hub has been shut down since 2024. Code path remains so a flip-on is instant if a compatible hub reappears.
+All five share `TUBEPULSE_KV`. The RSS and aux Workers require `FIREBASE_SERVICE_ACCOUNT`; posts also uses the `TUBEPULSE_ENABLE_COMMUNITY_POSTS` variable. Scheduled-only Workers intentionally do not export `fetch()`, so opening their `workers.dev` URL is not a valid health check.
 
 ### Data Model (Cloudflare KV) — v3.1
 
@@ -324,8 +294,8 @@ WebSub subscriptions would expire (typically 4–10 days) if active. Currently a
 Video uploaded on YouTube                              Channel posts on YouTube
          │                                                     │
          ▼                                                     ▼
-Cron Worker polls YouTube RSS feed every 5 min       Cron Worker polls YouTube
-(via https://www.youtube.com/feeds/videos.xml)        activities.list every hour
+RSS shard polls YouTube RSS on its rotation          Posts worker polls one channel
+(via https://www.youtube.com/feeds/videos.xml)        through InnerTube per rotation
          │                                                     │
          ▼                                                     ▼
 Diff against channel:{id}:recent → new videoIds       Diff against channel:{id}:recent:posts
@@ -392,9 +362,13 @@ TubePulse/
 │   ├── tubepulse-api/
 │   │   ├── index.js               # API Worker — v3.1 channel-first + posts + prewarn
 │   │   └── wrangler.toml
+│   ├── tubepulse-rss-{0,1,2}/    # Active rotating RSS shard Workers
+│   ├── tubepulse-posts/          # Active rotating community-post Worker
+│   ├── tubepulse-aux/            # Active bounded nag/prewarn Worker
 │   └── tubepulse-cron/
-│       ├── index.js               # Cron Worker — v3.1 (prewarn + posts + RSS poll + nag + lease)
-│       └── wrangler.toml
+│       ├── index.js               # Retired no-op compatibility entrypoint
+│       ├── shared.mjs             # Shared scheduled-worker helpers
+│       └── wrangler.toml          # No Cron Trigger
 ├── secrets/                       # All gitignored — live credentials only
 │   ├── README.md                  # Operator docs for secrets
 │   ├── cloudflare.env             # CF account ID + API token
@@ -459,8 +433,10 @@ npx expo run:android
 # Deploy API worker source (app-facing API in repo; verify live route state first)
 cd worker/tubepulse-api && npx wrangler deploy
 
-# Deploy cron worker (prewarn + RSS poll + posts + nag cycle + lease renewal no-op)
-cd worker/tubepulse-cron && npx wrangler deploy
+# Deploy the five active scheduled workers
+for worker in tubepulse-rss-0 tubepulse-rss-1 tubepulse-rss-2 tubepulse-posts tubepulse-aux; do
+  (cd "worker/$worker" && npx wrangler deploy)
+done
 ```
 
 Before worker cleanup, note that the app's workers.dev API URL is verified reachable, while the repo wrangler comment remains stale/incomplete; review deployed Cloudflare settings before route/config changes.
@@ -468,9 +444,9 @@ Before worker cleanup, note that the app's workers.dev API URL is verified reach
 For the full cloud architecture — KV schema, endpoint reference, FCM details, cost analysis, free tier budget — see **[worker/README.md](worker/README.md)**.
 
 Required Cloudflare secrets:
-- `YOUTUBE_API_KEY` — YouTube Data API key (for handle resolution + avatars + posts polling)
-- `FIREBASE_SERVICE_ACCOUNT` — Firebase service account JSON (for FCM)
-- `TUBEPULSE_KV` — KV namespace binding (shared between workers)
+- `YOUTUBE_API_KEY` — API worker only, for handle resolution and avatars
+- `FIREBASE_SERVICE_ACCOUNT` — API, RSS shards, posts, and aux, for FCM
+- `TUBEPULSE_KV` — configured KV binding shared by all active workers
 
 ## License
 

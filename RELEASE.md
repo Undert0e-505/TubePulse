@@ -4,7 +4,7 @@
 
 For current app version evidence, start with `app.json` and `android/app/build.gradle`. `package.json` is tooling/package metadata and is not the app release version.
 
-Worker deployments are deliberately separate from app APK releases. Do not deploy `tubepulse-api` or `tubepulse-cron` as part of an app release unless that is an explicit worker deployment task.
+Worker deployments are deliberately separate from app APK releases. Do not deploy the API or scheduled Workers as part of an app release unless that is an explicit worker deployment task.
 
 ---
 
@@ -168,7 +168,8 @@ Purpose: deploy Cloudflare workers deliberately and separately.
 Expected behavior:
 
 - Deploy `worker/tubepulse-api` only when API worker changes require it.
-- Deploy `worker/tubepulse-cron` only when cron/background worker changes require it.
+- Deploy the affected active scheduled workers individually: `worker/tubepulse-rss-0`, `worker/tubepulse-rss-1`, `worker/tubepulse-rss-2`, `worker/tubepulse-posts`, and `worker/tubepulse-aux`.
+- Keep `worker/tubepulse-cron` deployed as a no-op with `crons = []`; do not use it for background-worker releases.
 - Never deploy archived workers unless deliberately restoring historical behavior.
 - Never bundle worker deploys into app APK release automation.
 
