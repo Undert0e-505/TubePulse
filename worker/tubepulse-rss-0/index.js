@@ -93,7 +93,13 @@ async function pollSingleRssChannel(env, ctx, channelId) {
   const newVideos = classified.filter((v) => v.isNew);
   const suppressed = classified.filter((v) => !v.isNew);
 
-  // Hourly view-count refresh for latest video
+  // View-count refresh for latest video.
+  // Writes only when: views changed >25% AND checked in a different hour,
+  // OR it's been >24 hours since the last check (daily forced refresh
+  // ensures small/slow channels still get updated at least once/day).
+  // This reduces KV writes from ~24/channel/day to ~1-4/channel/day.
+  const VIEW_REFRESH_THRESHOLD = 0.25; // 25%
+  const DAILY_REFRESH_MS = 24 * 60 * 60 * 1000;
   const rssByVideoId = new Map(uploads.map((u) => [u.videoId, u]));
   const refreshedPrev = prevRecent.map((v) => v);
   let recentChanged = false;
@@ -126,10 +132,12 @@ async function pollSingleRssChannel(env, ctx, channelId) {
   if (latest && latestFromRss) {
     const oldViews = parseInt(latest.views || '0', 10);
     const newViews = parseInt(latestFromRss.views || '0', 10);
+    const lastCheckedMs = (latest.viewsLastCheckedHour || 0) * 3600000;
+    const stale = (now - lastCheckedMs) > DAILY_REFRESH_MS;
     const viewsChanged = (
       !isNaN(oldViews) && !isNaN(newViews) &&
       currentHour !== latest.viewsLastCheckedHour &&
-      (oldViews === 0 || Math.abs(newViews - oldViews) / Math.max(oldViews, 1) > 0.05)
+      (stale || oldViews === 0 || Math.abs(newViews - oldViews) / Math.max(oldViews, 1) > VIEW_REFRESH_THRESHOLD)
     );
     const oldLikes = latest.likes;
     const newLikes = latestFromRss.likes != null ? String(latestFromRss.likes) : null;
@@ -137,7 +145,7 @@ async function pollSingleRssChannel(env, ctx, channelId) {
     const newDislikes = latestFromRss.dislikes != null ? String(latestFromRss.dislikes) : null;
     const likesChanged = (
       currentHour !== latest.viewsLastCheckedHour &&
-      ((newLikes != null && newLikes !== oldLikes) || (newDislikes != null && newDislikes !== oldDislikes))
+      (stale || (newLikes != null && newLikes !== oldLikes) || (newDislikes != null && newDislikes !== oldDislikes))
     );
 
     if (viewsChanged) {
