@@ -8,7 +8,7 @@ binding = "TUBEPULSE_KV"
 id = "52e77ca9f5f6493e89d2478c8d3055ec"
 
 [triggers]
-crons = ["* * * * *"]
+crons = ["*/5 * * * *"]
 
 [observability]
 enabled = true
