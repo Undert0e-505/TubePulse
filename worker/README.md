@@ -67,13 +67,13 @@ All scheduled workers use the same KV namespace, so they can write state that th
 
 The active entry points are `worker/tubepulse-rss-0/1/2/index.js`, `worker/tubepulse-posts/index.js`, and `worker/tubepulse-aux/index.js`. Shared runtime helpers live in `worker/tubepulse-cron/shared.mjs`; `worker/tubepulse-cron/index.js` itself is a retired no-op.
 
-**Schedule:** all five active workers use `* * * * *` (every minute).
+**Schedule:** `tubepulse-posts` and `tubepulse-aux` use `* * * * *` (every minute). RSS shards use `*/5 * * * *` (every 5 minutes, changed 2026-09-20 from every 1 minute to reduce KV write consumption).
 
 See [CONTRACTS.md](CONTRACTS.md) for the active worker contract/inventory reference before changing worker behavior.
 
 | Worker | Selection/work |
 |---|---|
-| RSS 0/1/2 | Sort `channels:active`, choose the active shard count (one per five channels, up to three), then rotate one channel per shard using the current minute. A durable known-video watermark prevents deletion/restoration notification cascades. |
+| RSS 0/1/2 | Sort `channels:active`, choose the active shard count (one per five channels, up to three), then rotate one channel per shard using the current 5-minute slot. Poll cadence changed from 1min to 5min on 2026-09-20 to reduce KV writes. A durable known-video watermark prevents deletion/restoration notification cascades. |
 | Posts | Filter active channels through the optional allowlist and use minute-derived spacing to select one channel. First-poll seeding sends no notification. |
 | Aux | Drain one legacy upcoming bucket, process at most five `nag:active` entries, then check prewarns when no nag fired. |
 
@@ -357,18 +357,19 @@ KV writes are the primary budget concern. The free tier allows 1,000 writes/day 
 
 **Deletes per day (cleanup):** dead-device cleanup is event-driven, not scheduled — it only fires when FCM reports a token as `UNREGISTERED`. Steady-state cost is ~0 deletes/day. A single cleanup of a device subscribed to N channels costs roughly `1 + 5N + 3N` KV ops (1 read of `device:{id}:channels` + N reads + N writes of subscriber lists + 3 + 2N deletes). In practice this is one user uninstalling every few months, well under free tier. See §11.
 
-### 6.4 Engagement-metric write throttle (since v3.0.18, refined v3.1)
+### 6.4 Engagement-metric write throttle (since v3.0.18, refined v3.1, threshold raised 2026-09-20)
 
 Originally, the combined cron re-stamped view counts on every video in the recent list on every tick, causing excessive writes.
 
-New policy:
+Current policy (updated 2026-09-20):
 - Only the **latest video's** view count is considered for writes
 - Only evaluated at the top of a new hour (gated by `currentHour !== viewsLastCheckedHour`)
-- Only writes if the count changed by **more than 5%** from the last stored value
+- Only writes if the count changed by **more than 25%** from the last stored value (raised from 5% on 2026-09-20 to reduce KV write burn on the free plan)
+- **Daily forced refresh**: if >24 hours since the last check, always write regardless of threshold (ensures small/slow channels still get view-count updates at least once/day)
 - Prior videos (index 1-14) keep their last-stored view counts — view counts are slightly stale on older videos, which is fine because the newest video is the one the user actually looks at
-- **v3.1**: likes and dislikes follow the same hourly top-of-list rule but with a **stricter** threshold (any change) — they're useful at any scale, so we don't wait for a 5% swing
+- Likes and dislikes follow the same hourly + daily-refresh rule
 
-Net effect: engagement writes are bounded to at most one latest-video refresh per channel per hour, and are often much lower.
+Net effect: engagement writes are bounded to at most 1-4 per channel per day (down from up to 24/hour with the old 5% threshold). Combined with the 5-minute poll cadence, total KV writes dropped from an estimated ~700-1,000/day to ~100-200/day across 19 active channels.
 
 ---
 
