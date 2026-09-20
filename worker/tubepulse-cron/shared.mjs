@@ -133,10 +133,9 @@ export function isDndActive(dndStart, dndEnd, timezone = 'UTC') {
 
 // ─── Video classification ───────────────────────────────────────────────
 
-export function classifyVideo(entry) {
+export function classifyVideo(entry, now = Date.now()) {
   if (!entry.published && !entry.publishedAt) return 'video';
   const publishedTime = new Date(entry.published || entry.publishedAt).getTime();
-  const now = Date.now();
   if (publishedTime > now + 5 * 60 * 1000) return 'live_scheduled';
   const title = (entry.title || '').toLowerCase();
   if (title.startsWith('🔴') || title.includes(' live')) return 'live';
@@ -180,6 +179,101 @@ export function parseRSSFeed(xmlText) {
   const channelName = xmlText.match(/<name>([^<]+)<\/name>/)?.[1];
 
   return { channelId, channelName, entries };
+}
+
+// ─── RSS recent-video persistence ────────────────────────────────────────
+
+const RSS_METRIC_REFRESH_THRESHOLD = 0.25;
+const RSS_METRIC_FORCE_REFRESH_HOURS = 24;
+
+function metricChangedBeyondThreshold(persistedValue, rssValue) {
+  if (rssValue === undefined || rssValue === null) return false;
+  const persisted = Number(persistedValue ?? 0);
+  const current = Number(rssValue);
+  if (!Number.isFinite(persisted) || !Number.isFinite(current)) return false;
+  return Math.abs(current - persisted) / Math.max(Math.abs(persisted), 1) > RSS_METRIC_REFRESH_THRESHOLD;
+}
+
+function shouldPersistMetricGroup(lastCheckedHour, currentHour, metricPairs) {
+  const normalizedLastCheckedHour = Number(lastCheckedHour);
+  const missingLastCheckedHour = lastCheckedHour === undefined || lastCheckedHour === null
+    || !Number.isFinite(normalizedLastCheckedHour);
+  const differentHour = missingLastCheckedHour || normalizedLastCheckedHour !== currentHour;
+  const stale = missingLastCheckedHour
+    || currentHour - normalizedLastCheckedHour >= RSS_METRIC_FORCE_REFRESH_HOURS;
+  return differentHour && (
+    stale || metricPairs.some(([persistedValue, rssValue]) => (
+      metricChangedBeyondThreshold(persistedValue, rssValue)
+    ))
+  );
+}
+
+function currentMetricValue(rssValue, persistedValue) {
+  if (rssValue !== undefined && rssValue !== null) return String(rssValue);
+  if (persistedValue !== undefined && persistedValue !== null) return persistedValue;
+  return '0';
+}
+
+function copyPersistedMetricFields(target, cached) {
+  for (const field of [
+    'views', 'likes', 'dislikes', 'viewsLastCheckedHour', 'likesLastCheckedHour',
+  ]) {
+    if (Object.prototype.hasOwnProperty.call(cached, field)) target[field] = cached[field];
+  }
+}
+
+/**
+ * Merge the current RSS ordering/structure with persisted metrics.
+ * Only the latest existing entry is eligible for a metric refresh; new entries
+ * are seeded from RSS. `nowMs` is explicit so this helper remains deterministic.
+ */
+export function mergeRssUploadsIntoRecentVideos(cachedRecent, rssUploads, nowMs) {
+  const currentHour = Math.floor(nowMs / 3600000);
+  const cachedByVideoId = new Map((cachedRecent || []).map((video) => [video.videoId, video]));
+
+  return (rssUploads || []).slice(0, 15).map((upload, index) => {
+    const merged = {
+      videoId: upload.videoId,
+      title: upload.title,
+      publishedAt: upload.published,
+      thumbnail: upload.thumbnail,
+      type: classifyVideo(upload, nowMs),
+      link: upload.link,
+    };
+    const cached = cachedByVideoId.get(upload.videoId);
+
+    if (!cached) {
+      return {
+        ...merged,
+        views: currentMetricValue(upload.views),
+        likes: currentMetricValue(upload.likes),
+        dislikes: currentMetricValue(upload.dislikes),
+        viewsLastCheckedHour: currentHour,
+        likesLastCheckedHour: currentHour,
+      };
+    }
+
+    copyPersistedMetricFields(merged, cached);
+    if (index !== 0) return merged;
+
+    if (shouldPersistMetricGroup(cached.viewsLastCheckedHour, currentHour, [
+      [cached.views, upload.views],
+    ])) {
+      merged.views = currentMetricValue(upload.views, cached.views);
+      merged.viewsLastCheckedHour = currentHour;
+    }
+
+    if (shouldPersistMetricGroup(cached.likesLastCheckedHour, currentHour, [
+      [cached.likes, upload.likes],
+      [cached.dislikes, upload.dislikes],
+    ])) {
+      merged.likes = currentMetricValue(upload.likes, cached.likes);
+      merged.dislikes = currentMetricValue(upload.dislikes, cached.dislikes);
+      merged.likesLastCheckedHour = currentHour;
+    }
+
+    return merged;
+  });
 }
 
 export async function fetchChannelRSS(channelId) {

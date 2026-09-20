@@ -11,8 +11,9 @@
     "check:worker-cron": "node --check worker/tubepulse-cron/index.js",
     "check:worker-scheduled": "node --check worker/tubepulse-cron/shared.mjs && node --check worker/tubepulse-rss-0/index.js && node --check worker/tubepulse-rss-1/index.js && node --check worker/tubepulse-rss-2/index.js && node --check worker/tubepulse-posts/index.js && node --check worker/tubepulse-posts/community-posts.mjs && node --check worker/tubepulse-aux/index.js",
     "test:worker-rotation": "node worker/test-scheduled-worker-rotation.mjs",
+    "test:worker-rss-merge": "node worker/test-rss-recent-merge.mjs",
     "test:worker-rss-watermark": "node worker/tubepulse-rss-0/test-rss-watermark.mjs",
-    "check:workers": "npm run check:worker-api && npm run check:worker-cron && npm run check:worker-scheduled && npm run test:worker-rotation && npm run test:worker-rss-watermark",
+    "check:workers": "npm run check:worker-api && npm run check:worker-cron && npm run check:worker-scheduled && npm run test:worker-rotation && npm run test:worker-rss-merge && npm run test:worker-rss-watermark",
     "check:community-posts": "node scripts/test-community-post-parser.js"
   },
   "dependencies": {

@@ -1,6 +1,6 @@
 # Active Worker Contracts
 
-**Last updated:** 2026-09-01
+**Last updated:** 2026-09-20
 **Status:** Current-state inventory for the active Cloudflare Workers. This document records observed contracts, coupling, and known drift. It is not a refactor plan, and it does not imply that every behavior described here is ideal.
 
 Use this file before changing `worker/tubepulse-api/` or any active scheduled worker. If code changes alter endpoint behavior, KV keys, notification payloads, cron cadence, bindings, or deployment assumptions, update this contract in the same commit.
@@ -12,7 +12,7 @@ Use this file before changing `worker/tubepulse-api/` or any active scheduled wo
 | Worker | Path | Role | Trigger type | KV binding | KV namespace | Deployment note |
 |---|---|---|---|---|---|---|
 | `tubepulse-api` | `worker/tubepulse-api/` | Live app-facing REST API plus dormant WebSub callback endpoints | HTTP `fetch` | `TUBEPULSE_KV` | `52e77ca9f5f6493e89d2478c8d3055ec` | Live `workers.dev` route was verified on 2026-06-25. `GET /` identifies `worker: "tubepulse-api"`. Wrangler config has no explicit route and contains a stale/incomplete route comment. |
-| `tubepulse-rss-0/1/2` | `worker/tubepulse-rss-{0,1,2}/` | RSS/video detection shards; one selected channel per active shard per tick | Cloudflare scheduled event, `* * * * *` | `TUBEPULSE_KV` | `52e77ca9f5f6493e89d2478c8d3055ec` | Scheduled-only. Distinct `RSS_SHARD_INDEX`; durable `known:videos` watermark prevents deletion cascades. |
+| `tubepulse-rss-0/1/2` | `worker/tubepulse-rss-{0,1,2}/` | RSS/video detection shards; one selected channel per active shard per tick | Cloudflare scheduled event, `*/5 * * * *` | `TUBEPULSE_KV` | `52e77ca9f5f6493e89d2478c8d3055ec` | Scheduled-only. Distinct `RSS_SHARD_INDEX`; durable `known:videos` watermark prevents deletion cascades. |
 | `tubepulse-posts` | `worker/tubepulse-posts/` | Time-rotated community-post polling | Cloudflare scheduled event, `* * * * *` | `TUBEPULSE_KV` | `52e77ca9f5f6493e89d2478c8d3055ec` | Selects one eligible channel per tick and spaces selections across an hour. |
 | `tubepulse-aux` | `worker/tubepulse-aux/` | Bounded nag/prewarn work and legacy bucket drain | Cloudflare scheduled event, `* * * * *` | `TUBEPULSE_KV` | `52e77ca9f5f6493e89d2478c8d3055ec` | Processes at most five nag entries per invocation. |
 | `tubepulse-cron` | `worker/tubepulse-cron/` | Retired compatibility stub; shared helpers remain in `shared.mjs` | None (`crons = []`) | `TUBEPULSE_KV` | `52e77ca9f5f6493e89d2478c8d3055ec` | Deliberate no-op. Never use as the active background deployment target. |
@@ -57,9 +57,11 @@ Important exception: `/register` intentionally uses `KV.list({ prefix: 'device:'
 
 | Function | Cadence | Purpose | KV effects | External calls | FCM side effects | Risk | Notes |
 |---|---|---|---|---|---|---|---|
-| RSS shard scheduled handler | Every minute per Worker | Select one channel from the active shard and run watermark-protected RSS detection. | Reads active/recent/known/meta/subscriber/device state; writes changed cache/watermark/device state and `nag:active`. | YouTube RSS; FCM only for new eligible content. | Sends upload/live pushes; can prune dead devices. | High | With six active channels, two shards cover all channels in three minutes; shard 2 exits without work. |
+| RSS shard scheduled handler | Every five minutes per Worker | Select one channel from the active shard and run watermark-protected RSS detection. | Reads active/recent/known/meta/subscriber/device state; writes changed cache/watermark/device state and `nag:active`. | YouTube RSS; FCM only for new eligible content. | Sends upload/live pushes; can prune dead devices. | High | Selection uses a five-minute epoch tick. With 19 active channels, shard sizes are 7/6/6 and a complete rotation takes at most 35 minutes. |
 | Posts scheduled handler | Every minute | Select one eligible channel using an hour-spaced time rotation and reconcile its latest InnerTube post. | Reads/writes post cache, known IDs, first-poll sentinel, subscriber/device state, and `nag:active`. | InnerTube; FCM only for an unknown new post. | First poll is silent; rollback/restoration is suppressed. | High | With six channels, each channel is selected once per hour. |
 | Aux `runNag` / `runPrewarn` | Every minute | Drain current legacy bucket, process a bounded nag batch, then check prewarns if no nag fired. | Reads/writes `nag:active`, upcoming events/prewarn sentinels, and device state. | FCM when due. | Sends reminder and prewarn pushes; can prune dead devices. | High | Nag cadence remains timestamp-based; per-minute invocation does not imply per-minute notifications. |
+
+RSS selection is driven by `floor((scheduledTime ?? Date.now()) / 300000)`, which advances once per `*/5` trigger. Using raw epoch minutes would advance by five and can starve shard positions when the shard length shares a factor with five. Local rotation coverage exercises active-channel counts 1 through 30.
 
 ---
 
@@ -70,7 +72,7 @@ Important exception: `/register` intentionally uses `KV.list({ prefix: 'device:'
 | `channel:{id}:meta` | Shared | Channel display/cache metadata such as `name`, `avatarUrl`, `lastVideoId`, `addedAt`. | Written by API bootstrap/subscribe and cron RSS updates. |
 | `channel:{id}:subscribers` | Shared | JSON array of `deviceId`s subscribed to the channel. | API mutates on subscribe/unsubscribe; cron reads for fan-out and cleanup. |
 | `channel:{id}:websub` | Mostly API/dormant | WebSub lease/HMAC state. | WebSub is currently dormant/stale; API can still write/read this key. |
-| `channel:{id}:recent` | Shared | Recent video array. | API can bootstrap; cron is the active updater through RSS. |
+| `channel:{id}:recent` | Shared | Recent video array containing structural fields, `views`, `likes`, `dislikes`, and optional `viewsLastCheckedHour` / `likesLastCheckedHour` UTC-hour persistence clocks. | API can bootstrap; RSS is the active updater. Existing cached metrics are preserved except for policy-eligible refreshes of the latest entry; RSS order, structural changes, additions, and removals still persist. |
 | `channel:{id}:recent:posts` | Shared | Latest community post array, currently empty or one item. Post objects use canonical `id: "post:{postId}"`, preserve `publishedText`, include `fetchedAt`, `publishedAt`, and `publishedAtSource` when InnerTube relative age can be estimated, and may include optional `likeCount`/`likeText` or `viewCount`/`viewText` when those fields are exposed directly on the InnerTube post renderer. `likeCount: 0` is a real explicit value; null/missing means unknown or unavailable. | Written/read only when `TUBEPULSE_ENABLE_COMMUNITY_POSTS` is enabled; API/cron dead-channel cleanup deletes it even when disabled. Existing cached posts without `publishedAt` or metrics remain valid; cron enriches the same latest post once and then preserves that timestamp to avoid hourly drift. Missing metrics are unknown, not zero. |
 | `channel:{id}:firstPollAt:posts` | Shared cleanup, cron writer | ISO timestamp sentinel for community-post first-run guard. | Written only when `TUBEPULSE_ENABLE_COMMUNITY_POSTS` is enabled; API/cron dead-channel cleanup deletes it even when disabled. |
 | `channel:{id}:known:posts` | Cron writer, shared cleanup | Bounded JSON array of canonical community post IDs such as `post:{postId}`. | Notification/deletion watermark only, not display history. Capped at 20 IDs. API/cron dead-channel cleanup deletes it even when disabled. |
@@ -124,7 +126,7 @@ Run this lightweight syntax check before and after worker behavior changes:
 npm run check:workers
 ```
 
-The command runs syntax checks against the API, retired stub/shared module, all five active scheduled entrypoints, and the posts parser, then runs focused schedule/rotation coverage:
+The command runs syntax checks against the API, retired stub/shared module, all five active scheduled entrypoints, and the posts parser, then runs focused schedule/rotation, RSS merge-policy, and watermark coverage:
 
 - `worker/tubepulse-api/index.js`
 - `worker/tubepulse-cron/index.js` and `shared.mjs`
@@ -132,6 +134,8 @@ The command runs syntax checks against the API, retired stub/shared module, all 
 - `worker/tubepulse-posts/index.js` and `community-posts.mjs`
 - `worker/tubepulse-aux/index.js`
 - `worker/test-scheduled-worker-rotation.mjs`
+- `worker/test-rss-recent-merge.mjs`
+- `worker/tubepulse-rss-0/test-rss-watermark.mjs`
 
 This is intentionally narrow. It catches JavaScript parse errors without deploying workers, calling live APIs, changing KV state, or requiring a test framework.
 

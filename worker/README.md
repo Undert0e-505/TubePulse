@@ -38,7 +38,7 @@ This document describes the TubePulse backend: the HTTP API Worker, five active 
 | Component | Repo path/config | Purpose | Route/deploy evidence |
 |-----------|------------------|---------|-----------------------|
 | `tubepulse-api` | `worker/tubepulse-api/` | Current live app-facing API worker source + dormant WebSub callback | `GET /` at `https://tubepulse-api.jimothyoakley55.workers.dev` returned Cloudflare-served health JSON on 2026-06-25. Wrangler route comments are stale/incomplete. |
-| `tubepulse-rss-0/1/2` | `worker/tubepulse-rss-{0,1,2}/` | Time-derived RSS shards; one channel per active shard per minute | One-minute triggers, distinct shard indexes, no HTTP handlers. |
+| `tubepulse-rss-0/1/2` | `worker/tubepulse-rss-{0,1,2}/` | Time-derived RSS shards; one channel per active shard per scheduled tick | Five-minute (`*/5 * * * *`) triggers, distinct shard indexes, no HTTP handlers. |
 | `tubepulse-posts` | `worker/tubepulse-posts/` | Rotating community-post poller; one eligible channel per invocation | One-minute trigger; with six channels each is selected approximately hourly. |
 | `tubepulse-aux` | `worker/tubepulse-aux/` | Bounded nag/prewarn processing and legacy upcoming-bucket drain | One-minute trigger; no HTTP handler. |
 | `tubepulse-cron` | `worker/tubepulse-cron/` | Retired compatibility stub | Deliberate no-op with `triggers.crons = []`; do not deploy it as the active scheduler. |
@@ -73,9 +73,11 @@ See [CONTRACTS.md](CONTRACTS.md) for the active worker contract/inventory refere
 
 | Worker | Selection/work |
 |---|---|
-| RSS 0/1/2 | Sort `channels:active`, choose the active shard count (one per five channels, up to three), then rotate one channel per shard using the current 5-minute slot. Poll cadence changed from 1min to 5min on 2026-09-20 to reduce KV writes. A durable known-video watermark prevents deletion/restoration notification cascades. |
+| RSS 0/1/2 | Sort `channels:active`, choose the active shard count (one per five channels, up to three), then rotate one channel per shard using a monotonically advancing five-minute epoch tick. Poll cadence changed from 1min to 5min on 2026-09-20 to reduce KV writes. A durable known-video watermark prevents deletion/restoration notification cascades. |
 | Posts | Filter active channels through the optional allowlist and use minute-derived spacing to select one channel. First-poll seeding sends no notification. |
 | Aux | Drain one legacy upcoming bucket, process at most five `nag:active` entries, then check prewarns when no nag fired. |
+
+Each RSS handler passes `floor((scheduledTime ?? Date.now()) / 300000)` to the shared selector, so the selection index advances by one per five-minute trigger. The previous raw epoch-minute modulo advanced by five at each `*/5` trigger and could repeatedly visit only a subset of a shard when its length shared a factor with five. Rotation tests cover every active-channel count from 1 through 30. The production set observed on 2026-09-20 contained 19 active channels, producing shard sizes 7/6/6 and a complete rotation in at most seven ticks (35 minutes).
 
 ### 3.1 RSS poll — the active new-video detection path
 
@@ -89,7 +91,7 @@ Each entry in the Atom feed carries: `videoId`, `title`, `publishedAt`, `thumbna
 
 **Flow for the selected channel:**
 
-1. Read `channels:active` and select this shard's channel for the current minute.
+1. Read `channels:active` and select this shard's channel for the current five-minute epoch tick.
 2. For that channelId:
    - GET the RSS feed (with `User-Agent` + `SOCS` cookie to bypass the EU/UK consent wall)
    - Parse with a regex-based Atom parser (no XML library needed in the worker)
@@ -98,7 +100,7 @@ Each entry in the Atom feed carries: `videoId`, `title`, `publishedAt`, `thumbna
    - For new videos: write updated `channel:{id}:recent` and `channel:{id}:meta`, then look up subscribers and fan out FCM pushes
 3. Truncate `recent` to 15 entries
 
-**Quota cost: 0 YouTube Data API units.** RSS is a free public feed. Cloudflare KV cost: ~1 read per channel per tick, with writes only when a new video is detected, when engagement metrics cross their threshold, or when the top-of-hour top-of-list view refresh runs (see §6.4 below).
+**Quota cost: 0 YouTube Data API units.** RSS is a free public feed. Cloudflare KV writes occur for structural/recent-list changes, notification state changes, and engagement refreshes allowed by the persistence policy in §6.4.
 
 ### 3.2 FCM push from the cron
 
@@ -164,10 +166,10 @@ The WebSub handlers are intact but unused since 2024 (Google's hub was shut down
 
 | Key | Type | Contents | Written by | Read by |
 |-----|------|----------|------------|---------|
-| `channel:{channelId}:meta` | JSON | `{ name, avatarUrl, lastVideoId, addedAt, viewsLastCheckedHour? }` | API (subscribe), Cron (new video + view refresh) | API (feed, bootstrap) |
+| `channel:{channelId}:meta` | JSON | `{ name, avatarUrl, lastVideoId, addedAt }` | API (subscribe), Cron (new video) | API (feed, bootstrap) |
 | `channel:{channelId}:subscribers` | JSON array | `[deviceId, ...]` | API (subscribe, unsubscribe) | Cron (FCM fan-out), API (unsubscribe cleanup) |
 | `channel:{channelId}:websub` | JSON | `{ leaseExpiresAt, hmacSecret, lastVerified }` | API (subscribe, dormant) | (none — never used) |
-| `channel:{channelId}:recent` | JSON array | `[{ videoId, title, publishedAt, thumbnail, type, link, views, likes, dislikes, viewsLastCheckedHour? }]` — **v3.1**: `likes` + `dislikes` extracted from `media:starRating` and `media:statistics` | Cron (RSS poll) | API (feed, bootstrap), API (subscribe for first-time populate) |
+| `channel:{channelId}:recent` | JSON array | `[{ videoId, title, publishedAt, thumbnail, type, link, views, likes, dislikes, viewsLastCheckedHour?, likesLastCheckedHour? }]` — the two UTC-hour clocks independently gate view and likes/dislikes persistence | Cron (RSS poll) | API (feed, bootstrap), API (subscribe for first-time populate) |
 | `channel:{channelId}:recent:posts` | JSON array | `[{ activityId, kind, text, thumbnail, link, publishedAt }, ...]` — last 30 community posts (**v3.1**) | Cron (community posts) | API (feed) |
 | `channel:{channelId}:firstPollAt:posts` | string | ISO timestamp of the first posts-cron run for this channel — drives the first-run guard (**v3.1**) | Cron (community posts) | Cron (community posts) |
 | `device:{deviceId}:profile` | JSON | `{ fcmToken, platform, appVersion, createdAt, lastSeenAt }` | API (register) | API (any auth call), Cron (FCM fan-out) |
@@ -193,7 +195,7 @@ The WebSub handlers are intact but unused since 2024 (Google's hub was shut down
 
 ## 5.1 Nag reminder behaviour
 
-The nag system sends repeat reminder push notifications while items remain unread. It runs on every 5-minute cron tick.
+The nag system sends repeat reminder push notifications while items remain unread. The aux worker runs every minute; notification eligibility remains timestamp-based.
 
 **How it works:**
 
@@ -337,7 +339,8 @@ KV writes are the primary budget concern. The free tier allows 1,000 writes/day 
 
 | Worker | Invocations/day | CPU per | Notes |
 |--------|-----------------|---------|-------|
-| RSS/posts/aux scheduled workers | One invocation/worker/minute | Bounded | One RSS/post channel or bounded aux batch per invocation |
+| RSS shard workers | One invocation/worker/five minutes | Bounded | One RSS channel per active shard per invocation |
+| Posts/aux scheduled workers | One invocation/worker/minute | Bounded | One post channel or bounded aux batch per invocation |
 | `tubepulse-api` (HTTP) | ~20-50 | ~5ms | Depends on app open frequency and action count |
 
 ### 6.3 Cloudflare KV (free tier: 100K reads, 1K writes, 1K list, 1GB storage)
@@ -347,11 +350,16 @@ KV writes are the primary budget concern. The free tier allows 1,000 writes/day 
 - API (per app open): 4 `channel:{id}:*` reads × 4 channels = 16 reads × 20 opens = **320 reads/day**
 - **Total: ~2,400 reads/day = 2.4% of free tier**
 
-**Writes per day (1 user, 4 channels):**
-- View-refresh (throttled, see §6.4): up to 4 channels × 24 hours = **up to 96 writes/day**
-- App open (~20/day × ~5 writes each): **~100 writes/day**
-- One-time per subscribe: **~4 writes per new channel** (only on first add)
-- **Total: ~200 writes/day = 20% of free tier**
+**Writes are workload-dependent.** New uploads, notification state, app activity, subscription changes, cleanup, posts, aux work, and RSS cache updates all share the namespace. Any daily total is therefore a projection until measured in Cloudflare analytics.
+
+Predeployment evidence supplied from Cloudflare adaptive analytics on 2026-09-20 (approximate and potentially delayed):
+
+- 2026-09-19 recorded about **1,546 writes**.
+- 2026-09-20 had recorded about **950 writes by approximately 14:33 UTC**.
+- Before the five-minute cron change, RSS ran about **5 invocations per worker per 5 minutes** and the shared namespace recorded about **6–14 writes per 5 minutes**.
+- After the cron-only change, RSS ran about **1 invocation per worker per 5 minutes** and the shared namespace recorded about **1–2 writes per 5 minutes**.
+
+Those observations motivated the persistence-code fix below. They are not measurements of the corrected code; the initial postdeployment observation is recorded in §6.5. Namespace totals also include API, posts, and aux writes.
 
 **Cron `KV.list()` calls: 0 in the current code.** The `channels:active` index replaces cron-side namespace scans. The API `/register` path intentionally uses `KV.list({ prefix: 'device:' })` for FCM-token migration; see [CONTRACTS.md](CONTRACTS.md).
 
@@ -359,17 +367,38 @@ KV writes are the primary budget concern. The free tier allows 1,000 writes/day 
 
 ### 6.4 Engagement-metric write throttle (since v3.0.18, refined v3.1, threshold raised 2026-09-20)
 
-Originally, the combined cron re-stamped view counts on every video in the recent list on every tick, causing excessive writes.
+The 25% rule was ineffective in the predeployment shard code. After conditionally refreshing the cached latest entry, each shard rebuilt the recent array with fresh RSS metrics for every entry. Whole-array change detection therefore persisted routine view/like movement anyway. The likes/dislikes gate also used `viewsLastCheckedHour` instead of an independent likes clock.
 
 Current policy (updated 2026-09-20):
-- Only the **latest video's** view count is considered for writes
-- Only evaluated at the top of a new hour (gated by `currentHour !== viewsLastCheckedHour`)
-- Only writes if the count changed by **more than 25%** from the last stored value (raised from 5% on 2026-09-20 to reduce KV write burn on the free plan)
-- **Daily forced refresh**: if >24 hours since the last check, always write regardless of threshold (ensures small/slow channels still get view-count updates at least once/day)
-- Prior videos (index 1-14) keep their last-stored view counts — view counts are slightly stale on older videos, which is fine because the newest video is the one the user actually looks at
-- Likes and dislikes follow the same hourly + daily-refresh rule
 
-Net effect: engagement writes are bounded to at most 1-4 per channel per day (down from up to 24/hour with the old 5% threshold). Combined with the 5-minute poll cadence, total KV writes dropped from an estimated ~700-1,000/day to ~100-200/day across 19 active channels.
+- Existing cached videos preserve `views`, `likes`, and `dislikes`; older-video metric movement alone does not change the persisted array.
+- Only the latest existing video is eligible for a metric refresh.
+- Views use `viewsLastCheckedHour`; likes/dislikes use `likesLastCheckedHour` as an independent group clock.
+- Each group can refresh at most once per UTC hour and only when a metric changes by **strictly more than 25%**, or when that group has not been persisted for at least 24 hours.
+- New entries seed current RSS metrics and both clocks. Missing legacy clocks are migrated with one refresh.
+- Current RSS order, structural edits, additions/restorations, and removals are still persisted.
+
+The policy is expected to reduce RSS-driven writes, but the shared-namespace observation below cannot attribute changes to RSS alone and is not a guaranteed daily write count.
+
+### 6.5 Production deployment and observation (2026-09-20)
+
+The corrected RSS workers were deployed individually:
+
+| Worker | Version ID | Deployment timestamp (UTC) |
+|--------|------------|----------------------------|
+| `tubepulse-rss-0` | `dcbe5269-b32c-4302-9c41-8f4477b3ece4` | `2026-09-20T16:12:16.484491Z` |
+| `tubepulse-rss-1` | `bb7f3dcc-a63e-4d5e-9cd1-475c11f21e87` | `2026-09-20T16:12:35.539949Z` |
+| `tubepulse-rss-2` | `16c3853d-2c76-42d0-be07-ecbdbb7406ed` | `2026-09-20T16:12:54.093884Z` |
+
+All three live schedules were verified as exactly `*/5 * * * *`. From `2026-09-20T16:20:14Z` through `2026-09-20T16:55:14Z`, eight consecutive ticks produced 24/24 successful scheduled `CronEvent`s (8 per worker) with zero scheduled/runtime errors, RSS HTTP errors, fetch errors, FCM errors, or error-level console messages.
+
+The run covered 19/19 active channel IDs. Shards contained 7/6/6 channels, every selection matched the five-minute tick calculation, and each shard visited every member before wrapping: shard 0 wrapped on tick 8, while shards 1 and 2 wrapped on ticks 7 and 8. There was no starvation or unexpected within-cycle duplicate.
+
+RSS 0 and RSS 1 each produced normal poll output on 8/8 ticks; RSS 2 did so on 6/8. Its other two selections were both `UCvhToxTqKbs0iUgM6MYjTGw`, whose public RSS request returned HTTP 200 and valid feed metadata but zero `<entry>` elements, so both post-fetch early returns were expected. Separately, external monitoring sent one non-cron `workers.dev` `FetchEvent` probe to each scheduled-only worker. Those three probes returned the expected HTTP 500 because these workers intentionally export no `fetch()` handler; they are not scheduled-worker failures and are excluded from the cron health totals.
+
+Cloudflare adaptive analytics for the shared KV namespace reported this adjacent predeployment baseline for `15:30–16:05Z`: `2,3,10,3,6,6,6,1` writes per five-minute bucket, totaling 37 (average 4.625). The settled postdeployment buckets for `16:20–16:50Z` were `1,1,1,2,0,0,2`, totaling 7. The `16:55Z` bucket was still not reported on the final read-only query; a later `17:00Z` row reported 2 writes. Comparing the seven settled postdeployment buckets with the adjacent seven-bucket baseline slice `15:35–16:05Z` (35 writes) is about 80% lower. This is directional shared-namespace evidence, not RSS-only causation: API, posts, and aux also write to the namespace, and adaptive analytics can be approximate, delayed, or omit zero-valued groups.
+
+No API, posts, aux, or retired `tubepulse-cron` worker was deployed during this change. Production KV was not mutated to manufacture traffic, and no test notification push was sent.
 
 ---
 

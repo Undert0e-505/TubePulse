@@ -17,7 +17,7 @@ It is designed for people who want direct, lightweight YouTube notifications wit
 ## Features
 
 - Subscribe to YouTube channels by handle (`@handle`) or channel ID
-- Receive Android push notifications for new videos (via minute-scheduled rotating RSS shards)
+- Receive Android push notifications for new videos (via five-minute rotating RSS shards)
 - Receive Android push notifications for YouTube community posts (text, images, polls)
 - Home screen feed showing latest videos and posts from all tracked channels
 - Android home screen widget with latest videos and posts
@@ -56,7 +56,7 @@ YouTube's in-app notifications can be inconsistent, especially for community pos
 | Push notifications | Firebase Cloud Messaging (FCM) via HTTP v1 API |
 | Backend | Cloudflare Workers (API + five scheduled workers) |
 | Storage | Cloudflare KV |
-| Video detection | YouTube RSS feed polling (minute-scheduled rotating shards, zero Data API quota) |
+| Video detection | YouTube RSS feed polling (five-minute rotating shards, zero Data API quota) |
 | Community post detection | Rotating InnerTube polling (approximately hourly per active channel) |
 | Widgets | react-native-android-widget |
 | Auth | Persistent device UUID (Bearer token, independent of FCM token rotation) |
@@ -103,12 +103,12 @@ v3.3.1 fixes widget/HomeScreen feed parity so the widget uses the same latest vi
 > **Note:** Each device registers independently. There's no cross-device sync — if you install TubePulse on two phones, each manages its own channel list and settings.
 
 ### ⚡ New-Video Detection
-TubePulse detects new uploads via **three rotating YouTube RSS shard Workers** scheduled every minute. Originally it used **WebSub** (PubSubHubbub) for push-style detection, but Google's `pubsubhubbub.appspot.com` hub was shut down in 2024, and the v3.0.18 build abandoned the YouTube Data API poller because RSS provides the same data at zero quota cost.
+TubePulse detects new uploads via **three rotating YouTube RSS shard Workers** scheduled every five minutes. Originally it used **WebSub** (PubSubHubbub) for push-style detection, but Google's `pubsubhubbub.appspot.com` hub was shut down in 2024, and the v3.0.18 build abandoned the YouTube Data API poller because RSS provides the same data at zero quota cost.
 
 **Active path (since v3.0.18):**
-- **RSS-based polling** — active shards rotate over `channels:active`, polling one channel per shard per minute
+- **RSS-based polling** — active shards rotate over `channels:active`, polling one channel per shard every five minutes using a five-minute epoch tick
 - **Zero YouTube Data API quota cost** — RSS is a free public feed
-- **Latency** — up to one shard rotation (about 3 minutes with the current six active channels)
+- **Latency** — up to one shard rotation; the 19-channel production set observed on 2026-09-20 yields shard sizes 7/6/6 and a maximum 35-minute rotation
 - **Includes view counts, likes & dislikes** — RSS carries `media:statistics/@_views`, `media:starRating/@_count` (likes), and `media:statistics/@_dislikes` (usually `0` since YouTube removed public dislike counts in Nov 2021, but the field is still captured)
 - **The YouTube Data API is reserved for subscribe-time only** — handle→channelId resolve (1 unit, cached 7 days) and avatar fetch (1 unit per new channel, cached forever). Community-post polling uses InnerTube rather than Data API quota.
 
@@ -241,7 +241,7 @@ The old `tubepulse-cron` deployment is a retired no-op with no Cron Trigger. Bac
 
 | Worker | Cadence | Work per invocation |
 |---|---|---|
-| `tubepulse-rss-0/1/2` | Every minute | Each active shard polls one channel. Time-derived rotation covers every active channel without cursor writes. RSS is the active zero-quota video detection path. |
+| `tubepulse-rss-0/1/2` | Every five minutes (`*/5 * * * *`) | Each active shard polls one channel using a monotonically advancing five-minute epoch tick. Rotation coverage is tested for active-channel counts 1–30. RSS is the active zero-quota video detection path. |
 | `tubepulse-posts` | Every minute | Selects one eligible channel on a time-derived rotation; with six channels each is polled approximately hourly. Uses InnerTube and silently seeds first-poll state. |
 | `tubepulse-aux` | Every minute | Processes a bounded `nag:active` batch, drains legacy upcoming buckets, and checks scheduled-live prewarns. |
 
@@ -254,7 +254,7 @@ All five share `TUBEPULSE_KV`. The RSS and aux Workers require `FIREBASE_SERVICE
 | `channel:{channelId}:meta` | Channel name, avatarUrl, lastVideoId, addedAt |
 | `channel:{channelId}:subscribers` | Array of deviceIds tracking this channel |
 | `channel:{channelId}:websub` | WebSub state: leaseExpiresAt, hmacSecret, lastVerified (dormant — no longer used) |
-| `channel:{channelId}:recent` | Last 15 videos: videoId, title, publishedAt, type, thumbnail, link, **views** (from RSS `media:statistics/@_views`), **likes** (from `media:starRating/@_count`), **dislikes** (from `media:statistics/@_dislikes`), **viewsLastCheckedHour** (wall-clock hour of last engagement-metric refresh) |
+| `channel:{channelId}:recent` | Last 15 videos: videoId, title, publishedAt, type, thumbnail, link, **views**, **likes**, **dislikes**, **viewsLastCheckedHour** (view persistence UTC hour), and **likesLastCheckedHour** (likes/dislikes persistence UTC hour) |
 | `channel:{channelId}:recent:posts` | Last 30 community posts: activityId, kind, text, thumbnail, link, publishedAt |
 | `channel:{channelId}:firstPollAt:posts` | ISO timestamp of first posts-cron run for this channel (drives the first-run guard) |
 | `device:{deviceId}:profile` | fcmToken (nullable), platform, appVersion, createdAt, lastSeenAt |

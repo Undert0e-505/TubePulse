@@ -1,13 +1,13 @@
 // tubepulse-rss — RSS shard worker (1 channel per invocation)
-// Scheduled every minute. Each shard processes one channel from its slice.
+// Scheduled every five minutes. Each shard processes one channel from its slice.
 
 import {
   key, getKV, putKV, putKVIfChanged, selectRssShardWork,
-  fetchChannelRSS, classifyVideo, isDndActive,
+  fetchChannelRSS, isDndActive,
   getCachedFcmAccessToken, sendFCMPush, cleanupDeadDevice,
   addToNagActive,
   seedKnownVideosFromRss, classifyRssVideosForNotification,
-  updateKnownVideosAfterPoll,
+  updateKnownVideosAfterPoll, mergeRssUploadsIntoRecentVideos,
 } from '../tubepulse-cron/shared.mjs';
 
 const RSS_MAX_SHARDS = 3;
@@ -19,8 +19,8 @@ export default {
     const active = await getKV(env.TUBEPULSE_KV, key.channelsActive()) || [];
     if (active.length === 0) return;
 
-    const minuteSlot = Math.floor(Date.now() / 60000);
-    const work = selectRssShardWork(active, shardIndex, maxShards, minuteSlot);
+    const fiveMinuteTick = Math.floor((event?.scheduledTime ?? Date.now()) / 300000);
+    const work = selectRssShardWork(active, shardIndex, maxShards, fiveMinuteTick);
     if (!work) return;
 
     console.log(`[RSS] shard=${shardIndex}/${work.activeShardCount} channel=${work.channelId}`);
@@ -60,18 +60,7 @@ async function pollSingleRssChannel(env, ctx, channelId) {
     await putKV(kv, key.channelKnownVideos(channelId), seededKnown);
 
     const subs = await getKV(kv, key.channelSubs(channelId)) || [];
-    const seededRecent = uploads.slice(0, 15).map((v) => ({
-      videoId: v.videoId,
-      title: v.title,
-      publishedAt: v.published,
-      thumbnail: v.thumbnail,
-      type: classifyVideo(v),
-      link: v.link,
-      views: v.views || '0',
-      likes: v.likes != null ? String(v.likes) : '0',
-      dislikes: v.dislikes != null ? String(v.dislikes) : '0',
-      viewsLastCheckedHour: Math.floor(now / 3600000),
-    }));
+    const seededRecent = mergeRssUploadsIntoRecentVideos(prevRecent, uploads, now);
     await putKVIfChanged(kv, key.channelRecent(channelId), seededRecent, prevRecent);
 
     const meta = await getKV(kv, key.channelMeta(channelId)) || {};
@@ -93,111 +82,9 @@ async function pollSingleRssChannel(env, ctx, channelId) {
   const newVideos = classified.filter((v) => v.isNew);
   const suppressed = classified.filter((v) => !v.isNew);
 
-  // View-count refresh for latest video.
-  // Writes only when: views changed >25% AND checked in a different hour,
-  // OR it's been >24 hours since the last check (daily forced refresh
-  // ensures small/slow channels still get updated at least once/day).
-  // This reduces KV writes from ~24/channel/day to ~1-4/channel/day.
-  const VIEW_REFRESH_THRESHOLD = 0.25; // 25%
-  const DAILY_REFRESH_MS = 24 * 60 * 60 * 1000;
-  const rssByVideoId = new Map(uploads.map((u) => [u.videoId, u]));
-  const refreshedPrev = prevRecent.map((v) => v);
-  let recentChanged = false;
-
-  // Backfill likes/dislikes
-  let backfilledAny = false;
-  for (let i = 0; i < refreshedPrev.length; i++) {
-    const v = refreshedPrev[i];
-    const rss = rssByVideoId.get(v.videoId);
-    if (!rss) continue;
-    const needsLikes = v.likes === undefined || v.likes === null;
-    const needsDislikes = v.dislikes === undefined || v.dislikes === null;
-    if (!needsLikes && !needsDislikes) continue;
-    refreshedPrev[i] = {
-      ...v,
-      likes: rss.likes != null ? String(rss.likes) : '0',
-      dislikes: rss.dislikes != null ? String(rss.dislikes) : '0',
-    };
-    backfilledAny = true;
-  }
-  if (backfilledAny) {
-    recentChanged = true;
-    console.log(`[RSS] ${channelId}: backfilled likes/dislikes`);
-  }
-
-  const latest = prevRecent[0];
-  const latestFromRss = latest && rssByVideoId.get(latest.videoId);
-  const currentHour = Math.floor(now / 3600000);
-
-  if (latest && latestFromRss) {
-    const oldViews = parseInt(latest.views || '0', 10);
-    const newViews = parseInt(latestFromRss.views || '0', 10);
-    const lastCheckedMs = (latest.viewsLastCheckedHour || 0) * 3600000;
-    const stale = (now - lastCheckedMs) > DAILY_REFRESH_MS;
-    const viewsChanged = (
-      !isNaN(oldViews) && !isNaN(newViews) &&
-      currentHour !== latest.viewsLastCheckedHour &&
-      (stale || oldViews === 0 || Math.abs(newViews - oldViews) / Math.max(oldViews, 1) > VIEW_REFRESH_THRESHOLD)
-    );
-    const oldLikes = latest.likes;
-    const newLikes = latestFromRss.likes != null ? String(latestFromRss.likes) : null;
-    const oldDislikes = latest.dislikes;
-    const newDislikes = latestFromRss.dislikes != null ? String(latestFromRss.dislikes) : null;
-    const likesChanged = (
-      currentHour !== latest.viewsLastCheckedHour &&
-      (stale || (newLikes != null && newLikes !== oldLikes) || (newDislikes != null && newDislikes !== oldDislikes))
-    );
-
-    if (viewsChanged) {
-      refreshedPrev[0] = { ...latest, views: String(newViews), viewsLastCheckedHour: currentHour };
-      recentChanged = true;
-    }
-    if (likesChanged) {
-      refreshedPrev[0] = {
-        ...refreshedPrev[0],
-        likes: newLikes != null ? newLikes : (latest.likes || '0'),
-        dislikes: newDislikes != null ? newDislikes : (latest.dislikes || '0'),
-        likesLastCheckedHour: currentHour,
-      };
-      recentChanged = true;
-    }
-  }
-
-  // Build updated display recent list: always reflect current RSS feed order.
-  // Suppressed videos (old/deletion-exposed) still appear in display cache.
-  const rssRecentVideos = uploads.slice(0, 15).map((v) => {
-    const rss = rssByVideoId.get(v.videoId) || v;
-    return {
-      videoId: v.videoId,
-      title: v.title,
-      publishedAt: v.published,
-      thumbnail: v.thumbnail,
-      type: classifyVideo(v),
-      link: v.link,
-      views: v.views || '0',
-      likes: rss.likes != null ? String(rss.likes) : '0',
-      dislikes: rss.dislikes != null ? String(rss.dislikes) : '0',
-    };
-  });
-
-  // Preserve hourly view/like refresh fields from refreshedPrev when present.
-  const refreshedPrevMap = new Map(refreshedPrev.map((v) => [v.videoId, v]));
-  const mergedRecent = rssRecentVideos.map((v) => {
-    const prev = refreshedPrevMap.get(v.videoId);
-    if (!prev) return v;
-    return {
-      ...v,
-      viewsLastCheckedHour: prev.viewsLastCheckedHour !== undefined ? prev.viewsLastCheckedHour : v.viewsLastCheckedHour,
-      likesLastCheckedHour: prev.likesLastCheckedHour !== undefined ? prev.likesLastCheckedHour : v.likesLastCheckedHour,
-    };
-  });
-
-  if (!recentChanged && !jsonEqualish(prevRecent, mergedRecent)) {
-    recentChanged = true;
-  }
-  if (recentChanged) {
-    await putKVIfChanged(kv, key.channelRecent(channelId), mergedRecent, prevRecent);
-  }
+  // Always reflect RSS structure while the shared helper enforces metric persistence.
+  const mergedRecent = mergeRssUploadsIntoRecentVideos(prevRecent, uploads, now);
+  await putKVIfChanged(kv, key.channelRecent(channelId), mergedRecent, prevRecent);
 
   // Update known/watermark state after every poll — write only on semantic change.
   const knownResult = updateKnownVideosAfterPoll(known, uploads, newVideos, nowIso);
@@ -330,13 +217,5 @@ async function pollSingleRssChannel(env, ctx, channelId) {
   for (const deviceId of [...new Set(deadDevices)]) {
     console.log(`[RSS] Pruning dead device: ${deviceId}`);
     ctx.waitUntil(cleanupDeadDevice(deviceId, env, 'fcm_unregistered'));
-  }
-}
-
-function jsonEqualish(a, b) {
-  try {
-    return JSON.stringify(a) === JSON.stringify(b);
-  } catch {
-    return false;
   }
 }
