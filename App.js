@@ -1,11 +1,13 @@
-import React, { useEffect, useRef } from 'react';
-import { StatusBar, Text, TouchableOpacity, Platform, Linking } from 'react-native';
+import React, { useEffect, useRef, useState } from 'react';
+import { ActivityIndicator, StatusBar, Text, TouchableOpacity, Platform, Linking, View } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { NavigationContainer, DefaultTheme } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import HomeScreen from './src/screens/HomeScreen';
 import ChannelsScreen from './src/screens/ChannelsScreen';
 import SettingsScreen from './src/screens/SettingsScreen';
+import PreviewServerScreen from './src/screens/PreviewServerScreen';
 import { COLORS } from './src/utils/constants';
 import { getSettings, getLastSeen, saveLastSeen, getChannelCache, saveChannelCache } from './src/utils/storage';
 import { requestPermissionAndGetToken, onTokenRefresh, onForegroundMessage, onNotificationOpenedApp, getInitialNotification, setBackgroundMessageHandler } from './src/utils/fcm';
@@ -13,6 +15,17 @@ import { registerDevice, markSeen, getDeviceId, subscribeChannel, updateSettings
 import { setupNotificationChannel } from './src/utils/notifications';
 import { ConfirmHost } from './src/components/Confirm';
 import { updateWidget } from './src/components/widgetTaskHandler';
+import {
+  IS_TUBEPULSE_PREVIEW,
+  PREVIEW_PUSH_ENABLED,
+  getConfiguredPreviewOrigin,
+  subscribeToPreviewOriginChanges,
+} from './src/utils/apiEndpointConfig';
+import { bootstrapTrackedChannel } from './src/utils/channelBootstrap.mjs';
+import {
+  APP_INITIALIZATION_STORAGE_KEY,
+  createAppInitializationMarker,
+} from './src/utils/appInitialization.mjs';
 
 // Configure expo-notifications to show notifications while the app is
 // in the foreground. Without this, scheduleNotificationAsync calls
@@ -58,7 +71,7 @@ function HeaderButton({ title, onPress, style }) {
 //   2. Update the channel cache in AsyncStorage
 //   3. Trigger a widget re-render so the home screen widget shows the new video
 // Without this, the widget stays stale until the user opens the app.
-setBackgroundMessageHandler(async (remoteMessage) => {
+if (PREVIEW_PUSH_ENABLED) setBackgroundMessageHandler(async (remoteMessage) => {
   console.log('Background push received:', remoteMessage?.messageId, remoteMessage?.data?.videoId);
   try {
     const { getDeviceId, fetchFeed } = require('./src/utils/api');
@@ -127,9 +140,10 @@ setBackgroundMessageHandler(async (remoteMessage) => {
   }
 });
 
-export default function App() {
+function TubePulseApplication() {
   const fcmTokenRef = useRef(null);
   const deviceIdRef = useRef(null);
+  const [initializationMarker] = useState(() => createAppInitializationMarker());
 
   useEffect(() => {
     (async () => {
@@ -141,8 +155,9 @@ export default function App() {
         const deviceId = await getDeviceId();
         deviceIdRef.current = deviceId;
 
-        // Request permission and get FCM token
-        const fcmToken = await requestPermissionAndGetToken();
+        // Preview APKs use a null token unless built with a real, separately
+        // registered Firebase Android client for the preview package.
+        const fcmToken = PREVIEW_PUSH_ENABLED ? await requestPermissionAndGetToken() : null;
         // Register device with the server. We do this even if FCM is unavailable —
         // the device profile is what the preseed channel bootstrap subscribes against.
         // FCM token is a separate field on the profile and is set/updated below.
@@ -242,7 +257,12 @@ export default function App() {
             for (const ch of channelsNeedingBootstrap) {
               // Bootstrap — fetches RSS + avatar from server
               try {
-                const bootResult = await bootstrapChannel(deviceId, ch.channelId);
+                const bootResult = await bootstrapTrackedChannel({
+                  deviceId,
+                  channelId: ch.channelId,
+                  bootstrapChannel,
+                  subscribeChannel,
+                });
                 if (bootResult?.ok && bootResult.videos?.length > 0) {
                   const { saveChannelCache, getLastSeen, saveLastSeen } = require('./src/utils/storage');
                   const freshCache = await getChannelCache();
@@ -291,16 +311,22 @@ export default function App() {
         } catch (e) {
           console.warn('[Init] Channel reconciliation failed:', e);
         }
-        // Signal that init is complete (whether or not bootstrap ran)
-        const { AsyncStorage: AS } = require('react-native');
-        await AS.setItem('tubepulse_init_done', String(Date.now()));
       } catch (e) {
         console.warn('Init error:', e);
+      } finally {
+        // Signal completion even when initialization failed. Home waits for
+        // this current-session marker before its first Preview feed request,
+        // then surfaces any real offline/registration error normally.
+        try {
+          await AsyncStorage.setItem(APP_INITIALIZATION_STORAGE_KEY, initializationMarker);
+        } catch (e) {
+          console.warn('Could not persist initialization completion:', e);
+        }
       }
     })();
 
     // Handle token refresh — re-register with updated FCM token
-    const tokenUnsubscribe = onTokenRefresh(async (newToken) => {
+    const tokenUnsubscribe = PREVIEW_PUSH_ENABLED ? onTokenRefresh(async (newToken) => {
       fcmTokenRef.current = newToken;
       try {
         const deviceId = deviceIdRef.current || await getDeviceId();
@@ -308,13 +334,13 @@ export default function App() {
       } catch (e) {
         console.warn('Token refresh re-register failed:', e);
       }
-    });
+    }) : () => {};
 
     // Handle foreground messages
     // When the app is in the foreground, FCM does NOT automatically show
     // a system notification. We must explicitly display one using
     // expo-notifications' scheduleNotificationAsync.
-    const foregroundUnsubscribe = onForegroundMessage(async (remoteMessage) => {
+    const foregroundUnsubscribe = PREVIEW_PUSH_ENABLED ? onForegroundMessage(async (remoteMessage) => {
       console.log('Foreground push:', remoteMessage?.data?.videoId || remoteMessage?.data?.activityId);
       try {
         const Notifications = require('expo-notifications');
@@ -370,7 +396,7 @@ export default function App() {
       } catch (e) {
         console.warn('Foreground notification display failed:', e);
       }
-    });
+    }) : () => {};
 
     // Handle notification tap (app opened from notification)
     const handleNotificationTap = async (remoteMessage) => {
@@ -508,14 +534,18 @@ export default function App() {
     };
 
     // Check if app was opened from a notification (cold start)
-    getInitialNotification().then((remoteMessage) => {
-      if (remoteMessage) {
-        handleNotificationTap(remoteMessage);
-      }
-    });
+    if (PREVIEW_PUSH_ENABLED) {
+      getInitialNotification().then((remoteMessage) => {
+        if (remoteMessage) {
+          handleNotificationTap(remoteMessage);
+        }
+      });
+    }
 
     // Listen for notification taps (warm start)
-    const tapUnsubscribe = onNotificationOpenedApp(handleNotificationTap);
+    const tapUnsubscribe = PREVIEW_PUSH_ENABLED
+      ? onNotificationOpenedApp(handleNotificationTap)
+      : () => {};
 
     return () => {
       tokenUnsubscribe();
@@ -545,9 +575,8 @@ export default function App() {
         <Stack.Navigator screenOptions={screenOptions}>
           <Stack.Screen
             name="Home"
-            component={HomeScreen}
             options={({ navigation }) => ({
-              title: 'TubePulse',
+              title: IS_TUBEPULSE_PREVIEW ? 'TubePulse Preview' : 'TubePulse',
               headerRight: () => (
                 <>
                   <HeaderButton title="Channels" onPress={() => navigation.navigate('Channels')} />
@@ -555,9 +584,19 @@ export default function App() {
                 </>
               ),
             })}
-          />
+          >
+            {(screenProps) => (
+              <HomeScreen
+                {...screenProps}
+                previewInitializationMarker={IS_TUBEPULSE_PREVIEW ? initializationMarker : null}
+              />
+            )}
+          </Stack.Screen>
           <Stack.Screen name="Channels" component={ChannelsScreen} />
           <Stack.Screen name="Settings" component={SettingsScreen} />
+          {IS_TUBEPULSE_PREVIEW ? (
+            <Stack.Screen name="PreviewServer" component={PreviewServerScreen} options={{ title: 'Preview Server' }} />
+          ) : null}
         </Stack.Navigator>
       </NavigationContainer>
       {/* ConfirmHost is a global modal host. Any `confirm()` call from
@@ -566,4 +605,56 @@ export default function App() {
       <ConfirmHost />
     </GestureHandlerRootView>
   );
+}
+
+export default function App() {
+  const [previewReady, setPreviewReady] = useState(!IS_TUBEPULSE_PREVIEW);
+  const [checkingPreview, setCheckingPreview] = useState(IS_TUBEPULSE_PREVIEW);
+  const [previewRevision, setPreviewRevision] = useState(0);
+
+  useEffect(() => {
+    if (!IS_TUBEPULSE_PREVIEW) return undefined;
+    let cancelled = false;
+    getConfiguredPreviewOrigin()
+      .then((origin) => {
+        if (!cancelled) setPreviewReady(Boolean(origin));
+      })
+      .finally(() => {
+        if (!cancelled) setCheckingPreview(false);
+      });
+    const unsubscribe = subscribeToPreviewOriginChanges(() => {
+      setPreviewReady(true);
+      setCheckingPreview(false);
+      // Remount normal initialization so the new Home receives registration,
+      // settings and subscription reconciliation immediately.
+      setPreviewRevision((value) => value + 1);
+    });
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, []);
+
+  if (checkingPreview) {
+    return (
+      <GestureHandlerRootView style={{ flex: 1 }}>
+        <StatusBar barStyle="light-content" backgroundColor={COLORS.bg} />
+        <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: COLORS.bg }}>
+          <ActivityIndicator color={COLORS.accent} />
+          <Text style={{ color: COLORS.textDim, marginTop: 12 }}>Loading TubePulse Preview…</Text>
+        </View>
+      </GestureHandlerRootView>
+    );
+  }
+
+  if (IS_TUBEPULSE_PREVIEW && !previewReady) {
+    return (
+      <GestureHandlerRootView style={{ flex: 1 }}>
+        <StatusBar barStyle="light-content" backgroundColor={COLORS.bg} />
+        <PreviewServerScreen initialSetup />
+      </GestureHandlerRootView>
+    );
+  }
+
+  return <TubePulseApplication key={`endpoint-${previewRevision}`} />;
 }

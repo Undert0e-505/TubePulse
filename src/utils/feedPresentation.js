@@ -79,3 +79,21 @@ export function formatCompactCount(value) {
   if (num >= 1000) return `${(num / 1000).toFixed(1).replace(/\.0$/, '')}K`;
   return `${num}`;
 }
+
+export function hasKnownMetric(value) {
+  return value !== null
+    && value !== undefined
+    && value !== ''
+    && Number.isFinite(Number(value));
+}
+
+/**
+ * Prefer an explicitly returned server metric, including explicit null.
+ * Fall back to cached data only when an older server omitted the field.
+ */
+export function resolveOptionalMetric(source, field, fallback = null) {
+  if (source && Object.prototype.hasOwnProperty.call(source, field)) {
+    return hasKnownMetric(source[field]) ? source[field] : null;
+  }
+  return hasKnownMetric(fallback) ? fallback : null;
+}

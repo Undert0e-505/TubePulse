@@ -1,0 +1,22 @@
+services:
+  tubepulse:
+    build:
+      context: ..
+      dockerfile: self-host/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TUBEPULSE_HOST: 0.0.0.0
+      TUBEPULSE_PORT: 8788
+      TUBEPULSE_DATA_DIR: /data
+      TUBEPULSE_PILOT: "${TUBEPULSE_PILOT:-false}"
+      TUBEPULSE_MODE: "${TUBEPULSE_MODE:-standalone}"
+      TUBEPULSE_AUTO_TAKEOVER: "${TUBEPULSE_AUTO_TAKEOVER:-false}"
+      TUBEPULSE_CLOUDFLARE_WRITE_ENABLED: "${TUBEPULSE_CLOUDFLARE_WRITE_ENABLED:-false}"
+      TUBEPULSE_SYNC_AUTO_PUSH: "${TUBEPULSE_SYNC_AUTO_PUSH:-false}"
+    ports:
+      - "${TUBEPULSE_PUBLISH_ADDRESS:-127.0.0.1}:8788:8788"
+    volumes:
+      - "${TUBEPULSE_HOST_DATA_DIR:-./data}:/data"
+      - ./secrets:/run/secrets/tubepulse:ro

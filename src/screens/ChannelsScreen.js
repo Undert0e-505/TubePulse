@@ -26,6 +26,7 @@ import {
 } from '../utils/storage';
 import { resolveHandle, subscribeChannel, unsubscribeChannel, registerDevice, getDeviceId, setChannelOverride, bootstrapChannel } from '../utils/api';
 import { getFCMToken } from '../utils/fcm';
+import { PREVIEW_PUSH_ENABLED } from '../utils/apiEndpointConfig';
 import TimeSpinner from '../components/TimeSpinner';
 import { confirm } from '../components/Confirm';
 import { updateWidget } from '../components/widgetTaskHandler';
@@ -166,8 +167,10 @@ export default function ChannelsScreen() {
 
       // Ensure device is registered before resolve (may not have completed on fresh install)
       const { getChannels, getSettings } = require('../utils/storage');
-      const fcmToken = await getFCMToken();
-      if (fcmToken) {
+      const fcmToken = PREVIEW_PUSH_ENABLED ? await getFCMToken() : null;
+      if (!PREVIEW_PUSH_ENABLED) {
+        await registerDevice(deviceId, null);
+      } else if (fcmToken) {
         await registerDevice(deviceId, fcmToken);
       }
 

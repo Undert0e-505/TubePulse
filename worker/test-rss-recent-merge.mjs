@@ -141,6 +141,55 @@ function makeCached(upload, overrides = {}) {
   assert.equal(seeded.likesLastCheckedHour, CURRENT_HOUR);
 }
 
+// An unavailable/hidden metric is unknown, not a synthetic zero.
+{
+  const upload = makeUpload('hidden-likes', { likes: null, dislikes: null });
+  const [seeded] = mergeRssUploadsIntoRecentVideos([], [upload], NOW_MS);
+  assert.equal(seeded.likes, null);
+  assert.equal(seeded.dislikes, null);
+  assert.equal(seeded.likesLastCheckedHour, CURRENT_HOUR);
+}
+
+// A legacy API bootstrap zero without a metric clock is ambiguous. Its first
+// scheduled RSS enrichment self-heals to the authoritative unknown value.
+{
+  const upload = makeUpload('legacy-hidden', { likes: null, dislikes: null });
+  const cached = makeCached(upload, { likes: '0', dislikes: '0' });
+  delete cached.likesLastCheckedHour;
+  const [healed] = mergeRssUploadsIntoRecentVideos([cached], [upload], NOW_MS);
+  assert.equal(healed.likes, null);
+  assert.equal(healed.dislikes, null);
+  assert.equal(healed.likesLastCheckedHour, CURRENT_HOUR);
+}
+
+// Some legacy zeros may already have acquired a clock from an older cron
+// version. Missing RSS metrics still repair those zeros once, without waiting
+// for the 24-hour refresh, and the repaired record is stable thereafter.
+{
+  const upload = makeUpload('clocked-legacy-hidden', { likes: null, dislikes: null });
+  const cached = makeCached(upload, {
+    likes: '0',
+    dislikes: '0',
+    likesLastCheckedHour: CURRENT_HOUR,
+  });
+  const healed = mergeRssUploadsIntoRecentVideos([cached], [upload], NOW_MS);
+  assert.equal(healed[0].likes, null);
+  assert.equal(healed[0].dislikes, null);
+  assert.equal(healed[0].likesLastCheckedHour, CURRENT_HOUR);
+  assert.deepEqual(
+    mergeRssUploadsIntoRecentVideos(healed, [upload], NOW_MS),
+    healed,
+  );
+}
+
+// An explicit public zero is still a real count.
+{
+  const upload = makeUpload('real-zero', { likes: '0', dislikes: null });
+  const [seeded] = mergeRssUploadsIntoRecentVideos([], [upload], NOW_MS);
+  assert.equal(seeded.likes, '0');
+  assert.equal(seeded.dislikes, null);
+}
+
 // Feed order, structural edits, and removals remain visible independently of
 // metric persistence.
 {

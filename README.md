@@ -6,25 +6,26 @@
 [![Cloudflare Workers](https://img.shields.io/badge/backend-Cloudflare%20Workers-F38020.svg)](https://workers.cloudflare.com/)
 [![React Native](https://img.shields.io/badge/built%20with-React%20Native%20%2F%20Expo-61DAFB.svg)](https://expo.dev/)
 
-TubePulse is an open-source Android app for YouTube channel notifications, including community posts. It uses a small Cloudflare Workers backend and Firebase Cloud Messaging to deliver push notifications when subscribed channels publish new videos or community posts.
+TubePulse is an open-source Android app for YouTube channel notifications, including community posts. Its public API remains on Cloudflare Workers; the production scheduler can run as a unified local Home authority and uses Firebase Cloud Messaging for push delivery.
 
 It is designed for people who want direct, lightweight YouTube notifications without relying entirely on the YouTube app's notification behaviour.
 
 - **Android only** — no iOS support planned
 - **MIT licensed** — forkable, modifiable, self-hostable
-- **Self-hosted backend** — Cloudflare Workers + KV, Firebase Cloud Messaging
+- **Self-hostable backend** — Cloudflare Workers remain the default; an additive local-runtime preview is available
 
 ## Features
 
 - Subscribe to YouTube channels by handle (`@handle`) or channel ID
-- Receive Android push notifications for new videos (via five-minute rotating RSS shards)
+- Receive Android push notifications for new videos (every active channel is checked by Home every five minutes)
 - Receive Android push notifications for YouTube community posts (text, images, polls)
 - Home screen feed showing latest videos and posts from all tracked channels
 - Android home screen widget with latest videos and posts
 - Per-channel notification overrides (mode, DND, prewarn time, community posts opt-out)
 - Scheduled livestream prewarn — get notified before a stream goes live
 - Nag cycle — configurable re-notifications for unwatched videos
-- Cloudflare Workers backend (API + cron), zero `KV.list()` calls
+- Cloudflare public API plus an optional unified local scheduler/authority
+- Optional standalone or Cloudflare-mirror self-host preview with local persistent KV
 - Firebase Cloud Messaging push delivery
 - MIT licensed and forkable
 
@@ -54,10 +55,10 @@ YouTube's in-app notifications can be inconsistent, especially for community pos
 |-------|-----------|
 | Android app | React Native + Expo |
 | Push notifications | Firebase Cloud Messaging (FCM) via HTTP v1 API |
-| Backend | Cloudflare Workers (API + five scheduled workers) |
-| Storage | Cloudflare KV |
-| Video detection | YouTube RSS feed polling (five-minute rotating shards, zero Data API quota) |
-| Community post detection | Rotating InnerTube polling (approximately hourly per active channel) |
+| Backend | Cloudflare public API plus the self-host/Home runtime |
+| Storage | Persistent local KV with changed-key Cloudflare KV backup |
+| Video detection | YouTube RSS polling of every active channel every five minutes (zero Data API quota) |
+| Community post detection | InnerTube polling of every eligible channel hourly |
 | Widgets | react-native-android-widget |
 | Auth | Persistent device UUID (Bearer token, independent of FCM token rotation) |
 
@@ -68,8 +69,19 @@ YouTube's in-app notifications can be inconsistent, especially for community pos
 - **v3.3.2** includes reliable multi-device subscription reconciliation.
 - Community post support exists but depends on unofficial YouTube web data structures, so it may need maintenance if YouTube changes.
 - The app is Android-only. No iOS support is planned.
+- An experimental, functional [self-host preview](self-host/README.md) can run the existing Worker sources locally or as a conflict-detecting Cloudflare standby. It is not deployed to the maintainer's production account by its addition.
 - See [STATUS.md](STATUS.md) for current repo status and operational caveats.
 - See [RELEASE.md](RELEASE.md) for the release process.
+
+---
+
+## Self-host preview
+
+The additive [`self-host/`](self-host/) package runs the existing API and scheduled Worker modules through a workerd-backed local runtime. It supports standalone operation, persistent local KV, explicit Cloudflare reconciliation, and Docker/Windows operation. A debug-signed `TubePulse Preview` APK can be installed beside the main app, selects a health-tested Home URL at runtime, and never falls back to production. Its documented pilot Compose profile uses an isolated `data-pilot` directory and hard-disables Cloudflare sync/write behavior. A private Workers VPC canary was exercised on 2026-10-04 without a public Home hostname or inbound router port, then disabled after its full five-minute mirror was shown to consume about 233,000 KV reads/day at 811 records.
+
+Production switched to the **unified Home authority** on 2026-10-04: one process/store owns signed all-device mutation replication and the consolidated scheduler, polls every active channel's RSS every five minutes, polls community posts hourly, and runs aux work each minute. The unchanged public Worker URL serves every authenticated `/feed` from this local store over Workers VPC when the authority is current, with bounded Cloudflare-KV fallback. Home publishes only changed keys to Cloudflare backup storage; a coordinator caps scheduler backup writes at 650/day and total coordinated writes at 950/day, leaving 300 writes of app-mutation headroom. Deferred backup changes are coalesced, overlapping app keys are flushed before a Cloudflare-first mutation runs, and notification intents are suppressed while their backup publication is deferred. No periodic namespace pull runs after the one-time signed snapshot. The three RSS, posts, and aux Cloudflare Cron Triggers are disabled; their Worker deployments are retained for rollback.
+
+Start with the [self-host guide](self-host/README.md) for its preview limitations, five-minute setup, synchronization safety model, Cloudflare Tunnel guidance, backups, and recovery procedure.
 
 ---
 
@@ -79,7 +91,7 @@ YouTube's in-app notifications can be inconsistent, especially for community pos
 > App release process and cleanup plan: see [RELEASE.md](RELEASE.md). Worker deployments are separate from app APK releases.
 
 ### Current App Line
-The current checked-in app version is `3.3.1`. The v3.1 feature line below remains the latest broad feature summary in these docs; see [STATUS.md](STATUS.md) for current repo status and caveats.
+The current checked-in app version is `3.5.2`. The v3.1 feature line below is retained as a historical feature summary; see [STATUS.md](STATUS.md) for current repo status and caveats.
 
 Community posts in v3.3.0 are enabled for active subscribed channels when the global worker feature gate is on. Newly added channels are silently seeded before future community-post notifications, so old posts are not pushed as new.
 
@@ -108,7 +120,7 @@ TubePulse detects new uploads via **three rotating YouTube RSS shard Workers** s
 **Active path (since v3.0.18):**
 - **RSS-based polling** — active shards rotate over `channels:active`, polling one channel per shard every five minutes using a five-minute epoch tick
 - **Zero YouTube Data API quota cost** — RSS is a free public feed
-- **Latency** — up to one shard rotation; the 19-channel production set observed on 2026-09-20 yields shard sizes 7/6/6 and a maximum 35-minute rotation
+- **Latency** — up to one shard rotation. Derive the live value from `channels:active`: for `N` active channels, `S = min(3, max(1, ceil(N / 5)))` shards are active; each channel's worst-case revisit interval is `5 minutes × the size of its round-robin shard`, and average detection is approximately half that interval. Because subscriptions change, operational status—not a hard-coded README count—is the source for current latency.
 - **Includes view counts, likes & dislikes** — RSS carries `media:statistics/@_views`, `media:starRating/@_count` (likes), and `media:statistics/@_dislikes` (usually `0` since YouTube removed public dislike counts in Nov 2021, but the field is still captured)
 - **The YouTube Data API is reserved for subscribe-time only** — handle→channelId resolve (1 unit, cached 7 days) and avatar fetch (1 unit per new channel, cached forever). Community-post polling uses InnerTube rather than Data API quota.
 
@@ -125,7 +137,7 @@ When a new video is detected, the RSS shard pushes it to all eligible devices vi
 - **At the scheduled time, the regular new-video push fires** — the same `type: 'live'` notification as any other upload. There is no separate "is live now!" notification; the prewarn is the heads-up, the regular push is the "this just appeared" notification. Livestreams bypass DND.
 - Then nagged like any other unwatched video until you watch it
 
-**Community posts (v3.1):** the posts Worker runs every minute and time-rotates eligible channels so each is polled approximately hourly through InnerTube. It captures text posts, image posts, and polls. A first-run guard prevents notification floods on first install. Posts respect the same global `includeCommunityPosts` setting and per-channel override as videos. Posts do not enter the nag cycle — only the initial push fires.
+**Community posts (v3.1):** the production Home scheduler checks every eligible channel once per hour through InnerTube. It captures text posts, image posts, and polls. A first-run guard prevents notification floods on first install. Posts respect the same global `includeCommunityPosts` setting and per-channel override as videos. Posts do not enter the nag cycle — only the initial push fires.
 
 Shorts are currently not filtered — they're treated as regular uploads.
 
@@ -216,7 +228,7 @@ The central Cloudflare Worker. Handles:
 | `/subscribe-channel` | POST | Add a channel to this device. Triggers Data API avatar fetch (one-time, cached forever) + RSS bootstrap for the recent list. |
 | `/unsubscribe` | POST | Remove a channel from this device. Removes the device from the channel's subscriber list; if the subscriber list goes empty, the channel is removed from the `channels:active` index. |
 | `/seen` | POST | Mark videos/posts as watched. `{ channelId, ids: [videoId, "post:activityId", ...] }` for taps, `{ channelId, clearAll: true }` for channel-tap. Post IDs are namespaced with `post:` so they share the `deviceState.unwatched` array with videos without collision. |
-| `/feed` | GET | Fetch current video + post data for all tracked channels (reads from KV cache). Each post carries an `unwatched` flag mirroring the video pattern. |
+| `/feed` | GET | Fetch current video + post data for all tracked channels. Production serves authenticated feeds from the unified Home store over VPC while current, with bounded Cloudflare-KV fallback. Each post carries an `unwatched` flag mirroring the video pattern. |
 | `/resolve` | GET | Resolve `@handle` → channelId + name + avatar (YouTube Data API, key stays server-side). Result cached 7 days in `handle:{lowercase}`. |
 | `/bootstrap` | POST | Fetch RSS + avatar for a newly added channel synchronously. RSS is the primary path; Data API is the fallback for the rare case where RSS is unreachable. |
 | `/settings` | POST | Update notification settings (full replacement). Includes `prewarnMinutes` (v3.1). |
@@ -233,19 +245,20 @@ The central Cloudflare Worker. Handles:
 6. Add `channelId` to `channels:active` (if this is the first subscriber)
 7. Return the channel meta + recent videos to the app
 
-**YouTube Data API usage:** Subscribe-time handle→channelId resolve (cached 7 days) and avatar fetch (cached forever). Video detection uses RSS shards and community posts use InnerTube, so neither scheduled path consumes Data API quota.
+**YouTube Data API usage:** Subscribe-time handle→channelId resolve (cached 7 days) and avatar fetch (cached forever). Video detection uses RSS and community posts use InnerTube, so neither Home polling path consumes Data API quota.
 
-### Scheduled Workers
+### Background scheduler
 
-The old `tubepulse-cron` deployment is a retired no-op with no Cron Trigger. Background work is split across five small scheduled Workers so each invocation remains within the Cloudflare free-tier CPU budget:
+Production scheduling moved to the unified local Home authority on 2026-10-04. It polls all 85 current active channels for videos every five minutes, polls all eligible channels for posts hourly, and runs bounded aux work each minute. The five Cloudflare scheduled Worker deployments and the old combined cron remain available only for rollback; all six currently have empty Cron Trigger lists.
 
-| Worker | Cadence | Work per invocation |
+| Runtime | Live cadence | Work per invocation |
 |---|---|---|
-| `tubepulse-rss-0/1/2` | Every five minutes (`*/5 * * * *`) | Each active shard polls one channel using a monotonically advancing five-minute epoch tick. Rotation coverage is tested for active-channel counts 1–30. RSS is the active zero-quota video detection path. |
-| `tubepulse-posts` | Every minute | Selects one eligible channel on a time-derived rotation; with six channels each is polled approximately hourly. Uses InnerTube and silently seeds first-poll state. |
-| `tubepulse-aux` | Every minute | Processes a bounded `nag:active` batch, drains legacy upcoming buckets, and checks scheduled-live prewarns. |
+| Home video sweep | Every five minutes | Polls every active channel exactly once with bounded concurrency and watermark protection. |
+| Home posts sweep | Hourly | Polls every eligible channel with InnerTube and preserves first-poll suppression. |
+| Home aux | Every minute | Processes bounded nag/prewarn work and drains legacy upcoming buckets. |
+| `tubepulse-rss-0/1/2`, `tubepulse-posts`, `tubepulse-aux` | Disabled (`crons = []`) | Retained code/deployments for stop-Home-first rollback only. |
 
-All five share `TUBEPULSE_KV`. The RSS and aux Workers require `FIREBASE_SERVICE_ACCOUNT`; posts also uses the `TUBEPULSE_ENABLE_COMMUNITY_POSTS` variable. Scheduled-only Workers intentionally do not export `fetch()`, so opening their `workers.dev` URL is not a valid health check.
+Home publishes changed keys to `TUBEPULSE_KV` as a bounded backup while the public API serves current feeds from Home over Workers VPC. The retained scheduled-only Workers intentionally do not export `fetch()`, so opening their `workers.dev` URLs is not a valid health check.
 
 ### Data Model (Cloudflare KV) — v3.1
 
@@ -350,6 +363,7 @@ TubePulse/
 │   │   └── Confirm.js             # Promise-based confirm({...}) helper that renders ConfirmDialog (v3.1)
 │   ├── utils/
 │   │   ├── api.js                 # REST client for the Cloudflare Worker (v3 endpoints)
+│   │   ├── apiEndpointPolicy.mjs  # Build-time primary/fallback and sticky retry policy
 │   │   ├── notifications.js       # Android notification channels
 │   │   ├── fcm.js                 # Firebase Cloud Messaging setup + handlers
 │   │   ├── storage.js             # AsyncStorage wrapper
@@ -369,6 +383,12 @@ TubePulse/
 │       ├── index.js               # Retired no-op compatibility entrypoint
 │       ├── shared.mjs             # Shared scheduled-worker helpers
 │       └── wrangler.toml          # No Cron Trigger
+├── self-host/                     # Preview local runtime, sync, scheduler, tests, Docker + Windows helpers
+│   ├── src/                       # Runtime adapter, service, reconciliation and CLI
+│   ├── test/                      # Local/mock-only unit and integration tests
+│   └── README.md                  # Public setup, operation, backup and recovery guide
+├── scripts/
+│   └── Build-SelfHostApk.ps1      # Self-contained, side-by-side TubePulse Preview test APK
 ├── secrets/                       # All gitignored — live credentials only
 │   ├── README.md                  # Operator docs for secrets
 │   ├── cloudflare.env             # CF account ID + API token
@@ -426,6 +446,14 @@ npx expo start
 # Run on Android
 npx expo run:android
 ```
+
+For a self-contained LAN test client that installs beside the main app, start the local backend and run:
+
+```powershell
+npm run build:android:selfhost -- --ApiUrl http://192.168.1.20:8788
+```
+
+The resulting ignored `dist/TubePulse-Preview-<version>-debug.apk` uses package `com.tubepulse.app.selfhost`, launcher label `TubePulse Preview`, and a bundled JavaScript payload. Its first-launch URL is health-tested and can later be changed from Settings without rebuilding. See the [no-new-Worker pilot](self-host/README.md#no-new-worker-preview-pilot) for Docker/LAN setup, the Firebase notification limitation, and installation instructions.
 
 ## Deploying Workers
 

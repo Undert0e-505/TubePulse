@@ -109,6 +109,14 @@ android {
         debug {
             signingConfig signingConfigs.debug
         }
+        selfhost {
+            initWith debug
+            applicationIdSuffix ".selfhost"
+            versionNameSuffix "-preview"
+            debuggable true
+            signingConfig signingConfigs.debug
+            matchingFallbacks = ['debug']
+        }
         release {
             // Caution! In production, you need to generate your own keystore file.
             // see https://reactnative.dev/docs/signed-apk-android.

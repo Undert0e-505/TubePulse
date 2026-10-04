@@ -1,7 +1,7 @@
 # TubePulse — Architecture Specification
 
 **Version:** Current architecture reference for the v3.x app line. See [STATUS.md](STATUS.md) for current checked-in version and operational caveats.
-**Date:** 2026-04-19 (initial), updated through the repo-hygiene documentation pass on 2026-06-25
+**Date:** 2026-04-19 (initial), updated through the unified Home production cutover on 2026-10-04
 **Status:** Architecture reference. Some historical diagrams/sections remain; [STATUS.md](STATUS.md) is authoritative for current version, release path, and verified deployment caveats.
 
 ---
@@ -132,16 +132,16 @@ Live route note: `GET /` at `https://tubepulse-api.jimothyoakley55.workers.dev` 
 - No database (KV only — see §5.1 for why)
 - No queue (KV operations are fast enough)
 - No separate cache layer (KV is already edge-cached)
-- No backend service polling YouTube RSS — **YouTube Data API polling is the active path (Job 2.5)**, not RSS
+- No separate always-on cloud server — **three scheduled Cloudflare Workers poll YouTube RSS**, one selected channel per active shard per tick
 
-### 4.3 Active detection path (as of 2026-06-02, v3.0.18)
+### 4.3 Active detection path (updated 2026-09-21)
 
 Google's `pubsubhubbub.appspot.com` hub was **shut down in 2024**. The WebSub handler remains in both workers for:
 - Manual testing
 - Compatibility with any future YouTube-compatible hub
 - As a clean integration point for self-hosted hubs
 
-The **active video detection path** is the cron running a **YouTube RSS feed** poller every 5 minutes (Job 2.5 in `tubepulse-cron/index.js`). It iterates the `channels:active` index, fetches `https://www.youtube.com/feeds/videos.xml?channel_id=...` for each, and diffs the response against `channel:{channelId}:recent.lastVideoId`. New videos are treated identically to WebSub pushes from the API worker's perspective.
+The **active video detection path** is three rotating **YouTube RSS feed** shard Workers running every five minutes. Each active shard selects one channel from `channels:active` using a five-minute epoch tick, fetches `https://www.youtube.com/feeds/videos.xml?channel_id=...`, and reconciles it against the recent cache plus the durable known-video watermark. New videos are treated identically to WebSub pushes from the API worker's perspective.
 
 **Cost:** zero YouTube Data API units. RSS is a free, public feed. The only outbound calls are to YouTube's RSS server and to Cloudflare KV.
 
@@ -315,7 +315,7 @@ Reads the `upcoming:` bucket key for the current 5-minute window. For each entry
 
 Cost per tick: 1 read minimum, 2 reads + 2 writes per event firing. Most ticks have nothing in the bucket.
 
-### 6.2 RSS poll cron — every 5 minutes  ⚠️ ACTIVE DETECTION PATH
+### 6.2 RSS shard crons — every five minutes  ⚠️ ACTIVE DETECTION PATH
 
 ```
 */5 * * * *
@@ -323,13 +323,15 @@ Cost per tick: 1 read minimum, 2 reads + 2 writes per event firing. Most ticks h
 
 This is the **primary** new-video detection path (since WebSub hub shutdown in 2024, and the YouTube Data API quota approach was abandoned in v3.0.18 because RSS provides the same data at zero quota cost).
 
-1. Read `channels:active` index from KV
-2. For each channelId:
+1. Read `channels:active` index from KV and derive the active shard count
+2. In each active shard, select one channelId from the sorted shard slice for the current five-minute epoch tick:
    - Fetch `https://www.youtube.com/feeds/videos.xml?channel_id={id}` (no API key, no quota)
    - Parse the Atom feed — extract videoId, title, publishedAt, thumbnail, link, **and views** (from `media:community/media:statistics/@_views`)
    - Compare against `channel:{channelId}:recent`
    - For each new videoId: update recent list, look up subscribers, send FCM
 3. New videos flow through the same notification pipeline as WebSub pushes would
+
+The shards therefore process up to three channels per five-minute tick. For `N` active channels, the selector activates `S = min(3, max(1, ceil(N / 5)))` shards and assigns the stable sorted list round-robin, so each shard contains either `floor(N / S)` or `ceil(N / S)` channels. A shard's full rotation is `5 minutes × its channel count`; expected detection is approximately half a rotation. `channels:active` is the source of truth for the current count, so time-stamped operational status should be used instead of embedding a changing production count here. Rotation coverage is tested for every active-channel count from 1 through 100.
 
 **Quota cost:** 0 YouTube Data API units. The only network calls are to YouTube's public RSS feed (free, no auth) and to KV (free tier).
 
@@ -688,6 +690,88 @@ v3.1 is a strict superset of v3.0 — the channel-first, zero-`KV.list()`, time-
 - **API `getFeedPostsForChannel` env bug**: the function was defined without an `env` parameter but referenced `env.TUBEPULSE_KV` inside, throwing `ReferenceError: env is not defined` on every `/feed` call. Fixed in commit `f985845` — the function now takes `env` as the first parameter, matching every other KV-touching helper.
 - **Cron RSS likes/dislikes wiring**: the v3.1.0 likes/dislikes commit only modified the API's WebSub path. The cron's RSS parser (the actual hot path for new-video detection) never got `media:community` extraction, so all v3.1.0 videos had `likes: 0, dislikes: 0` stored. Fixed in commit `a4cc838` — `parseRSSFeed` now extracts likes/dislikes and the new-video enrichment writes them into `channel:{id}:recent` alongside views.
 - **ConfirmDialog wiring**: v3.1.0 created the `ConfirmDialog` component but never wired it up. `ChannelsScreen.removeChannel` still called `Alert.alert` and `App.js` never mounted `<ConfirmHost />`. Fixed in `a4cc838` — `removeChannel` now uses `confirm({ destructive: true })` and `App.js` mounts the host.
+
+---
+
+## 15. Self-host runtime preview (2026-09-20)
+
+The repository now includes an additive [`self-host/`](self-host/) package. It does not alter the deployed Cloudflare topology. The current app URL and every Wrangler deployment/configuration remain the production defaults.
+
+### 15.1 Runtime boundary
+
+Miniflare starts one workerd instance containing named entrypoints for the existing API, RSS shard, posts, and aux modules. Every entrypoint binds the same persisted local `TUBEPULSE_KV` namespace. A small Node listener owns operational routes, dispatches normal HTTP requests into the unchanged API Worker, and dispatches scheduled events on aligned boundaries.
+
+```text
+Node listener
+  ├── /_tubepulse/status + authenticated admin control
+  └── app routes ──> workerd: tubepulse-api ──┐
+                                               ├── persistent local KV
+aligned scheduler ──> workerd: rss/posts/aux ─┘
+```
+
+Posts and aux run once per aligned minute. All three RSS shards run once per aligned five-minute boundary. A per-entrypoint lock skips overlap rather than running the same handler concurrently. Standalone mode activates the scheduler at boot; mirror mode stores an explicit active/standby role and never automatically fails back.
+
+Miniflare is primarily Cloudflare's local development/testing harness, so this capability is labeled preview. `self-host/src/runtime.mjs` is an adapter boundary for a future direct-workerd implementation.
+
+### 15.2 Mirror consistency
+
+Mirror synchronization is key-level three-way reconciliation among local state, current Cloudflare state, and a durable last-shared baseline. Content hashes and expirations are compared without storing values in the conflict ledger. Pull updates only clean local keys. Push is dry-run unless explicitly applied and verifies that current remote content/expiration still matches the baseline before every mutation. Conflicting values are retained on both sides.
+
+The design does not provide a distributed transaction across related keys or multi-node leader election. Cloudflare's eventually consistent listing/value reads can also span different instants. Cached FCM access tokens, FCM lookup-index keys, and WebSub leases are excluded because they are installation-specific. See the [self-host operations guide](self-host/README.md) for recovery and backup requirements.
+
+### 15.3 Client failover
+
+`src/utils/api.js` keeps the historical `workers.dev` URL as its exact default. Builds may specify a primary and optional fallback through statically analyzable Expo public environment variables. Network failures and HTTP `429`, `502`, `503`, or `504` receive one fallback attempt. Client/auth errors do not. A successful fallback is sticky for that process; there is no implicit failback.
+
+Fallback requests carry `X-TubePulse-Failover`. Optional automatic mirror takeover is off by default and additionally requires a successful app API route whose unchanged bearer profile matches the Cloudflare-derived sync baseline. The header is a signal, not authentication. Manual admin takeover remains the recommended initial operating model.
+
+### 15.4 Side-by-side Android test client
+
+The `selfhost` Android build type keeps the normal Java/Kotlin namespace but adds the application-ID suffix `.selfhost`, yielding `com.tubepulse.app.selfhost`. Android therefore treats it as a separate installation with separate app data, secure storage, widget receiver action, and launcher label. The build remains debuggable/debug-signed while React Native still runs `createBundleSelfhostJsAndAssets`; only the ordinary `debug` variant is excluded from bundling.
+
+`scripts/Build-SelfHostApk.ps1` enables Preview mode and supplies a first-run URL suggestion, not an accepted endpoint. Before normal app initialization, the Preview UI validates the absolute URL, performs a read-only API health probe, and persists the accepted origin. Every API caller resolves that origin at request time; Settings can health-test and switch it without a rebuild, while Preview never falls back to production. A source-set manifest enables cleartext HTTP only for private/LAN hosts in this test build. The main manifest has no cleartext opt-in, and the normal `com.tubepulse.app` application ID remains unchanged.
+
+The no-new-Worker pilot runs under a distinct `tubepulse-pilot` Compose project and binds local KV/runtime state from `self-host/data-pilot`, never the ordinary `self-host/data` directory. Its `TUBEPULSE_PILOT` runtime boundary requires standalone mode, disables Cloudflare synchronization credentials, and refuses automatic takeover, Cloudflare writes, or automatic push even if an operator attempts to enable them.
+
+### Existing-app canary gateway (single-device production canary)
+
+The app endpoint contract did not change for the 2026-10-04 canary. A default-off wrapper around the existing API handler identifies one explicitly configured canary from `SHA-256(Authorization bearer)` and routes only `GET /feed` to an authenticated, ready Home mirror. Missing/invalid/disabled gateway configuration immediately invokes the old handler without an extra KV read or origin fetch. Non-canaries, health, resolver, WebSub, admin/internal, and unknown routes always use the existing Cloudflare handler.
+
+Canary mutations are deliberately asymmetric: execute Cloudflare first, preserve its response as canonical, then synchronously reproduce a successful mutation at Home. HMAC covers timestamp, unique request ID, operation, method, path/query, authorization digest, and body digest. Home rechecks that bearer against the configured canary fingerprint, permits only the explicit app allowlist, and must be mirror/standby with a recent successful conflict-free pull and the canary profile present; its scheduler therefore cannot send notifications. Enabling this dedicated origin role closes direct ordinary app API routes on the Home listener while retaining status and authenticated admin operations. Cloudflare remains the FCM owner.
+
+If Home replication fails, Cloudflare writes one `gateway:canary:{fingerprint}:state` transition to `stale` (not one write per request). A stale or missing state forces Cloudflare reads. Only a short-lived receipt produced after a full Home reconciliation can restore `current`; one later successful mutation cannot. The origin serializes local gateway operations against mirror maintenance. A signed canonical mutation observed during an in-flight pull taints that snapshot for recovery, queues a fresh pull, and keeps reads on Cloudflare until the next pull proves no conflicts or pending local records. A signed automatic receipt may then restore `current`. Two schema-specific replay races select the canonical Cloudflare value: device profiles differing only in valid `lastSeenAt`, and newly created `channel:{id}:meta` objects differing only in valid numeric `addedAt`. Any other field, key, type, or timestamp difference remains quarantined. Network/auth/readiness errors, timeout, `429`, `5xx`, and incompatible Home replies fall back to Cloudflare. A well-formed non-retryable app `4xx` from a current Home read is semantic and is returned without replaying the read elsewhere.
+
+This model cannot make two origins transactionally identical. If Cloudflare refuses a mutation or cannot persist the stale transition, instantaneous two-sided consistency is impossible. The gateway never promotes a Home-only mutation; it retains the canonical Cloudflare outcome and fails closed wherever stale state is observable. Disabling `TUBEPULSE_HOME_GATEWAY_ENABLED` is the routing rollback. The initial production mirror and signed reconciliation are complete for one canary; every expansion still requires a fresh explicit review rather than broadening the fingerprint selector.
+
+The selected ingress is private Workers VPC rather than a public Home URL. A `TUBEPULSE_HOME_VPC` fetcher binding targets a VPC Service fixed to Docker-internal `gateway-origin:8788`; a remotely managed named Tunnel and digest-pinned `cloudflared` sidecar provide outbound-only connectivity. VPC mode is explicit and requires the fetcher binding. Its fetch uses an absolute `Request` without a redirect-mode override because Workers VPC rejects that otherwise-valid option before dispatch; public-origin mode retains both its HTTPS requirement and `redirect: "error"`. Both transports use the same HMAC, replay, identity, allowlist, readiness, stale-state, and timeout rules, and feature-off still delegates before any KV read or network fetch.
+
+The temporary local-package `google-services.json` exists only to satisfy the Gradle plugin and is deleted after each build. It does not create a Firebase registration, so local API testing and notification delivery are separate milestones: the app can register with a null FCM token, but push support needs a real Firebase Android app for the suffixed package.
+
+### 15.5 Known boundary risks
+
+- An ambiguous Cloudflare/local handoff can duplicate a notification.
+- Standby API traffic can create local dirty state while schedulers remain off.
+- Production fallback configuration is fixed at APK build time. The separate Preview package has one runtime-selected endpoint and no production fallback.
+- A LAN HTTP test APK trusts cleartext traffic and must not be distributed as a production build.
+- The side-by-side package does not inherit a valid FCM registration merely because build-time Firebase metadata was rewritten.
+- Cloudflare REST synchronization consumes Cloudflare KV quota.
+- Operators must explicitly coordinate Cloudflare scheduler state and local takeover; this preview never changes production resources.
+
+### 15.6 Unified Home production authority
+
+The scheduled-worker replacement is a separate process from both the app gateway origin and the standalone Preview pilot. In shadow it refreshes isolated `data-scheduler` from canonical Cloudflare state, then invokes the existing RSS poller once for every sorted unique active channel with bounded concurrency. It reuses the existing post poller for an all-eligible-channel hourly sweep and the existing aux routine each minute. The Cloudflare three-shard split is deliberately absent because Home is not constrained by the per-invocation Worker CPU budget. The public API and its canonical KV schema do not change. Configurable post cadence carries an explicit daily-quota projection and guard; the production candidate defaults to 60 minutes, while five-minute posts require a separate quota flag/latch and sufficient live calculated budget plus reserve.
+
+Three fail-closed modes exist: shadow measures local mutations and notification decisions with no remote writes or FCM network request; standby does no scheduled work; active requires an independent write flag, notification flag, live-trigger-disable confirmation, Firebase credential, and exact activation latch. A persisted exclusive lease, heartbeat, overlap guard, in-progress channel list, timeout, and retry/backoff make a single runner restartable without knowingly duplicating a completed channel. Shadow publication compares final local state with canonical state and classifies predicted writes by key family/reason, including a distinct metrics-only category.
+
+Moving compute does not eliminate canonical writes. An earlier 2026-10-04 exercise proved that making Cloudflare KV the scheduler's live backing store is not viable on the free tier: per-channel reads approach/exceed 100,000/day, and a separate full mirror of 811 records every five minutes alone projects to about 233,000 reads/day. It also exposed notification-before-feed visibility and was rolled back before this unified design replaced it.
+
+The implemented successor is one local authority/runtime/store. Signed Cloudflare-first mutations for every authenticated device and scheduled polling share one global Durable Object lease followed by one local lease, so lock order is deterministic. Home polls local KV and publishes an exact changed-key journal. The SQLite-backed coordinator stores conditional baselines and resumable transactions; genuine divergence marks the authority stale. Authenticated `GET /feed` is routed for all devices over the private VPC binding to that same store only while current, with bounded canonical-KV fallback. This strong Home read path—not a fixed propagation sleep—is the notification visibility barrier.
+
+Cloudflare backup publication has two explicit budgets: 650 scheduler writes/day and 950 total coordinated writes/day, reserving 300 for app mutations under the platform's 1,000-write ceiling. At the scheduler cap, the coordinator durably coalesces the latest change per key and retries on later ticks after the UTC reset. An API mutation first flushes any overlapping deferred keys from its reserve before the legacy Cloudflare handler runs, preventing stale-base overwrites such as `/seen` racing a new video. Home polling/feed service continues, but FCM for a batch whose canonical backup is deferred is suppressed: a subsequent VPC outage must not recreate push-with-missing-content on the Cloudflare fallback. WebSub pushes are acknowledged without writes/FCM while Home traffic ownership is active, and verification handshakes persist no lease state.
+
+Configuration and traffic activation are separate latches. Production cut over on 2026-10-04 after disabling/draining all five scheduled Workers and importing an exact signed 721-record snapshot through the Worker KV binding. The first active sweep covered all 85 channels in 3.4 seconds with no failures, applied only changed keys, and sent its one natural notification after the public Home-backed feed visibility barrier passed. All known profiles then returned Home-routed feeds through the unchanged API URL. Rollback still stops/drains Home before restoring the saved `*/5` RSS and one-minute posts/aux triggers. An old mirror plus public feeds is never accepted as a replacement for a full canonical snapshot.
+
+Community-post cache comparisons discard only rotating YouTube thumbnail delivery parameters when the stable image origin/path is unchanged, and they ignore relative-age label churn only when the cached post has the same valid `publishedAt`. This reduces false hourly writes without masking a new image, text, metric, or an authoritative relative label for a post whose absolute timestamp is unavailable.
 
 ---
 

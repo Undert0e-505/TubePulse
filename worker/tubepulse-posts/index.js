@@ -17,11 +17,12 @@ import {
   formatCommunityPostNotificationTitle,
   normalizeKnownCommunityPostIds, addKnownCommunityPostId,
   removeCachedPostIdsFromSubscriberState,
+  withKvMutationLock,
 } from '../tubepulse-cron/shared.mjs';
 
 const COMMUNITY_POSTS_DEBUG_CHANNEL_ID = 'UCeG5VyNPnGZq-8JzHJbSB6A';
 
-function isCommunityPostsDebugEnabled(env) {
+export function isCommunityPostsDebugEnabled(env) {
   const value = String(env.TUBEPULSE_DEBUG_COMMUNITY_POSTS || '').trim().toLowerCase();
   return value === '1' || value === 'true' || value === 'yes';
 }
@@ -45,7 +46,7 @@ export default {
   },
 };
 
-async function pollSingleCommunityChannel(env, ctx, channelId, debugEnabled) {
+export async function pollSingleCommunityChannel(env, ctx, channelId, debugEnabled, options = {}) {
   const kv = env.TUBEPULSE_KV;
   const channelDebug = debugEnabled && channelId === COMMUNITY_POSTS_DEBUG_CHANNEL_ID;
 
@@ -56,10 +57,14 @@ async function pollSingleCommunityChannel(env, ctx, channelId, debugEnabled) {
 
   let latestPost;
   try {
-    latestPost = await fetchLatestCommunityPostInnerTube(channelId, { fetch });
+    latestPost = await fetchLatestCommunityPostInnerTube(channelId, {
+      fetch,
+      ...(Number.isInteger(options.maxResponseBytes) ? { maxResponseBytes: options.maxResponseBytes } : {}),
+    });
   } catch (err) {
     console.error(`[Posts] InnerTube fetch error for ${channelId}:`, err?.message || err);
-    return;
+    if (options.failOnFetchError) throw err;
+    return { outcome: 'fetch-failed' };
   }
 
   if (!firstPollAt) {
@@ -70,7 +75,7 @@ async function pollSingleCommunityChannel(env, ctx, channelId, debugEnabled) {
     }
     await putKV(kv, key.firstPollAtPosts(channelId), new Date().toISOString());
     console.log(`[Posts] first run for ${channelId}: seeded, no notifications`);
-    return;
+    return { outcome: 'seeded' };
   }
 
   const prevRecent = await getKV(kv, key.channelRecentPosts(channelId)) || [];
@@ -97,7 +102,7 @@ async function pollSingleCommunityChannel(env, ctx, channelId, debugEnabled) {
       const removed = await removeCachedPostIdsFromSubscriberState(env, channelId, cachedPostIds);
       console.log(`[Posts] ${channelId}: no latest post, cleared ${cachedPostIds.size} cached, removed=${removed}`);
     }
-    return;
+    return { outcome: 'empty' };
   }
 
   if (cachedActivityIds.has(latestPost.activityId)) {
@@ -111,14 +116,14 @@ async function pollSingleCommunityChannel(env, ctx, channelId, debugEnabled) {
       const removed = await removeCachedPostIdsFromSubscriberState(env, channelId, stalePostIds);
       console.log(`[Posts] ${channelId}: unchanged ${latestPost.activityId}, compacted, removed=${removed}`);
     }
-    return;
+    return { outcome: 'unchanged' };
   }
 
   if (latestPostId && knownPostIds.includes(latestPostId)) {
     await putKVIfChanged(kv, key.channelRecentPosts(channelId), [latestPost], prevRecent);
     const removed = await removeCachedPostIdsFromSubscriberState(env, channelId, cachedPostIds);
     console.log(`[Posts] ${channelId}: known latest ${latestPost.activityId}, suppressed, removed=${removed}`);
-    return;
+    return { outcome: 'known-suppressed' };
   }
 
   // New post detected
@@ -162,7 +167,7 @@ async function pollSingleCommunityChannel(env, ctx, channelId, debugEnabled) {
     if (!state.unwatched.includes(postKey)) {
       state.unwatched.push(postKey);
       await putKV(kv, key.deviceState(deviceId, channelId), state);
-      addToNagActive(env, deviceId, channelId);
+      await addToNagActive(env, deviceId, channelId);
     }
 
     const truncated = latestPost.text.length > 100
@@ -189,6 +194,31 @@ async function pollSingleCommunityChannel(env, ctx, channelId, debugEnabled) {
 
     try {
       const sendResult = await sendFCMPush(accessToken, projectId, profile.fcmToken, notifPayload);
+      if (sendResult.shadow) {
+        const deferred = env.TUBEPULSE_NOTIFICATION_DEFERRED === true;
+        await env.TUBEPULSE_SHADOW_NOTIFICATION_OBSERVER?.({
+          kind: 'community-post',
+          channelId,
+          ...(deferred ? {
+            deviceId,
+            projectId,
+            fcmToken: profile.fcmToken,
+            payload: notifPayload,
+            contentIds: [postKey],
+            requireUnwatched: true,
+            onResult: async (result) => {
+              if (result?.sent) {
+                await withKvMutationLock(env, key.deviceState(deviceId, channelId), async () => {
+                  const current = await getKV(kv, key.deviceState(deviceId, channelId)) || state;
+                  await putKV(kv, key.deviceState(deviceId, channelId), { ...current, lastNagAt: Date.now() });
+                });
+              } else if (result?.deadToken) {
+                await cleanupDeadDevice(deviceId, env, 'fcm_unregistered');
+              }
+            },
+          } : {}),
+        });
+      }
       if (sendResult.sent) {
         state.lastNagAt = Date.now();
         await putKV(kv, key.deviceState(deviceId, channelId), state);
@@ -205,4 +235,5 @@ async function pollSingleCommunityChannel(env, ctx, channelId, debugEnabled) {
     console.log(`[Posts] Pruning dead device: ${deviceId}`);
     ctx.waitUntil(cleanupDeadDevice(deviceId, env, 'fcm_unregistered'));
   }
+  return { outcome: 'new-content', activityId: latestPost.activityId };
 }

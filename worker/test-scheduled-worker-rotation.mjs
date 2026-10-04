@@ -11,7 +11,7 @@ const firstScheduledTime = Date.parse('2026-09-20T00:00:00.000Z');
 
 // Exercise the same five-minute tick passed by the scheduled handlers. Every
 // supported active-channel count must rotate through the complete sorted set.
-for (let channelCount = 1; channelCount <= 30; channelCount++) {
+for (let channelCount = 1; channelCount <= 100; channelCount++) {
   const channels = Array.from(
     { length: channelCount },
     (_, index) => `channel-${String(channelCount - index).padStart(2, '0')}`,
@@ -61,15 +61,18 @@ for (const worker of [
   'tubepulse-rss-2',
 ]) {
   const config = await readFile(new URL(`./${worker}/wrangler.toml`, import.meta.url), 'utf8');
-  assert.match(config, /crons\s*=\s*\["\*\/5 \* \* \* \*"\]/, `${worker} must run every five minutes`);
+  assert.match(config, /crons\s*=\s*\[\]/, `${worker} must remain unscheduled while Home owns polling`);
+
+  const source = await readFile(new URL(`./${worker}/index.js`, import.meta.url), 'utf8');
+  assert.match(source, /scheduledTime \?\? Date\.now\(\)\) \/ 300000/, `${worker} must use a five-minute epoch tick`);
 }
 
 for (const worker of ['tubepulse-posts', 'tubepulse-aux']) {
   const config = await readFile(new URL(`./${worker}/wrangler.toml`, import.meta.url), 'utf8');
-  assert.match(config, /crons\s*=\s*\["\* \* \* \* \*"\]/, `${worker} must run every minute`);
+  assert.match(config, /crons\s*=\s*\[\]/, `${worker} must remain unscheduled while Home owns polling`);
 }
 
 const retiredConfig = await readFile(new URL('./tubepulse-cron/wrangler.toml', import.meta.url), 'utf8');
 assert.match(retiredConfig, /crons\s*=\s*\[\]/, 'retired tubepulse-cron must remain unscheduled');
 
-console.log('scheduled worker rotation: PASS (RSS counts 1-30, posts, and cron cadence)');
+console.log('scheduled worker rotation: PASS (RSS counts 1-100, posts, and Home-owned cron stand-down)');

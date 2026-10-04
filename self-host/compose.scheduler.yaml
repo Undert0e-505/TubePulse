@@ -1,0 +1,61 @@
+name: ${COMPOSE_PROJECT_NAME:-tubepulse-home-scheduler}
+
+services:
+  home-scheduler:
+    build:
+      context: ..
+      dockerfile: self-host/Dockerfile
+    command: ["node", "src/home-scheduler-cli.mjs", "run"]
+    restart: unless-stopped
+    # Miniflare closes its workerd process before the scheduler releases the
+    # exclusive lease. Give that orderly drain time to finish on host reboot
+    # or Compose recreation instead of forcing a three-minute stale-lease wait.
+    stop_grace_period: 45s
+    env_file:
+      - path: ${TUBEPULSE_HOME_SCHEDULER_ENV_FILE:-.env.scheduler}
+        required: true
+    environment:
+      TUBEPULSE_HOME_SCHEDULER_DATA_DIR: /data
+      TUBEPULSE_HOME_SCHEDULER_MODE: ${TUBEPULSE_HOME_SCHEDULER_MODE:-shadow}
+      TUBEPULSE_HOME_SCHEDULER_REMOTE_WRITE_ENABLED: "${TUBEPULSE_HOME_SCHEDULER_REMOTE_WRITE_ENABLED:-false}"
+      TUBEPULSE_HOME_SCHEDULER_NOTIFICATIONS_ENABLED: "${TUBEPULSE_HOME_SCHEDULER_NOTIFICATIONS_ENABLED:-false}"
+      TUBEPULSE_CLOUDFLARE_SCHEDULES_CONFIRMED_DISABLED: "${TUBEPULSE_CLOUDFLARE_SCHEDULES_CONFIRMED_DISABLED:-false}"
+      TUBEPULSE_HOME_SCHEDULER_ACTIVATION_LATCH: "${TUBEPULSE_HOME_SCHEDULER_ACTIVATION_LATCH:-}"
+    volumes:
+      - ./data-scheduler:/data
+      - type: bind
+        source: ${TUBEPULSE_HOME_SCHEDULER_CLOUDFLARE_TOKEN_HOST_FILE:-./secrets/cloudflare-read-token.txt}
+        target: /run/secrets/tubepulse/cloudflare-read-token.txt
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${TUBEPULSE_HOME_SCHEDULER_FIREBASE_HOST_FILE:-./secrets/firebase.json}
+        target: /run/secrets/tubepulse/firebase.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${TUBEPULSE_HOME_SCHEDULER_YOUTUBE_KEY_HOST_FILE:-./secrets/youtube-api-key.txt}
+        target: /run/secrets/tubepulse/youtube-api-key.txt
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${TUBEPULSE_HOME_SCHEDULER_GATEWAY_ADMIN_TOKEN_HOST_FILE:-./secrets/gateway-admin-token.txt}
+        target: /run/secrets/tubepulse/gateway-admin-token.txt
+        read_only: true
+        bind:
+          create_host_path: false
+    healthcheck:
+      test: ["CMD", "node", "src/home-scheduler-cli.mjs", "health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 20s
+      retries: 3
+    networks:
+      - scheduler-egress
+
+networks:
+  scheduler-egress:
+    driver: bridge

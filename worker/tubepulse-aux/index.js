@@ -13,6 +13,7 @@ import {
   key, getKV, putKV, isDndActive, getNagIntervalMs,
   getCachedFcmAccessToken, sendFCMPush, cleanupDeadDevice,
   removeFromNagActive,
+  withKvMutationLock,
 } from '../tubepulse-cron/shared.mjs';
 
 const NAG_BATCH_SIZE = 5;
@@ -42,7 +43,11 @@ function currentUpcomingBucket() {
 
 export default {
   async scheduled(event, env, ctx) {
-    const now = Date.now();
+    await runAuxTick(env, ctx, Date.now());
+  },
+};
+
+export async function runAuxTick(env, ctx, now = Date.now()) {
 
     // ── 1. Drain stale upcoming buckets (legacy, cheap) ──
     const bucket = currentUpcomingBucket();
@@ -61,8 +66,7 @@ export default {
     if (nagFired === 0) {
       await runPrewarn(env, ctx, now);
     }
-  },
-};
+}
 
 // ─── Nag ────────────────────────────────────────────────────────────────
 
@@ -83,6 +87,11 @@ async function runNag(env, ctx, now) {
     const parts = entry.split('|');
     if (parts.length !== 2) continue;
     const [deviceId, channelId] = parts;
+
+    // A new-content push queued earlier in this same Home tick must be
+    // delivered (or suppressed by its visibility barrier) before a reminder
+    // for the same device/channel can be considered.
+    if (env.TUBEPULSE_DEFERRED_NOTIFICATION_PENDING?.(deviceId, channelId)) continue;
 
     const state = await getKV(env.TUBEPULSE_KV, key.deviceState(deviceId, channelId));
     if (!state?.unwatched || state.unwatched.length === 0) {
@@ -201,6 +210,37 @@ async function runNag(env, ctx, now) {
 
     try {
       const result = await sendFCMPush(accessToken, projectId, profile.fcmToken, notifPayload);
+      if (result.shadow) {
+        const deferred = env.TUBEPULSE_NOTIFICATION_DEFERRED === true;
+        await env.TUBEPULSE_SHADOW_NOTIFICATION_OBSERVER?.({
+          kind: 'nag',
+          channelId,
+          ...(deferred ? {
+            deviceId,
+            projectId,
+            fcmToken: profile.fcmToken,
+            payload: notifPayload,
+            contentIds: [...stillUnwatched],
+            dedupeVersion: `${state.lastNagAt || 0}:${state.nagCount || 0}`,
+            requireUnwatched: true,
+            onResult: async (delivery) => {
+              if (delivery?.sent) {
+                await withKvMutationLock(env, key.deviceState(deviceId, channelId), async () => {
+                  const current = await getKV(env.TUBEPULSE_KV, key.deviceState(deviceId, channelId)) || state;
+                  await putKV(env.TUBEPULSE_KV, key.deviceState(deviceId, channelId), {
+                    ...current,
+                    lastNagAt: now,
+                    nagCount: (current.nagCount || 0) + 1,
+                  });
+                });
+              } else if (delivery?.deadToken) {
+                await cleanupDeadDevice(deviceId, env, 'fcm_unregistered');
+              }
+            },
+          } : {}),
+        });
+        if (deferred) fired++;
+      }
       if (result.sent) {
         fired++;
         state.lastNagAt = now;
@@ -333,6 +373,31 @@ async function runPrewarn(env, ctx, now) {
 
       try {
         const result = await sendFCMPush(accessToken, projectId, profile.fcmToken, notifPayload);
+        if (result.shadow) {
+          const deferred = env.TUBEPULSE_NOTIFICATION_DEFERRED === true;
+          await env.TUBEPULSE_SHADOW_NOTIFICATION_OBSERVER?.({
+            kind: 'prewarn',
+            channelId: ev.channelId,
+            ...(deferred ? {
+              deviceId,
+              projectId,
+              fcmToken: profile.fcmToken,
+              payload: notifPayload,
+              contentIds: [ev.videoId],
+              dedupeVersion: `prewarn:${effectiveMinutes}`,
+              requireUnwatched: false,
+              onResult: async (delivery) => {
+                if (delivery?.sent) {
+                  await putKV(env.TUBEPULSE_KV, key.prewarnSent(ev.videoId, deviceId), effectiveMinutes);
+                } else if (delivery?.deadToken) {
+                  await cleanupDeadDevice(deviceId, env, 'fcm_unregistered');
+                  await putKV(env.TUBEPULSE_KV, key.prewarnSent(ev.videoId, deviceId), effectiveMinutes);
+                }
+              },
+            } : {}),
+          });
+          if (deferred) fired++;
+        }
         if (result.sent) {
           fired++;
           await putKV(env.TUBEPULSE_KV, key.prewarnSent(ev.videoId, deviceId), effectiveMinutes);

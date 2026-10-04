@@ -23,10 +23,18 @@ import {
   formatCompactCount,
   formatViews,
   getPostSeenId,
+  hasKnownMetric,
+  resolveOptionalMetric,
   sortPostsNewestFirst,
   sortVideosNewestFirst,
 } from '../utils/feedPresentation';
 import { updateWidget } from '../components/widgetTaskHandler';
+import { IS_TUBEPULSE_PREVIEW } from '../utils/apiEndpointConfig';
+import {
+  APP_INITIALIZATION_STORAGE_KEY,
+  getPreviewHomeConnectionPhase,
+  waitForCurrentInitialization,
+} from '../utils/appInitialization.mjs';
 
 const THUMB_UP_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#666666" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
   <path d="M7 22V11" />
@@ -40,7 +48,7 @@ const THUMB_DOWN_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 
   <path d="M7 11l4.5-8.5c.6-.1 1.2.1 1.6.5.4.5.5 1.1.4 1.7L12.5 9H20c.8 0 1.5.7 1.5 1.5l-1.5 9c-.1.7-.7 1.2-1.4 1.2H7" />
 </svg>`;
 
-export default function HomeScreen({ navigation }) {
+export default function HomeScreen({ navigation, previewInitializationMarker = null }) {
   const [channels, setChannels] = useState([]);
   const [cache, setCache] = useState({});
   const [lastSeen, setLastSeen] = useState({});
@@ -48,6 +56,8 @@ export default function HomeScreen({ navigation }) {
   const [channelDisplaySettings, setChannelDisplaySettings] = useState({});
   const [refreshing, setRefreshing] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [previewConnectionError, setPreviewConnectionError] = useState(null);
+  const [previewInitializationPending, setPreviewInitializationPending] = useState(IS_TUBEPULSE_PREVIEW);
   const [nowMs, setNowMs] = useState(Date.now());
   // Hold the latest cache in a ref so refresh() can be stable
   // (depending on `cache` directly caused an infinite re-render loop
@@ -58,6 +68,8 @@ export default function HomeScreen({ navigation }) {
   // YouTube) doesn't overwrite the optimistic clear before markSeen
   // has been processed server-side.
   const recentlySeenRef = useRef(new Set());
+  const firstFocusRef = useRef(true);
+  const previewInitializationPendingRef = useRef(IS_TUBEPULSE_PREVIEW);
 
   const loadData = useCallback(async () => {
     const [ch, s, ls, ca, cds] = await Promise.all([
@@ -77,6 +89,11 @@ export default function HomeScreen({ navigation }) {
   }, []);
 
   const refresh = useCallback(async () => {
+    // Focus/AppState events can arrive while the Preview app is still
+    // registering. Ignore those refreshes instead of producing a known,
+    // short-lived /feed 404 and a misleading red error banner.
+    if (IS_TUBEPULSE_PREVIEW && previewInitializationPendingRef.current) return;
+
     setRefreshing(true);
     // Snapshot the recentlySeenRef at the start of this refresh cycle.
     // At the end of refresh, we clear recentlySeenRef for any IDs where
@@ -91,9 +108,11 @@ export default function HomeScreen({ navigation }) {
       if (deviceId) {
         const result = await fetchFeed(deviceId);
         if (result.ok && result.channels) {
+          if (IS_TUBEPULSE_PREVIEW) setPreviewConnectionError(null);
           // v3 /feed returns { channels: [{ channelId, meta, videos, unwatchedCount }] }
           const [localChannels] = await Promise.all([getChannels()]);
           const newCache = {};
+          const normalizedContentByChannelId = new Map();
 
           for (const serverChannel of result.channels) {
             const ch = localChannels.find((c) => c.channelId === serverChannel.channelId);
@@ -122,8 +141,8 @@ export default function HomeScreen({ navigation }) {
               // post-tap refresh cycle.
               unwatched: seenSnapshot.has(v.videoId) ? false : v.unwatched,
               views: v.views || existingByVideoId.get(v.videoId)?.views || '0',
-              likes: v.likes ?? existingByVideoId.get(v.videoId)?.likes ?? 0,
-              dislikes: v.dislikes ?? existingByVideoId.get(v.videoId)?.dislikes ?? 0,
+              likes: resolveOptionalMetric(v, 'likes', existingByVideoId.get(v.videoId)?.likes),
+              dislikes: resolveOptionalMetric(v, 'dislikes', existingByVideoId.get(v.videoId)?.dislikes),
             }));
 
             // Posts come from the server already filtered by the global +
@@ -133,6 +152,7 @@ export default function HomeScreen({ navigation }) {
               ...p,
               unwatched: seenSnapshot.has(getPostSeenId(p)) ? false : p.unwatched,
             }));
+            normalizedContentByChannelId.set(serverChannel.channelId, { videos, posts });
 
             // Use the ref so this callback stays stable across renders
             const existingEntry = cacheRef.current[handle] || {};
@@ -168,6 +188,10 @@ export default function HomeScreen({ navigation }) {
             const ch = localChannels.find((c) => c.channelId === serverChannel.channelId);
             const handle = ch?.handle;
             if (!handle) continue;
+            const normalized = normalizedContentByChannelId.get(serverChannel.channelId) || {
+              videos: [],
+              posts: [],
+            };
 
             if (!lastSeen[handle]) lastSeen[handle] = { seenIds: [] };
             const seenIds = new Set(lastSeen[handle].seenIds || []);
@@ -176,12 +200,12 @@ export default function HomeScreen({ navigation }) {
             // Use the already-guarded `videos`/`posts` arrays (which had
             // the seenSnapshot guard applied) so lastSeen stays consistent
             // with what the UI shows.
-            for (const v of videos) {
+            for (const v of normalized.videos) {
               if (!v.unwatched && v.videoId) {
                 seenIds.add(v.videoId);
               }
             }
-            for (const p of posts) {
+            for (const p of normalized.posts) {
               if (!p.unwatched && p.activityId) {
                 seenIds.add(`post:${p.activityId}`);
               }
@@ -213,6 +237,8 @@ export default function HomeScreen({ navigation }) {
               }
             }
           }
+        } else if (IS_TUBEPULSE_PREVIEW) {
+          setPreviewConnectionError(result.error || 'TubePulse Home is unavailable.');
         }
       } else {
         const ca = await getChannelCache();
@@ -221,6 +247,7 @@ export default function HomeScreen({ navigation }) {
       }
     } catch (e) {
       console.warn('Refresh failed:', e);
+      if (IS_TUBEPULSE_PREVIEW) setPreviewConnectionError('TubePulse Home is unavailable.');
       const ca = await getChannelCache();
       cacheRef.current = ca;
       setCache(ca);
@@ -231,46 +258,77 @@ export default function HomeScreen({ navigation }) {
   }, []); // stable: no deps, uses cacheRef
 
   const autoFetch = useCallback(async () => {
-    const [ch] = await Promise.all([getChannels()]);
-    // Wait for App.js init to finish (sets flag when done)
-    const initDone = await AsyncStorage.getItem('tubepulse_init_done');
-    if (!initDone) {
-      // Poll until init completes (max 15s).
-      // 500ms setTimeout calls don't trigger re-renders by themselves,
-      // but the cacheRef updates + setState calls at the end of this
-      // function do — and we now use stable callbacks (loadData, refresh)
-      // so the only re-renders come from intentional state updates.
-      for (let i = 0; i < 30; i++) {
-        await new Promise((r) => setTimeout(r, 500));
-        const done = await AsyncStorage.getItem('tubepulse_init_done');
-        if (done) break;
+    try {
+      // Preview Home must not issue /feed until this application mount has
+      // finished its register/reconcile/bootstrap sequence. The exact marker
+      // rejects both earlier processes and earlier mounts in this process.
+      // Production keeps its historical wait semantics unchanged.
+      if (IS_TUBEPULSE_PREVIEW) {
+        await waitForCurrentInitialization({
+          readCompletion: () => AsyncStorage.getItem(APP_INITIALIZATION_STORAGE_KEY),
+          expectedMarker: previewInitializationMarker,
+        });
+      } else {
+        const initDone = await AsyncStorage.getItem(APP_INITIALIZATION_STORAGE_KEY);
+        if (!initDone) {
+          for (let i = 0; i < 30; i++) {
+            await new Promise((r) => setTimeout(r, 500));
+            const done = await AsyncStorage.getItem(APP_INITIALIZATION_STORAGE_KEY);
+            if (done) break;
+          }
+        }
+      }
+
+      // From this point a Preview refresh is authoritative: initialization
+      // either completed for this exact mount or the bounded wait expired.
+      // A subsequent failure should be shown rather than suppressed.
+      if (IS_TUBEPULSE_PREVIEW) previewInitializationPendingRef.current = false;
+
+      // Init has written cache data — re-read everything before refreshing
+      const [freshChannels, freshCache, freshLastSeen, freshSettings, freshDisplaySettings] = await Promise.all([
+        getChannels(),
+        getChannelCache(),
+        getLastSeen(),
+        getSettings(),
+        getChannelDisplaySettings(),
+      ]);
+      cacheRef.current = freshCache || {};
+      setChannels(freshChannels);
+      setCache(freshCache);
+      setLastSeen(freshLastSeen);
+      setSettings(freshSettings);
+      setChannelDisplaySettings(freshDisplaySettings || {});
+      setLoading(false);
+
+      // Now refresh from server (supplements local cache with live data)
+      if (freshChannels.length > 0) {
+        await refresh();
+      }
+    } catch (error) {
+      console.warn('Initial Home load failed:', error);
+      if (IS_TUBEPULSE_PREVIEW) {
+        setPreviewConnectionError('TubePulse Home is unavailable.');
+      }
+      setLoading(false);
+    } finally {
+      if (IS_TUBEPULSE_PREVIEW) {
+        previewInitializationPendingRef.current = false;
+        setPreviewInitializationPending(false);
       }
     }
-    // Init has written cache data — re-read everything before refreshing
-    const [freshChannels, freshCache, freshLastSeen, freshSettings, freshDisplaySettings] = await Promise.all([
-      getChannels(),
-      getChannelCache(),
-      getLastSeen(),
-      getSettings(),
-      getChannelDisplaySettings(),
-    ]);
-    cacheRef.current = freshCache || {};
-    setChannels(freshChannels);
-    setCache(freshCache);
-    setLastSeen(freshLastSeen);
-    setSettings(freshSettings);
-    setChannelDisplaySettings(freshDisplaySettings || {});
-    setLoading(false);
-
-    // Now refresh from server (supplements local cache with live data)
-    if (freshChannels.length > 0) {
-      await refresh();
-    }
-  }, [refresh]);
+  }, [previewInitializationMarker, refresh]);
 
   useFocusEffect(
     useCallback(() => {
+      // autoFetch owns the first Preview load and waits for registration.
+      // Later focus events retain the normal immediate refresh behaviour.
+      if (IS_TUBEPULSE_PREVIEW && firstFocusRef.current) {
+        firstFocusRef.current = false;
+        return undefined;
+      }
+      firstFocusRef.current = false;
       loadData().then(() => refresh());
+      return undefined;
     }, [loadData, refresh])
   );
 
@@ -670,6 +728,8 @@ export default function HomeScreen({ navigation }) {
 
         {videosToShow.map((video) => {
           const isSeen = !getUnseenVideos(item.handle).find(v => v.videoId === video.videoId);
+          const hasLikeCount = hasKnownMetric(video.likes);
+          const hasDislikeCount = hasKnownMetric(video.dislikes);
           return (
             <TouchableOpacity
               key={video.videoId}
@@ -691,11 +751,13 @@ export default function HomeScreen({ navigation }) {
                   <View style={styles.videoMeta}>
                     <View style={styles.metaLeft}>
                       {video.published ? <Text style={styles.timeAgo}>{timeAgo(video.published)}</Text> : null}
-                      <View style={styles.metaLikeGroup}>
-                        <SvgXml xml={THUMB_UP_SVG} width={12} height={12} style={styles.metaIcon} />
-                        <Text style={styles.metaLikeCount}>{formatCount(video.likes || 0)}</Text>
-                      </View>
-                      {video.dislikes && video.dislikes !== '0' && (
+                      {hasLikeCount && (
+                        <View style={styles.metaLikeGroup}>
+                          <SvgXml xml={THUMB_UP_SVG} width={12} height={12} style={styles.metaIcon} />
+                          <Text style={styles.metaLikeCount}>{formatCount(video.likes)}</Text>
+                        </View>
+                      )}
+                      {hasDislikeCount && String(video.dislikes) !== '0' && (
                         <View style={styles.metaLikeGroup}>
                           <SvgXml xml={THUMB_DOWN_SVG} width={12} height={12} style={styles.metaIcon} />
                           <Text style={styles.metaLikeCount}>{formatCount(video.dislikes)}</Text>
@@ -724,6 +786,11 @@ export default function HomeScreen({ navigation }) {
     );
   }
 
+  const previewConnectionPhase = getPreviewHomeConnectionPhase({
+    initializationPending: previewInitializationPending,
+    connectionError: previewConnectionError,
+  });
+
   return (
     <View style={styles.container}>
       <FlatList
@@ -738,6 +805,25 @@ export default function HomeScreen({ navigation }) {
             colors={[COLORS.accent]}
           />
         }
+        ListHeaderComponent={IS_TUBEPULSE_PREVIEW && previewConnectionPhase === 'connecting' ? (
+          <View style={styles.previewConnecting}>
+            <ActivityIndicator color={COLORS.accent} size="small" />
+            <Text style={styles.previewConnectingText}>Connecting to Preview server…</Text>
+          </View>
+        ) : IS_TUBEPULSE_PREVIEW && previewConnectionPhase === 'error' ? (
+          <View style={styles.previewError}>
+            <Text style={styles.previewErrorTitle}>Preview server unavailable</Text>
+            <Text style={styles.previewErrorText}>{previewConnectionError}</Text>
+            <View style={styles.previewErrorActions}>
+              <TouchableOpacity onPress={refresh} disabled={refreshing}>
+                <Text style={styles.previewErrorLink}>{refreshing ? 'Retrying…' : 'Retry'}</Text>
+              </TouchableOpacity>
+              <TouchableOpacity onPress={() => navigation.navigate('Settings')}>
+                <Text style={styles.previewErrorLink}>Server settings</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        ) : null}
         ListEmptyComponent={
           <View style={styles.empty}>
             <Text style={styles.emptyText}>No channels added</Text>
@@ -762,6 +848,27 @@ const styles = StyleSheet.create({
     borderBottomColor: COLORS.border,
     paddingBottom: 8,
   },
+  previewError: {
+    backgroundColor: 'rgba(239, 83, 80, 0.12)',
+    borderBottomColor: COLORS.danger,
+    borderBottomWidth: 1,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+  },
+  previewErrorTitle: { color: COLORS.text, fontSize: 14, fontWeight: '700' },
+  previewErrorText: { color: COLORS.textDim, fontSize: 12, marginTop: 3 },
+  previewErrorActions: { flexDirection: 'row', gap: 20, marginTop: 8 },
+  previewErrorLink: { color: COLORS.accent, fontSize: 13, fontWeight: '600' },
+  previewConnecting: {
+    alignItems: 'center',
+    borderBottomColor: COLORS.border,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    flexDirection: 'row',
+    gap: 10,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+  },
+  previewConnectingText: { color: COLORS.textDim, fontSize: 13 },
   channelSectionNew: {
     backgroundColor: 'rgba(79, 195, 247, 0.04)',
   },

@@ -1,0 +1,135 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import test from 'node:test';
+import { signAuthorityRequest } from '../src/home-authority.mjs';
+import { UnifiedHomeAuthorityService } from '../src/home-authority-service.mjs';
+import { contentHash } from '../src/kv-adapters.mjs';
+
+const SECRET = 'synthetic-unified-service-secret-longer-than-32-characters';
+
+class MemoryNamespace {
+  constructor(entries = {}) { this.values = new Map(Object.entries(entries)); }
+  async get(name, type = 'text') {
+    const value = this.values.has(name) ? this.values.get(name) : null;
+    return type === 'json' && value !== null ? JSON.parse(value) : value;
+  }
+  async put(name, value) { this.values.set(name, String(value)); }
+  async delete(name) { this.values.delete(name); }
+  async list() { return { keys: [...this.values.keys()].sort().map((name) => ({ name })), list_complete: true }; }
+}
+
+class FakeRuntime {
+  constructor(namespace) { this.namespace = namespace; this.started = false; }
+  async start() { this.started = true; return this; }
+  async getLocalNamespace() { return this.namespace; }
+  async dispatchFetch(_url, init) {
+    return Response.json({ channels: [], authorization: init.headers.Authorization ? 'present' : 'missing' });
+  }
+  async close() { this.started = false; }
+}
+
+class FakeRunner {
+  constructor() { this.started = false; }
+  async start() { this.started = true; }
+  async run() { throw new Error('standby must not arm scheduler'); }
+  async status() { return { mode: 'standby', lease: { state: 'held' } }; }
+  async close() { this.started = false; }
+}
+
+class FailingRunner extends FakeRunner {
+  async start() { throw new Error('synthetic scheduler startup failure'); }
+}
+
+async function temporaryDirectory(t) {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'tubepulse-unified-service-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  return directory;
+}
+
+function config(dataDir) {
+  return {
+    mode: 'standby', dataDir, leaseTtlMs: 60_000,
+    authority: { enabled: true, secret: SECRET, apiUrl: 'https://api.example.test', timeoutMs: 1000 },
+    repoRoot: path.resolve('..'), workerBindings: {}, quiet: true,
+    postsCadenceMinutes: 60, notificationsEnabled: false, remoteWriteEnabled: false,
+  };
+}
+
+function signed(pathname, operation, payload) {
+  const body = JSON.stringify(payload);
+  const authorization = 'Bearer synthetic-device';
+  return {
+    body,
+    headers: {
+      ...signAuthorityRequest({ secret: SECRET, operation, target: pathname, authorization, body }),
+      Authorization: authorization,
+      'Content-Type': 'application/json',
+    },
+  };
+}
+
+test('unified service exposes only status and signed authority ingress over the scheduler store', async (t) => {
+  const dataDir = await temporaryDirectory(t);
+  const namespace = new MemoryNamespace({ setting: 'old' });
+  const runner = new FakeRunner();
+  const service = new UnifiedHomeAuthorityService(config(dataDir), {
+    runtime: new FakeRuntime(namespace), runner, host: '127.0.0.1', port: 0,
+  });
+  await service.start();
+  t.after(() => service.close());
+  const address = service.server.address();
+  const base = `http://127.0.0.1:${address.port}`;
+  let response = await fetch(`${base}/_tubepulse/status`);
+  assert.equal(response.status, 200);
+  const status = await response.json();
+  assert.equal(status.configuration.publicAppRoutes, false);
+  assert.equal(status.configuration.periodicCanonicalPull, false);
+  response = await fetch(`${base}/feed`);
+  assert.equal(response.status, 404);
+
+  const manifest = { hash: contentHash('synthetic'), recordCount: 1 };
+  await service.gate.reconcile({ manifestHash: manifest.hash, recordCount: manifest.recordCount });
+  const readHeaders = signAuthorityRequest({
+    secret: SECRET,
+    operation: 'authority-feed',
+    method: 'GET',
+    target: '/_tubepulse/authority/feed',
+    authorization: 'Bearer synthetic-device',
+    body: '',
+  });
+  response = await fetch(`${base}/_tubepulse/authority/feed`, {
+    headers: { ...readHeaders, Authorization: 'Bearer synthetic-device' },
+  });
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).authorization, 'present');
+  const leaseId = 'service-api-lease-00001';
+  let request = signed('/_tubepulse/authority/preflight', 'authority-preflight', {
+    leaseId, method: 'POST', path: '/settings',
+  });
+  response = await fetch(`${base}/_tubepulse/authority/preflight`, { method: 'POST', ...request });
+  assert.equal(response.status, 200);
+  request = signed('/_tubepulse/authority/commit', 'authority-commit', {
+    leaseId,
+    deltas: [{ key: 'setting', operation: 'put', value: 'new', options: {}, baseHash: contentHash('old'), nextHash: contentHash('new') }],
+  });
+  response = await fetch(`${base}/_tubepulse/authority/commit`, { method: 'POST', ...request });
+  assert.equal(response.status, 200);
+  assert.equal(namespace.values.get('setting'), 'new');
+  assert.equal(runner.started, true);
+});
+
+test('unified service closes an already-started runtime when scheduler startup fails', async (t) => {
+  const dataDir = await temporaryDirectory(t);
+  const runtime = new FakeRuntime(new MemoryNamespace());
+  const service = new UnifiedHomeAuthorityService(config(dataDir), {
+    runtime,
+    runner: new FailingRunner(),
+    host: '127.0.0.1',
+    port: 0,
+  });
+  await assert.rejects(() => service.start(), /synthetic scheduler startup failure/);
+  assert.equal(runtime.started, false);
+  assert.equal(service.server, null);
+});

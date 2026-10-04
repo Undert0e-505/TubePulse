@@ -71,3 +71,28 @@ Since we are not rotating either key:
 
 > Do not apply console changes that could break production without confirming
 > with the project owner first.
+
+## Self-host preview
+
+The optional [`self-host/`](self-host/) runtime introduces local operational secrets and state. Its `.env`, `data/`, and `secrets/` paths are ignored by Git. Operators should run it under a dedicated low-privilege account and restrict filesystem access to:
+
+- the admin bearer token;
+- the Firebase service-account JSON;
+- the scoped Cloudflare KV API token;
+- the local data directory, which can contain device identifiers, channel state, and FCM registration tokens.
+
+Prefer the supported `_FILE` variables over multiline or shell-visible values. Cloudflare pull-only operation needs a namespace-scoped Workers KV Storage Read token. Remote push requires an Edit token plus the independent `TUBEPULSE_CLOUDFLARE_WRITE_ENABLED=true` safety switch; automatic push is off by default.
+
+The public self-host status endpoint omits secret values, filesystem paths, conflict keys, device/channel identifiers, and raw upstream error bodies. Mutating admin endpoints fail closed when `TUBEPULSE_ADMIN_TOKEN` is absent and compare bearer tokens in constant time. Bind to `127.0.0.1` unless a firewall or authenticated TLS tunnel intentionally publishes the service.
+
+Client fallback URLs are Expo public build-time configuration, not secrets. The `X-TubePulse-Failover` header is likewise only a signal. Optional automatic takeover additionally requires a successful app route for an unchanged device profile whose hash is represented in the durable Cloudflare sync baseline; new local registration alone cannot activate standby scheduling.
+
+The former single-device canary gateway is disabled. Production uses the fail-closed unified Home authority: all app traffic still enters the existing Cloudflare API, authenticated feeds reach the single local store only through the private VPC binding, and the same HMAC protocol protects exact mutation preflight/commit traffic. Signed requests bind timestamp, one-time request ID, operation, method, path/query, authorization digest, and body digest; replay, expiry, unknown routes, oversized bodies, and divergent baselines are rejected. The local listener exposes only loopback status plus signed authority paths, while the digest-pinned Tunnel sidecar publishes no host port. Secrets remain in ignored ACL-restricted files and encrypted Worker configuration; logs must never contain bearers, authorization headers, Tunnel tokens, FCM tokens, or snapshot values. A global stale transition stops Home publication/notification and makes the API fall back to Cloudflare reads until a fresh exact reconciliation succeeds. WebSub is acknowledged but suppressed while Home owns detection, preventing a second notification writer.
+
+### LAN and local Android test controls
+
+Docker Compose publishes the API on loopback unless `TUBEPULSE_PUBLISH_ADDRESS=0.0.0.0` is set explicitly. A LAN deployment should use a Windows **Private** network and an inbound rule limited to TCP 8788 from `LocalSubnet`; never add an Any-profile/Any-remote rule for convenience. Plain HTTP is suitable only on a trusted local network. Use TLS (for example, a narrowly routed tunnel) before crossing the public internet.
+
+The side-by-side `selfhost` APK permits cleartext traffic only through its source-set manifest. The production/main manifest has no such opt-in. The APK is debuggable and signed with the Android debug key, so it is a test artifact, not a release candidate, and must not be distributed as a production build.
+
+`scripts/Build-SelfHostApk.ps1` creates and removes an ignored variant Firebase config during the build. Rewriting the non-secret client package metadata does not register a new Firebase app; the Preview pilot deliberately sends a null token. Register `com.tubepulse.app.selfhost` separately in Firebase and explicitly enable Preview push before relying on delivery; do not loosen the production app's package/certificate restrictions. The ignored APK output, generated Firebase file, self-host data, `.env`, and copied secret files must remain outside Git.

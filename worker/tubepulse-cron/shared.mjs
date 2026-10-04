@@ -37,6 +37,7 @@ export const KNOWN_VIDEO_LIMIT = 500;
 export const RELENTLESS_5M_BACKOFF_THRESHOLD = 12; // 12 × 5min = 1 hour
 const FCM_TOKEN_CACHE_TTL_MS = 50 * 60 * 1000; // 50 minutes (access tokens last 60min)
 const FCM_TOKEN_CACHE_MARGIN_MS = 5 * 60 * 1000; // refresh 5min before expiry
+const SHADOW_FCM_ACCESS_TOKEN = 'tubepulse-shadow-no-network';
 
 // ─── KV helpers ─────────────────────────────────────────────────────────
 
@@ -65,6 +66,13 @@ export async function putKVIfChanged(kv, k, value, existingValue) {
 
 export function stableSort(arr) {
   return [...arr].sort();
+}
+
+export async function withKvMutationLock(env, name, operation) {
+  if (typeof env?.TUBEPULSE_KV_MUTATION_LOCK === 'function') {
+    return await env.TUBEPULSE_KV_MUTATION_LOCK(name, operation);
+  }
+  return await operation();
 }
 
 // Time-derived work selection keeps shard workers stateless. These helpers
@@ -211,7 +219,20 @@ function shouldPersistMetricGroup(lastCheckedHour, currentHour, metricPairs) {
 function currentMetricValue(rssValue, persistedValue) {
   if (rssValue !== undefined && rssValue !== null) return String(rssValue);
   if (persistedValue !== undefined && persistedValue !== null) return persistedValue;
-  return '0';
+  return null;
+}
+
+function isMissingMetricClock(lastCheckedHour) {
+  return lastCheckedHour === undefined || lastCheckedHour === null
+    || !Number.isFinite(Number(lastCheckedHour));
+}
+
+function isAmbiguousLegacyZero(persistedValue, rssValue) {
+  return (rssValue === undefined || rssValue === null)
+    && persistedValue !== undefined
+    && persistedValue !== null
+    && persistedValue !== ''
+    && Number(persistedValue) === 0;
 }
 
 function copyPersistedMetricFields(target, cached) {
@@ -263,12 +284,27 @@ export function mergeRssUploadsIntoRecentVideos(cachedRecent, rssUploads, nowMs)
       merged.viewsLastCheckedHour = currentHour;
     }
 
-    if (shouldPersistMetricGroup(cached.likesLastCheckedHour, currentHour, [
+    const repairAmbiguousLikes = isAmbiguousLegacyZero(cached.likes, upload.likes);
+    const repairAmbiguousDislikes = isAmbiguousLegacyZero(cached.dislikes, upload.dislikes);
+    if (repairAmbiguousLikes || repairAmbiguousDislikes || shouldPersistMetricGroup(cached.likesLastCheckedHour, currentHour, [
       [cached.likes, upload.likes],
       [cached.dislikes, upload.dislikes],
     ])) {
-      merged.likes = currentMetricValue(upload.likes, cached.likes);
-      merged.dislikes = currentMetricValue(upload.dislikes, cached.dislikes);
+      // Old API bootstrap/WebSub entries wrote a synthetic zero and no
+      // metric clock when RSS omitted a count. During their one-time clock
+      // migration, or if the old zero has already acquired a clock, trust the
+      // current RSS value (including null/unknown) instead of carrying that
+      // ambiguous zero forever. Once repaired to null this condition is false,
+      // so the exception remains a bounded one-time write.
+      const legacyUnclocked = isMissingMetricClock(cached.likesLastCheckedHour);
+      merged.likes = currentMetricValue(
+        upload.likes,
+        legacyUnclocked || repairAmbiguousLikes ? undefined : cached.likes,
+      );
+      merged.dislikes = currentMetricValue(
+        upload.dislikes,
+        legacyUnclocked || repairAmbiguousDislikes ? undefined : cached.dislikes,
+      );
       merged.likesLastCheckedHour = currentHour;
     }
 
@@ -371,6 +407,11 @@ export async function getGoogleAccessToken(serviceAccountJson) {
  * Never prints token contents.
  */
 export async function getCachedFcmAccessToken(env) {
+  // The dedicated Home scheduler uses this explicit mode while measuring a
+  // production-shaped sweep. Returning an internal sentinel keeps the normal
+  // notification decision path intact without minting a Google token or
+  // contacting FCM. The sentinel is consumed only by sendFCMPush below.
+  if (env?.TUBEPULSE_NOTIFICATION_MODE === 'shadow') return SHADOW_FCM_ACCESS_TOKEN;
   const kv = env.TUBEPULSE_KV;
   const cached = await getKV(kv, key.fcmTokenCache());
   const now = Date.now();
@@ -390,6 +431,9 @@ export async function getCachedFcmAccessToken(env) {
 // ─── FCM push ──────────────────────────────────────────────────────────
 
 export async function sendFCMPush(accessToken, projectId, fcmToken, payload) {
+  if (accessToken === SHADOW_FCM_ACCESS_TOKEN) {
+    return { sent: false, deadToken: false, shadow: true };
+  }
   const url = `https://fcm.googleapis.com/v1/projects/${projectId}/messages:send`;
   const notification = payload.notification || {};
   const title = payload.title ?? notification.title ?? 'TubePulse';
@@ -502,22 +546,26 @@ export async function cleanupDeadDevice(deviceId, env, reason = 'fcm_unregistere
 // ─── Nag active index ───────────────────────────────────────────────────
 
 export async function addToNagActive(env, deviceId, channelId) {
-  const kv = env.TUBEPULSE_KV;
-  const entry = `${deviceId}|${channelId}`;
-  const active = await getKV(kv, key.nagActive()) || [];
-  if (active.includes(entry)) return;
-  active.push(entry);
-  await putKV(kv, key.nagActive(), active);
+  return await withKvMutationLock(env, key.nagActive(), async () => {
+    const kv = env.TUBEPULSE_KV;
+    const entry = `${deviceId}|${channelId}`;
+    const active = await getKV(kv, key.nagActive()) || [];
+    if (active.includes(entry)) return;
+    active.push(entry);
+    await putKV(kv, key.nagActive(), active);
+  });
 }
 
 export async function removeFromNagActive(env, deviceId, channelId) {
-  const kv = env.TUBEPULSE_KV;
-  const entry = `${deviceId}|${channelId}`;
-  const active = await getKV(kv, key.nagActive()) || [];
-  const filtered = active.filter((e) => e !== entry);
-  if (filtered.length !== active.length) {
-    await putKV(kv, key.nagActive(), filtered);
-  }
+  return await withKvMutationLock(env, key.nagActive(), async () => {
+    const kv = env.TUBEPULSE_KV;
+    const entry = `${deviceId}|${channelId}`;
+    const active = await getKV(kv, key.nagActive()) || [];
+    const filtered = active.filter((e) => e !== entry);
+    if (filtered.length !== active.length) {
+      await putKV(kv, key.nagActive(), filtered);
+    }
+  });
 }
 
 // ─── RSS known-video watermark helpers ──────────────────────────────────
@@ -661,6 +709,33 @@ export function preserveCachedCommunityPostPublishedAt(post, cachedPosts) {
   };
 }
 
+function isExpectedCommunityThumbnailHost(hostname) {
+  const normalized = String(hostname || '').toLowerCase();
+  return normalized === 'i.ytimg.com'
+    || normalized.endsWith('.ytimg.com')
+    || normalized === 'yt3.ggpht.com'
+    || normalized.endsWith('.ggpht.com')
+    || normalized.endsWith('.googleusercontent.com');
+}
+
+function communityThumbnailCacheIdentity(value) {
+  if (typeof value !== 'string' || !value) return value;
+  try {
+    const url = new URL(value);
+    if (!isExpectedCommunityThumbnailHost(url.hostname)) return value;
+    // YouTube rotates these delivery/signature parameters between otherwise
+    // identical InnerTube responses. The image identity is the stable path;
+    // retaining the cached URL prevents an hourly KV write with no UI change.
+    url.searchParams.delete('sqp');
+    url.searchParams.delete('rs');
+    url.searchParams.sort();
+    url.hash = '';
+    return url.toString();
+  } catch {
+    return value;
+  }
+}
+
 export function shouldRefreshCachedCommunityPost(latestPost, cachedPosts) {
   if (!latestPost) return false;
   if (!Array.isArray(cachedPosts) || cachedPosts.length !== 1) return true;
@@ -669,9 +744,21 @@ export function shouldRefreshCachedCommunityPost(latestPost, cachedPosts) {
   if (!cached.publishedAt && latestPost.publishedAt) return true;
   if (!cached.fetchedAt && latestPost.fetchedAt) return true;
   if (!cached.publishedAtSource && latestPost.publishedAtSource) return true;
-  for (const field of ['text', 'thumbnail', 'publishedText', 'likeCount', 'likeText', 'viewCount', 'viewText']) {
+  if (communityThumbnailCacheIdentity(cached?.thumbnail)
+    !== communityThumbnailCacheIdentity(latestPost?.thumbnail)) return true;
+  for (const field of ['text', 'likeCount', 'likeText', 'viewCount', 'viewText']) {
     if ((cached?.[field] ?? null) !== (latestPost?.[field] ?? null)) return true;
   }
+  const cachedPublishedAt = Date.parse(cached?.publishedAt);
+  const latestPublishedAt = Date.parse(latestPost?.publishedAt);
+  const hasStablePublishedAt = Number.isFinite(cachedPublishedAt)
+    && Number.isFinite(latestPublishedAt)
+    && cachedPublishedAt === latestPublishedAt;
+  // Relative labels (for example "12 minutes ago") advance even though the
+  // post did not. Clients prefer publishedAt and compute their own age, so a
+  // label-only change is useful only when there is no trustworthy timestamp.
+  if (!hasStablePublishedAt
+    && (cached?.publishedText ?? null) !== (latestPost?.publishedText ?? null)) return true;
   return false;
 }
 

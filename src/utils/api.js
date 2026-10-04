@@ -18,17 +18,17 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Application from 'expo-application';
 import * as SecureStore from 'expo-secure-store';
+import {
+  fetchWithEndpointFailover,
+} from './apiEndpointPolicy.mjs';
+import {
+  getApiEndpointPolicy,
+  resetApiEndpointPolicy,
+} from './apiEndpointConfig';
+import { createDeviceIdResolver } from './deviceIdentity.mjs';
 
-const API_URL = 'https://tubepulse-api.jimothyoakley55.workers.dev';
 const DEVICE_ID_KEY = 'tubepulse_device_id'; // AsyncStorage (fallback)
 const SECURE_DEVICE_ID_KEY = 'tubepulse_device_id_v1'; // Keystore/Keychain (primary)
-
-// Module-level mutex around the read-or-create for the slow fallbacks
-// (AsyncStorage UUID). The primary secure-store path is naturally
-// race-free because SecureStore handles its own persistence. The
-// secondary Android ID path is also race-free (synchronous). The
-// mutex only protects the AsyncStorage UUID fallback.
-let _fallbackDeviceIdPromise = null;
 
 function _generateUuid() {
   return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
@@ -56,14 +56,14 @@ function _generateUuid() {
  *    the Keystore is unavailable (some older devices, broken Keystores,
  *    Expo Go). Same lifecycle as secure store (reset on uninstall).
  *
- * 3. **AsyncStorage UUID** (with a module-level mutex). Last-resort
- *    fallback. Prone to the v3.0.18 race where two concurrent first-
- *    launch calls each saw an empty store and minted different UUIDs.
- *    The mutex prevents that.
+ * 3. **AsyncStorage UUID**. Last-resort fallback when neither native
+ *    identity source is available.
  *
- * All three paths return a Promise<string>; callers don't need to
- * know which path was used. The server treats all of them the same
- * (just a stable per-install identifier).
+ * The complete read-or-create resolution is protected by one module-level
+ * promise. Concurrent first-launch callers therefore receive the same ID,
+ * including while the SecureStore value is still being created. All three
+ * paths return a Promise<string>; callers don't need to know which path was
+ * used. The server treats all of them as a stable per-install identifier.
  *
  * Cross-tier stability: a v3.0.19 install with `android:abc...` that
  * upgrades to v3.0.20 will get a fresh `secure:xyz...` on first
@@ -72,45 +72,18 @@ function _generateUuid() {
  * profile and migrates state to the new deviceId. Same mechanism as
  * the v3.0.18→v3.0.19 migration.
  */
+const resolveDeviceId = createDeviceIdResolver({
+  secureStore: SecureStore,
+  application: Application,
+  asyncStorage: AsyncStorage,
+  secureStoreKey: SECURE_DEVICE_ID_KEY,
+  fallbackStorageKey: DEVICE_ID_KEY,
+  generateUuid: _generateUuid,
+  warn: (...args) => console.warn(...args),
+});
+
 export async function getDeviceId() {
-  // 1. Try secure store first. This is the desired long-term path.
-  try {
-    const secureId = await SecureStore.getItemAsync(SECURE_DEVICE_ID_KEY);
-    if (secureId && typeof secureId === 'string' && secureId.length > 0) {
-      return secureId; // expected format: "secure:<uuid>"
-    }
-    // No entry yet — generate one and persist.
-    const newId = `secure:${_generateUuid()}`;
-    await SecureStore.setItemAsync(SECURE_DEVICE_ID_KEY, newId);
-    return newId;
-  } catch (err) {
-    // SecureStore can fail if the Keystore is unavailable (broken
-    // device Keystore, locked device with no unlock yet, etc.).
-    // Fall through to Android ID.
-    console.warn('[deviceId] SecureStore unavailable, falling back to Android ID:', err?.message || err);
-  }
-
-  // 2. Try Android ID. Race-free, synchronous.
-  try {
-    const androidId = Application.getAndroidId();
-    if (androidId && typeof androidId === 'string' && androidId.length > 0) {
-      return `android:${androidId}`;
-    }
-  } catch (err) {
-    console.warn('[deviceId] Application.getAndroidId() failed, falling back to AsyncStorage UUID:', err?.message || err);
-  }
-
-  // 3. Last-resort: AsyncStorage UUID with a mutex.
-  if (_fallbackDeviceIdPromise) return _fallbackDeviceIdPromise;
-  _fallbackDeviceIdPromise = (async () => {
-    let id = await AsyncStorage.getItem(DEVICE_ID_KEY);
-    if (!id) {
-      id = `uuid:${_generateUuid()}`;
-      await AsyncStorage.setItem(DEVICE_ID_KEY, id);
-    }
-    return id;
-  })();
-  return _fallbackDeviceIdPromise;
+  return await resolveDeviceId();
 }
 
 async function apiFetch(path, options = {}) {
@@ -134,7 +107,13 @@ async function apiFetch(path, options = {}) {
   }
 
   try {
-    const resp = await fetch(`${API_URL}${path}`, fetchOptions);
+    const endpointPolicy = await getApiEndpointPolicy();
+    const resp = await fetchWithEndpointFailover({
+      policy: endpointPolicy,
+      path,
+      init: fetchOptions,
+      fetchImpl: fetch,
+    });
 
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({ error: resp.statusText }));
@@ -148,6 +127,14 @@ async function apiFetch(path, options = {}) {
     console.error(`API ${method} ${path} network error:`, err.message);
     return { ok: false, error: 'Network error' };
   }
+}
+
+/**
+ * Explicitly clear process-lifetime fallback stickiness. The app never calls
+ * this automatically; it exists for tests and deliberate recovery tooling.
+ */
+export function resetApiFailoverEndpoint() {
+  resetApiEndpointPolicy();
 }
 
 /**

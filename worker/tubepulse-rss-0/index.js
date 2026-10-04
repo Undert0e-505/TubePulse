@@ -6,6 +6,7 @@ import {
   fetchChannelRSS, isDndActive,
   getCachedFcmAccessToken, sendFCMPush, cleanupDeadDevice,
   addToNagActive,
+  withKvMutationLock,
   seedKnownVideosFromRss, classifyRssVideosForNotification,
   updateKnownVideosAfterPoll, mergeRssUploadsIntoRecentVideos,
 } from '../tubepulse-cron/shared.mjs';
@@ -28,13 +29,17 @@ export default {
   },
 };
 
-async function pollSingleRssChannel(env, ctx, channelId) {
+export async function pollSingleRssChannel(env, ctx, channelId, options = {}) {
   const kv = env.TUBEPULSE_KV;
   const now = Date.now();
   const nowIso = new Date(now).toISOString();
 
   const feed = await fetchChannelRSS(channelId);
-  if (!feed || feed.entries.length === 0) return;
+  if (!feed) {
+    if (options.failOnFetchError) throw new Error(`RSS fetch failed for ${channelId}`);
+    return { outcome: 'fetch-failed' };
+  }
+  if (feed.entries.length === 0) return { outcome: 'empty-feed' };
 
   const uploads = feed.entries.map((e) => ({
     videoId: e.videoId,
@@ -73,7 +78,7 @@ async function pollSingleRssChannel(env, ctx, channelId) {
     if (metaChanged) await putKVIfChanged(kv, key.channelMeta(channelId), meta);
 
     console.log(`[RSS] ${channelId}: first-run seed — ${seededKnown.ids.length} known IDs, highWatermarkAt=${seededKnown.highWatermarkAt}, subs=${subs.length}, no notifications`);
-    return;
+    return { outcome: 'seeded', entryCount: uploads.length };
   }
 
   // Classify videos using durable watermark: notify only unknown videos
@@ -96,7 +101,7 @@ async function pollSingleRssChannel(env, ctx, channelId) {
     console.log(`[RSS] ${channelId}: suppressed ${suppressed.length} videos (known or below watermark)`);
   }
 
-  if (newVideos.length === 0) return;
+  if (newVideos.length === 0) return { outcome: 'unchanged', entryCount: uploads.length };
 
   console.log(`[RSS] ${channelId}: ${newVideos.length} genuinely new videos above watermark`);
 
@@ -160,11 +165,13 @@ async function pollSingleRssChannel(env, ctx, channelId) {
 
       if (video.type === 'live_scheduled') {
         const publishedTime = new Date(video.publishedAt).getTime();
-        const events = await getKV(kv, key.upcomingEvents()) || [];
-        if (!events.some((e) => e.videoId === video.videoId)) {
-          events.push({ channelId, videoId: video.videoId, scheduledFor: publishedTime, addedAt: now });
-          await putKV(kv, key.upcomingEvents(), events);
-        }
+        await withKvMutationLock(env, key.upcomingEvents(), async () => {
+          const events = await getKV(kv, key.upcomingEvents()) || [];
+          if (!events.some((e) => e.videoId === video.videoId)) {
+            events.push({ channelId, videoId: video.videoId, scheduledFor: publishedTime, addedAt: now });
+            await putKV(kv, key.upcomingEvents(), events);
+          }
+        });
         continue;
       }
 
@@ -177,7 +184,7 @@ async function pollSingleRssChannel(env, ctx, channelId) {
     // Add to nag:active only when genuine unread items were added and
     // unwatched transitioned from empty to non-empty.
     if (stateChanged && !hadUnwatchedBefore && (state.unwatched || []).length > 0) {
-      addToNagActive(env, deviceId, channelId);
+      await addToNagActive(env, deviceId, channelId);
     }
 
     if (stateChanged) {
@@ -206,6 +213,31 @@ async function pollSingleRssChannel(env, ctx, channelId) {
         };
       }
       const pushResult = await sendFCMPush(accessToken, projectId, profile.fcmToken, notifPayload);
+      if (pushResult.shadow) {
+        const deferred = env.TUBEPULSE_NOTIFICATION_DEFERRED === true;
+        await env.TUBEPULSE_SHADOW_NOTIFICATION_OBSERVER?.({
+          kind: 'video',
+          channelId,
+          ...(deferred ? {
+            deviceId,
+            projectId,
+            fcmToken: profile.fcmToken,
+            payload: notifPayload,
+            contentIds: notifyEntries.map((video) => video.videoId),
+            requireUnwatched: true,
+            onResult: async (result) => {
+              if (result?.sent) {
+                await withKvMutationLock(env, key.deviceState(deviceId, channelId), async () => {
+                  const current = await getKV(kv, key.deviceState(deviceId, channelId)) || state;
+                  await putKV(kv, key.deviceState(deviceId, channelId), { ...current, lastNagAt: now });
+                });
+              } else if (result?.deadToken) {
+                await cleanupDeadDevice(deviceId, env, 'fcm_unregistered');
+              }
+            },
+          } : {}),
+        });
+      }
       if (pushResult.deadToken) deadDevices.push(deviceId);
       if (pushResult.sent) {
         state.lastNagAt = now;
@@ -218,4 +250,5 @@ async function pollSingleRssChannel(env, ctx, channelId) {
     console.log(`[RSS] Pruning dead device: ${deviceId}`);
     ctx.waitUntil(cleanupDeadDevice(deviceId, env, 'fcm_unregistered'));
   }
+  return { outcome: 'new-content', entryCount: uploads.length, newVideoCount: newVideos.length };
 }

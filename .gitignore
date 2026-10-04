@@ -27,6 +27,21 @@ worker/*/.dev.vars
 worker/*/.wrangler/
 .wrangler/
 
+# Self-host runtime state and local configuration
+self-host/.env
+self-host/.env.gateway
+self-host/data/
+self-host/data-gateway/
+self-host/data-pilot/
+self-host/data-scheduler/
+self-host/data-authority/
+self-host/secrets/
+self-host/.env.scheduler
+self-host/.env.authority
+
+# Generated only while assembling the side-by-side local Android variant.
+android/app/src/selfhost/google-services.json
+
 # Local secrets and credentials
 # CRITICAL: anything under secrets/ is live credentials - NEVER commit
 /secrets/

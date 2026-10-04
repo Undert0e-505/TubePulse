@@ -1,0 +1,57 @@
+name: ${COMPOSE_PROJECT_NAME:-tubepulse-home}
+
+services:
+  gateway-origin:
+    build:
+      context: ..
+      dockerfile: self-host/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - path: ${TUBEPULSE_GATEWAY_ENV_FILE:-.env.gateway}
+        required: true
+    environment:
+      TUBEPULSE_HOST: 0.0.0.0
+      TUBEPULSE_PORT: 8788
+      TUBEPULSE_DATA_DIR: /data
+      TUBEPULSE_PILOT: "false"
+      TUBEPULSE_MODE: mirror
+      TUBEPULSE_GATEWAY_ORIGIN_ENABLED: "true"
+      TUBEPULSE_AUTO_TAKEOVER: "false"
+      TUBEPULSE_CLOUDFLARE_WRITE_ENABLED: "false"
+      TUBEPULSE_SYNC_AUTO_PUSH: "false"
+      FIREBASE_SERVICE_ACCOUNT: ""
+      FIREBASE_SERVICE_ACCOUNT_FILE: ""
+    ports:
+      - "127.0.0.1:${TUBEPULSE_GATEWAY_STATUS_PORT:-8789}:8788"
+    volumes:
+      - ./data-gateway:/data
+      - ./secrets:/run/secrets/tubepulse:ro
+    networks:
+      - home-private
+
+  cloudflared:
+    image: ${TUBEPULSE_CLOUDFLARED_IMAGE:-cloudflare/cloudflared@sha256:072c067d25ccbe61d46e18f0d0723255f2bb5304f7317caa95b27031520ff92c}
+    profiles:
+      - tunnel
+    restart: unless-stopped
+    command:
+      - tunnel
+      - --no-autoupdate
+      - --loglevel
+      - info
+      - run
+      - --token-file
+      - /run/secrets/cloudflared-tunnel-token
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ./secrets/cloudflared-tunnel-token.txt:/run/secrets/cloudflared-tunnel-token:ro
+    networks:
+      - home-private
+
+networks:
+  home-private:
+    driver: bridge

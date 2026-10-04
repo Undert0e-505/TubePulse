@@ -1,14 +1,62 @@
 name = "tubepulse-api"
 main = "index.js"
-compatibility_date = "2025-04-01"
+# Workers VPC requires the current runtime surface. This is the date used for
+# the first private-service canary deployment.
+compatibility_date = "2026-10-01"
 account_id = "77bb7769185bbfeb53feef16b9f72803"
 
 [[kv_namespaces]]
 binding = "TUBEPULSE_KV"
 id = "52e77ca9f5f6493e89d2478c8d3055ec"
 
-# No HTTP routes — worker disabled
-# routes = []
+[[vpc_services]]
+binding = "TUBEPULSE_HOME_VPC"
+service_id = "01a106c3-0990-7410-b88d-08d96a726127"
+
+# SQLite-backed Durable Object coordinator for the default-off unified Home
+# authority. The namespace may exist while the feature flag is false; in that
+# state normal API traffic never calls it and incurs no DO requests.
+[[durable_objects.bindings]]
+name = "TUBEPULSE_AUTHORITY_COORDINATOR"
+class_name = "TubePulseAuthorityCoordinator"
+
+[[migrations]]
+tag = "authority-v1"
+new_sqlite_classes = ["TubePulseAuthorityCoordinator"]
+
+# No custom routes are committed; the live workers.dev endpoint remains enabled.
+
+# Experimental existing-app Home canary gateway. There are intentionally no
+# committed values. Production currently provisions the values below as
+# encrypted Worker secrets for one canary; keep the secret and fingerprint out
+# of [vars]. Local HTTP is accepted only through the private VPC transport.
+# TUBEPULSE_HOME_GATEWAY_ENABLED=false
+# TUBEPULSE_HOME_ORIGIN=https://home-origin.example
+# TUBEPULSE_HOME_GATEWAY_TRANSPORT=https
+# TUBEPULSE_HOME_CANARY_SHA256=<full-64-hex-sha256>
+# wrangler secret put TUBEPULSE_HOME_GATEWAY_SECRET
+# TUBEPULSE_HOME_GATEWAY_TIMEOUT_MS=1500
+# TUBEPULSE_HOME_GATEWAY_ALLOW_HTTP=false
+
+# Private Workers VPC transport replaces public HTTPS ingress. The binding
+# above targets the verified production-account service. Missing, invalid, or
+# false gateway configuration still delegates directly to Cloudflare.
+# TUBEPULSE_HOME_GATEWAY_TRANSPORT=vpc
+# TUBEPULSE_HOME_ORIGIN=http://gateway-origin:8788
+
+# Unified local-first authority. Values stay encrypted Worker secrets; never
+# commit them under [vars]. The production deployment enables this separately
+# from source: all authenticated feeds use the one Home store over VPC while
+# current, with bounded Cloudflare-KV fallback, and exact mutation deltas are
+# synchronously replicated under the shared coordinator.
+# TUBEPULSE_HOME_AUTHORITY_ENABLED=false
+# TUBEPULSE_HOME_AUTHORITY_TRAFFIC_ENABLED=false
+# TUBEPULSE_HOME_AUTHORITY_TRANSPORT=vpc
+# TUBEPULSE_HOME_AUTHORITY_ORIGIN=http://gateway-origin:8788
+# TUBEPULSE_HOME_AUTHORITY_TIMEOUT_MS=5000
+# TUBEPULSE_AUTHORITY_KV_PUBLICATION_CAP=650
+# TUBEPULSE_AUTHORITY_KV_WRITE_HARD_CAP=950
+# wrangler secret put TUBEPULSE_HOME_AUTHORITY_SECRET
 
 [observability]
 enabled = true

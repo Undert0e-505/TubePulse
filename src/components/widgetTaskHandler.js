@@ -7,6 +7,7 @@ import {
   chooseLatestChannelContent,
   formatCompactAge,
   getPostSeenId,
+  resolveOptionalMetric,
   sortPostsNewestFirst,
   sortVideosNewestFirst,
 } from '../utils/feedPresentation';
@@ -23,8 +24,8 @@ function normalizeVideo(video = {}) {
     published: video.published || video.publishedAt,
     publishedAt: video.publishedAt || video.published,
     views: video.views || '',
-    likes: video.likes ?? 0,
-    dislikes: video.dislikes ?? 0,
+    likes: resolveOptionalMetric(video, 'likes'),
+    dislikes: resolveOptionalMetric(video, 'dislikes'),
     unwatched: video.unwatched,
     kind: 'video',
   };

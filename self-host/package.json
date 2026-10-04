@@ -1,0 +1,29 @@
+{
+  "name": "@tubepulse/self-host",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Preview self-hosted runtime and Cloudflare KV failover tooling for TubePulse",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "start": "node src/cli.mjs serve",
+    "scheduler": "node src/home-scheduler-cli.mjs run",
+    "scheduler:once": "node src/home-scheduler-cli.mjs once",
+    "authority": "node src/home-authority-cli.mjs run",
+    "authority:reconcile": "node src/home-authority-cli.mjs reconcile",
+    "sync:pull": "node src/cli.mjs sync pull",
+    "sync:push": "node src/cli.mjs sync push",
+    "test": "node --test test/*.test.mjs",
+    "check:source": "node --check src/authority-client.mjs && node --check src/authority-quota.mjs && node --check src/cli.mjs && node --check src/config.mjs && node --check src/exclusions.mjs && node --check src/file-state.mjs && node --check src/gateway-auth.mjs && node --check src/home-authority-cli.mjs && node --check src/home-authority-reconcile.mjs && node --check src/home-authority-service.mjs && node --check src/home-authority.mjs && node --check src/home-scheduler-cli.mjs && node --check src/home-scheduler-config.mjs && node --check src/home-scheduler-notifications.mjs && node --check src/home-scheduler.mjs && node --check src/kv-adapters.mjs && node --check src/runtime.mjs && node --check src/scheduler.mjs && node --check src/service.mjs && node --check src/sync-engine.mjs",
+    "check": "npm run check:source && npm test"
+  },
+  "dependencies": {
+    "miniflare": "4.20260730.0"
+  },
+  "overrides": {
+    "sharp": "0.35.4",
+    "undici": "7.29.1"
+  }
+}

@@ -1,0 +1,76 @@
+name: ${COMPOSE_PROJECT_NAME:-tubepulse-home-authority}
+
+services:
+  home-authority:
+    build:
+      context: ..
+      dockerfile: self-host/Dockerfile
+    command: ["node", "src/home-authority-cli.mjs", "run"]
+    restart: unless-stopped
+    stop_grace_period: 45s
+    env_file:
+      - path: ${TUBEPULSE_HOME_AUTHORITY_ENV_FILE:-.env.authority}
+        required: true
+    environment:
+      TUBEPULSE_HOME_SCHEDULER_DATA_DIR: /data
+      TUBEPULSE_HOME_AUTHORITY_HOST: 0.0.0.0
+      TUBEPULSE_HOME_AUTHORITY_PORT: 8788
+    ports:
+      - "127.0.0.1:${TUBEPULSE_HOME_AUTHORITY_STATUS_PORT:-8789}:8788"
+    volumes:
+      - ./data-authority:/data
+      - type: bind
+        source: ${TUBEPULSE_HOME_AUTHORITY_CLOUDFLARE_TOKEN_HOST_FILE:-./secrets/cloudflare-scheduler-write-token.txt}
+        target: /run/secrets/tubepulse/cloudflare-token.txt
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${TUBEPULSE_HOME_AUTHORITY_FIREBASE_HOST_FILE:-./secrets/firebase.json}
+        target: /run/secrets/tubepulse/firebase.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${TUBEPULSE_HOME_AUTHORITY_YOUTUBE_KEY_HOST_FILE:-./secrets/youtube-api-key.txt}
+        target: /run/secrets/tubepulse/youtube-api-key.txt
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${TUBEPULSE_HOME_AUTHORITY_SECRET_HOST_FILE:-./secrets/authority-secret.txt}
+        target: /run/secrets/tubepulse/authority-secret.txt
+        read_only: true
+        bind:
+          create_host_path: false
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8788/_tubepulse/status').then(async r=>{const j=await r.json();if(!r.ok||j.service!=='unified-home-authority')process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      start_period: 20s
+      retries: 3
+    networks:
+      home-private:
+        aliases:
+          # Existing Workers VPC Service target. The old mirror gateway must
+          # be stopped before this project starts, so only one origin owns it.
+          - gateway-origin
+
+  cloudflared:
+    image: ${TUBEPULSE_CLOUDFLARED_IMAGE:-cloudflare/cloudflared@sha256:072c067d25ccbe61d46e18f0d0723255f2bb5304f7317caa95b27031520ff92c}
+    restart: unless-stopped
+    command: ["tunnel", "--no-autoupdate", "--loglevel", "info", "run", "--token-file", "/run/secrets/cloudflared-tunnel-token"]
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    volumes:
+      - ./secrets/cloudflared-tunnel-token.txt:/run/secrets/cloudflared-tunnel-token:ro
+    depends_on:
+      home-authority:
+        condition: service_healthy
+    networks:
+      - home-private
+
+networks:
+  home-private:
+    driver: bridge

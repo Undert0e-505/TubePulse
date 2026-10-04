@@ -3,14 +3,16 @@ import {
   View, Text, TouchableOpacity, StyleSheet,
   Platform, Switch, ScrollView,
 } from 'react-native';
-import { useFocusEffect } from '@react-navigation/native';
+import { useFocusEffect, useNavigation } from '@react-navigation/native';
 import { COLORS, DEFAULT_SETTINGS, NAG_INTERVALS, PREWARN_OPTIONS, VIDEOS_PER_CHANNEL_OPTIONS } from '../utils/constants';
 import TimeSpinner from '../components/TimeSpinner';
 import { getSettings, saveSettings } from '../utils/storage';
 import { updateSettings, getDeviceId } from '../utils/api';
+import { IS_TUBEPULSE_PREVIEW } from '../utils/apiEndpointConfig';
 
 // ── Main Screen ───────────────────────────────────────────────────────────────
 export default function SettingsScreen() {
+  const navigation = useNavigation();
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
 
   useFocusEffect(
@@ -226,8 +228,23 @@ export default function SettingsScreen() {
       {/* Push Architecture Note */}
       <Text style={styles.sectionTitle}>Push notifications</Text>
       <Text style={styles.guidance}>
-        TubePulse uses WebSub — YouTube pushes to us the instant a video drops, then we push to you. Your phone never polls. No battery drain.
+        {IS_TUBEPULSE_PREVIEW
+          ? 'Push is disabled in this pilot APK. API, feed and subscription testing uses a null push token.'
+          : 'TubePulse uses WebSub — YouTube pushes to us the instant a video drops, then we push to you. Your phone never polls. No battery drain.'}
       </Text>
+
+      {IS_TUBEPULSE_PREVIEW ? (
+        <>
+          <Text style={styles.sectionTitle}>Preview</Text>
+          <TouchableOpacity style={styles.serverButton} onPress={() => navigation.navigate('PreviewServer')}>
+            <View style={styles.switchLabelWrap}>
+              <Text style={styles.dndLabel}>Preview Server</Text>
+              <Text style={styles.switchSubtitle}>View, test or change this app's TubePulse Home</Text>
+            </View>
+            <Text style={styles.serverChevron}>›</Text>
+          </TouchableOpacity>
+        </>
+      ) : null}
 
     </ScrollView>
   );
@@ -333,6 +350,20 @@ const styles = StyleSheet.create({
     color: COLORS.textDim,
     fontSize: 12,
     marginTop: 2,
+  },
+  serverButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: COLORS.surface,
+    borderColor: COLORS.border,
+    borderWidth: 1,
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 11,
+  },
+  serverChevron: {
+    color: COLORS.accent,
+    fontSize: 24,
   },
   timeRow: {
     flexDirection: 'row',

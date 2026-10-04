@@ -1,3 +1,8 @@
+import { createGatewayWorker } from './gateway.mjs';
+import { createAuthorityWorker, TubePulseAuthorityCoordinator } from './authority.mjs';
+
+export { TubePulseAuthorityCoordinator };
+
 /**
  * TubePulse API Worker — v3.0 (channel-first architecture)
  *
@@ -484,15 +489,15 @@ function parseWebSubPush(xmlText) {
     const description = descMatch ? descMatch[1] : '';
     // View count lives in media:community/media:statistics/@_views
     const viewsMatch = e.match(/<media:statistics[^>]*views="(\d+)"/);
-    const views = viewsMatch ? viewsMatch[1] : '0';
+    const views = viewsMatch ? viewsMatch[1] : null;
 
     // Likes / dislikes live in media:community/media:starRating/@_count
     // and a `dislikes` attribute on media:statistics. We accept both
     // layouts defensively — many feeds only carry likes on starRating.
     const likesMatch = e.match(/<media:starRating[^>]*count="(\d+)"/);
-    const likes = likesMatch ? likesMatch[1] : '0';
+    const likes = likesMatch ? likesMatch[1] : null;
     const dislMatch = e.match(/<media:statistics[^>]*dislikes="(\d+)"/);
-    const dislikes = dislMatch ? dislMatch[1] : '0';
+    const dislikes = dislMatch ? dislMatch[1] : null;
 
     if (videoId) {
       entries.push({ videoId, title, link, published, updated, thumbnail, description, views, likes, dislikes });
@@ -530,7 +535,9 @@ async function fetchYouTubeRSS(channelId) {
       link: e.link,
       thumbnail: e.thumbnail,
       description: e.description,
-      views: e.views || '0',
+      views: e.views,
+      likes: e.likes,
+      dislikes: e.dislikes,
     }));
 
     return { channel, videos };
@@ -577,10 +584,11 @@ async function fetchRecentVideosViaAPI(apiKey, channelId, maxResults = 15) {
   }
 }
 
-// Batched view-count lookup. Returns { [videoId]: "12345" } string view counts.
+// Batched statistics lookup. Optional metrics remain null when YouTube hides
+// or omits them; null must not be converted into a misleading public zero.
 // Costs 1 quota unit per call (up to 50 video IDs at once).
 // Returns null on quota/connection error so the caller can degrade gracefully.
-async function fetchViewCounts(apiKey, videoIds) {
+async function fetchVideoStatistics(apiKey, videoIds) {
   if (!videoIds || videoIds.length === 0) return {};
   const ids = videoIds.filter(Boolean).slice(0, 50);
   if (ids.length === 0) return {};
@@ -593,11 +601,16 @@ async function fetchViewCounts(apiKey, videoIds) {
     const data = await resp.json();
     const out = {};
     for (const item of data.items || []) {
-      out[item.id] = String(item.statistics?.viewCount ?? '0');
+      const statistics = item.statistics || {};
+      out[item.id] = {
+        views: statistics.viewCount != null ? String(statistics.viewCount) : null,
+        likes: statistics.likeCount != null ? String(statistics.likeCount) : null,
+        dislikes: statistics.dislikeCount != null ? String(statistics.dislikeCount) : null,
+      };
     }
     return out;
   } catch (err) {
-    console.error(`ViewCounts error:`, err.message);
+    console.error(`VideoStatistics error:`, err.message);
     return null;
   } finally {
     clearTimeout(timer);
@@ -617,6 +630,28 @@ async function resolveChannelViaAPI(apiKey, channelId) {
     name: ch.snippet?.title || null,
     avatar: thumbs.high?.url || thumbs.medium?.url || thumbs.default?.url || null,
   };
+}
+
+async function ensureChannelAvatar(env, channelId, meta, logScope) {
+  if (!env.YOUTUBE_API_KEY || meta?.avatarUrl) return meta;
+
+  try {
+    const resolved = await resolveChannelViaAPI(env.YOUTUBE_API_KEY, channelId);
+    if (!resolved) return meta;
+
+    const repaired = {
+      ...(meta || {}),
+      name: resolved.name || meta?.name || channelId,
+      avatarUrl: resolved.avatar || meta?.avatarUrl || null,
+      lastVideoId: meta?.lastVideoId || null,
+      addedAt: meta?.addedAt || Date.now(),
+    };
+    await putKVIfChanged(env.TUBEPULSE_KV, key.channelMeta(channelId), repaired, meta);
+    return repaired;
+  } catch (e) {
+    console.warn(`[${logScope}] Avatar fetch failed for ${channelId}:`, e.message);
+    return meta;
+  }
 }
 
 async function resolveHandleViaAPI(apiKey, handle) {
@@ -945,15 +980,21 @@ async function handleSubscribeChannel(request, env, ctx) {
 
   // Read device channels, enforce cap
   const channels = await getKV(env.TUBEPULSE_KV, key.deviceChannels(deviceId)) || [];
-  if (channels.length >= MAX_CHANNELS) {
+  const alreadySubscribed = channels.includes(channelId);
+  if (!alreadySubscribed && channels.length >= MAX_CHANNELS) {
     return errorResponse(`Channel limit reached (${MAX_CHANNELS})`, 400);
   }
 
-  const alreadySubscribed = channels.includes(channelId);
+  // Repair shared channel metadata before either the idempotent or new
+  // subscription response. Older failed bootstraps can leave a valid meta
+  // record with avatarUrl:null; checking only for a missing record made that
+  // partial state permanent.
+  let meta = await getKV(env.TUBEPULSE_KV, key.channelMeta(channelId));
+  let recent = await getKV(env.TUBEPULSE_KV, key.channelRecent(channelId));
+  meta = await ensureChannelAvatar(env, channelId, meta, 'API');
+
   if (alreadySubscribed) {
     // Return channel info even if already subscribed
-    const meta = await getKV(env.TUBEPULSE_KV, key.channelMeta(channelId));
-    const recent = await getKV(env.TUBEPULSE_KV, key.channelRecent(channelId));
     return json({ ok: true, alreadySubscribed: true, channel: { channelId, meta, recent } });
   }
 
@@ -969,36 +1010,9 @@ async function handleSubscribeChannel(request, env, ctx) {
   const callbackUrl = `${new URL(request.url).origin}/websub`;
   const isFirstSubscriber = subs.length === 1;
 
-  // Bootstrap channel data SYNCHRONOUSLY so /feed works immediately
-  let meta = await getKV(env.TUBEPULSE_KV, key.channelMeta(channelId));
-  let recent = await getKV(env.TUBEPULSE_KV, key.channelRecent(channelId));
-
+  // Bootstrap channel data SYNCHRONOUSLY so /feed works immediately.
   if (!meta || !recent) {
-    // Step 1: Fetch avatar + channel name via YouTube Data API — 1 quota unit,
-    // ONLY on first subscribe, ONLY if meta is missing. Once avatar is
-    // cached, this branch never runs again. The YouTube Data API is also
-    // called by resolveChannelViaAPI for handle→channelId lookup (1 unit),
-    // which happens in the client-side resolve() before subscribe. Total:
-    // 2 quota units per brand-new channel. After that, the cron takes over
-    // via RSS (0 quota units).
-    if (env.YOUTUBE_API_KEY && !meta) {
-      try {
-        const resolved = await resolveChannelViaAPI(env.YOUTUBE_API_KEY, channelId);
-        if (resolved) {
-          meta = {
-            name: resolved.name || channelId,
-            avatarUrl: resolved.avatar || null,
-            lastVideoId: null,
-            addedAt: Date.now(),
-          };
-          await putKV(env.TUBEPULSE_KV, key.channelMeta(channelId), meta);
-        }
-      } catch (e) {
-        console.warn(`[API] Avatar fetch failed for ${channelId}:`, e.message);
-      }
-    }
-
-    // Step 2: Fetch recent videos via RSS — primary path, 0 quota cost.
+    // Fetch recent videos via RSS — primary path, 0 quota cost.
     // RSS provides videoId, title, publishedAt, thumbnail, link, and
     // views + likes + dislikes (from media:statistics / starRating).
     // Cron takes over from here.
@@ -1006,6 +1020,7 @@ async function handleSubscribeChannel(request, env, ctx) {
       try {
         const rssResult = await fetchYouTubeRSS(channelId);
         if (rssResult?.videos?.length > 0) {
+          const checkedHour = Math.floor(Date.now() / 3600000);
           recent = rssResult.videos.slice(0, 15).map((v) => ({
             videoId: v.videoId,
             title: v.title,
@@ -1013,9 +1028,11 @@ async function handleSubscribeChannel(request, env, ctx) {
             thumbnail: v.thumbnail,
             type: classifyVideo(v),
             link: v.link,
-            views: v.views || '0',
-            likes: v.likes || '0',
-            dislikes: v.dislikes || '0',
+            views: v.views ?? null,
+            likes: v.likes ?? null,
+            dislikes: v.dislikes ?? null,
+            viewsLastCheckedHour: checkedHour,
+            likesLastCheckedHour: checkedHour,
           }));
 
           if (!meta) {
@@ -1037,16 +1054,24 @@ async function handleSubscribeChannel(request, env, ctx) {
       }
     }
 
-    // Step 3: Data API fallback (only if RSS is unreachable)
+    // Data API fallback (only if RSS is unreachable)
     if (!recent && env.YOUTUBE_API_KEY) {
       try {
         const apiVideos = await fetchRecentVideosViaAPI(env.YOUTUBE_API_KEY, channelId);
         if (apiVideos && apiVideos.length > 0) {
-          const viewCounts = await fetchViewCounts(env.YOUTUBE_API_KEY, apiVideos.map((v) => v.videoId)) || {};
-          recent = apiVideos.map((v) => ({
-            ...v,
-            views: viewCounts[v.videoId] || '0',
-          }));
+          const statistics = await fetchVideoStatistics(env.YOUTUBE_API_KEY, apiVideos.map((v) => v.videoId)) || {};
+          const checkedHour = Math.floor(Date.now() / 3600000);
+          recent = apiVideos.map((v) => {
+            const metrics = statistics[v.videoId] || {};
+            return {
+              ...v,
+              views: metrics.views ?? null,
+              likes: metrics.likes ?? null,
+              dislikes: metrics.dislikes ?? null,
+              viewsLastCheckedHour: checkedHour,
+              likesLastCheckedHour: checkedHour,
+            };
+          });
           if (meta) meta.lastVideoId = apiVideos[0].videoId;
           await putKV(env.TUBEPULSE_KV, key.channelMeta(channelId), meta || {
             name: channelId,
@@ -1071,8 +1096,9 @@ async function handleSubscribeChannel(request, env, ctx) {
         await putKV(env.TUBEPULSE_KV, key.channelsActive(), active);
       }
 
-      const subState = await getKV(env.TUBEPULSE_KV, key.channelWebsub(channelId));
-      if (!subState) {
+      const webSubDisabled = String(env.TUBEPULSE_DISABLE_WEBSUB || '').toLowerCase() === 'true';
+      const subState = webSubDisabled ? null : await getKV(env.TUBEPULSE_KV, key.channelWebsub(channelId));
+      if (!webSubDisabled && !subState) {
         const secret = crypto.randomUUID();
         const success = await subscribeToChannel(channelId, callbackUrl, secret);
         if (success) {
@@ -1121,7 +1147,9 @@ async function handleUnsubscribe(request, env, ctx) {
   if (isLastSubscriber) {
     const callbackUrl = `${new URL(request.url).origin}/websub`;
     ctx.waitUntil((async () => {
-      await unsubscribeFromChannel(channelId, callbackUrl);
+      if (String(env.TUBEPULSE_DISABLE_WEBSUB || '').toLowerCase() !== 'true') {
+        await unsubscribeFromChannel(channelId, callbackUrl);
+      }
       // cleanupDeadChannel deletes meta/recent/websub and removes from
       // channels:active. Don't delete the device profile — the user
       // may re-subscribe later and we want to preserve their settings.
@@ -1339,36 +1367,23 @@ async function handleBootstrap(request, env, ctx) {
 
   const callbackUrl = `${new URL(request.url).origin}/websub`;
 
-  // Fetch avatar if missing
+  // Fetch or repair avatar metadata. A prior transient failure may have
+  // persisted a usable meta record whose avatarUrl is null.
   let meta = await getKV(env.TUBEPULSE_KV, key.channelMeta(channelId));
-
-  if (!meta && env.YOUTUBE_API_KEY) {
-    try {
-      const resolved = await resolveChannelViaAPI(env.YOUTUBE_API_KEY, channelId);
-      if (resolved) {
-        meta = {
-          name: resolved.name || channelId,
-          avatarUrl: resolved.avatar || null,
-          lastVideoId: null,
-          addedAt: Date.now(),
-        };
-        await putKV(env.TUBEPULSE_KV, key.channelMeta(channelId), meta);
-      }
-    } catch (e) {
-      console.warn(`[Bootstrap] Avatar fetch failed for ${channelId}:`, e.message);
-    }
-  }
+  meta = await ensureChannelAvatar(env, channelId, meta, 'Bootstrap');
 
   // Fetch recent videos — RSS first (zero quota cost), Data API as fallback
   // for the rare case where RSS is unreachable. RSS provides videoId, title,
   // publishedAt, thumbnail, link, and view counts (from media:statistics).
-  // The avatar is fetched separately and only on subscribe (one-time, 1 unit).
+  // The avatar is fetched separately when cached metadata is incomplete
+  // (normally a one-time, 1-unit repair).
   let recent = await getKV(env.TUBEPULSE_KV, key.channelRecent(channelId));
   if (!recent) {
     // Try RSS first — primary path since v3.0.18
     try {
       const rssResult = await fetchYouTubeRSS(channelId);
       if (rssResult?.videos?.length > 0) {
+        const checkedHour = Math.floor(Date.now() / 3600000);
         recent = rssResult.videos.slice(0, 15).map((v) => ({
           videoId: v.videoId,
           title: v.title,
@@ -1376,7 +1391,11 @@ async function handleBootstrap(request, env, ctx) {
           thumbnail: v.thumbnail,
           type: classifyVideo(v),
           link: v.link,
-          views: v.views || '0',
+          views: v.views ?? null,
+          likes: v.likes ?? null,
+          dislikes: v.dislikes ?? null,
+          viewsLastCheckedHour: checkedHour,
+          likesLastCheckedHour: checkedHour,
         }));
 
         if (!meta) {
@@ -1402,12 +1421,20 @@ async function handleBootstrap(request, env, ctx) {
       try {
         const apiVideos = await fetchRecentVideosViaAPI(env.YOUTUBE_API_KEY, channelId);
         if (apiVideos && apiVideos.length > 0) {
-          // Enrich with view counts in a single batched call (1 quota unit).
-          const viewCounts = await fetchViewCounts(env.YOUTUBE_API_KEY, apiVideos.map((v) => v.videoId)) || {};
-          recent = apiVideos.map((v) => ({
-            ...v,
-            views: viewCounts[v.videoId] || '0',
-          }));
+          // Enrich public statistics in a single batched call (1 quota unit).
+          const statistics = await fetchVideoStatistics(env.YOUTUBE_API_KEY, apiVideos.map((v) => v.videoId)) || {};
+          const checkedHour = Math.floor(Date.now() / 3600000);
+          recent = apiVideos.map((v) => {
+            const metrics = statistics[v.videoId] || {};
+            return {
+              ...v,
+              views: metrics.views ?? null,
+              likes: metrics.likes ?? null,
+              dislikes: metrics.dislikes ?? null,
+              viewsLastCheckedHour: checkedHour,
+              likesLastCheckedHour: checkedHour,
+            };
+          });
           if (meta) meta.lastVideoId = apiVideos[0].videoId;
           await putKV(env.TUBEPULSE_KV, key.channelMeta(channelId), meta || {
             name: channelId,
@@ -1425,8 +1452,9 @@ async function handleBootstrap(request, env, ctx) {
 
   // Subscribe to WebSub (async)
   ctx.waitUntil((async () => {
-    const subState = await getKV(env.TUBEPULSE_KV, key.channelWebsub(channelId));
-    if (!subState) {
+    const webSubDisabled = String(env.TUBEPULSE_DISABLE_WEBSUB || '').toLowerCase() === 'true';
+    const subState = webSubDisabled ? null : await getKV(env.TUBEPULSE_KV, key.channelWebsub(channelId));
+    if (!webSubDisabled && !subState) {
       const secret = crypto.randomUUID();
       const success = await subscribeToChannel(channelId, callbackUrl, secret);
       if (success) {
@@ -1513,6 +1541,14 @@ async function handleWebSubVerification(request, env) {
 
   if (!channelId) return new Response('Invalid topic', { status: 400 });
 
+  // During unified-Home ownership, retain protocol compatibility with any
+  // already-issued hub verification request without renewing or mutating the
+  // canonical WebSub lease record. Push delivery is acknowledged and ignored
+  // by the authority wrapper; five-minute Home polling is authoritative.
+  if (String(env.TUBEPULSE_DISABLE_WEBSUB || '').toLowerCase() === 'true') {
+    return new Response(challenge, { status: 200, headers: { 'Content-Type': 'text/plain' } });
+  }
+
   // Verify we have a subscription for this channel
   const subState = await getKV(env.TUBEPULSE_KV, key.channelWebsub(channelId));
   if (!subState) {
@@ -1572,6 +1608,7 @@ async function handleWebSubPush(request, env, ctx) {
     const prevVideoIds = new Set(prevRecent.map((v) => v.videoId));
 
     const newEntries = [];
+    const checkedHour = Math.floor(Date.now() / 3600000);
     for (const entry of parsed.entries) {
       if (!prevVideoIds.has(entry.videoId)) {
         newEntries.push({
@@ -1581,13 +1618,13 @@ async function handleWebSubPush(request, env, ctx) {
           thumbnail: entry.thumbnail,
           type: classifyVideo(entry),
           link: entry.link,
-          // Views/likes/dislikes are populated by the cron worker on the
-          // next RSS poll (it parses the same media:community block from
-          // the channel's feed). Default to 0 so the structure is
-          // consistent from creation.
-          views: 0,
-          likes: 0,
-          dislikes: 0,
+          // Preserve metrics present in the push. Missing/hidden optional
+          // counts remain null until an RSS poll can expose them.
+          views: entry.views ?? null,
+          likes: entry.likes ?? null,
+          dislikes: entry.dislikes ?? null,
+          viewsLastCheckedHour: checkedHour,
+          likesLastCheckedHour: checkedHour,
         });
       }
     }
@@ -1793,7 +1830,7 @@ async function handleWebSubPush(request, env, ctx) {
 
 // ─── Main handler ───────────────────────────────────────────────────────
 
-export default {
+const appWorker = {
   async fetch(request, env, ctx) {
     if (request.method === 'OPTIONS') {
       return new Response(null, { headers: corsHeaders() });
@@ -1851,3 +1888,9 @@ export default {
     }
   },
 };
+
+// The authority wrapper is byte-for-behaviour transparent unless its explicit
+// production latch is enabled. Keep the legacy read gateway inside it so an
+// authority rollout can disable Home reads while retaining signed mutation
+// ingress and the canonical Cloudflare API contract.
+export default createAuthorityWorker(createGatewayWorker(appWorker));
