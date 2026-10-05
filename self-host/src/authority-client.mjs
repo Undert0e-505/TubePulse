@@ -29,6 +29,9 @@ const ROUTES = Object.freeze({
   activate: { method: 'POST', path: '/_tubepulse/authority/reconcile/activate', operation: 'authority-reconcile-activate' },
   reconcileRelease: { method: 'POST', path: '/_tubepulse/authority/reconcile/release', operation: 'authority-reconcile-release' },
   stale: { method: 'POST', path: '/_tubepulse/authority/stale', operation: 'authority-stale' },
+  migrationBegin: { method: 'POST', path: '/_tubepulse/authority/backend-migration/begin', operation: 'authority-backend-migration-begin' },
+  migrationChunk: { method: 'POST', path: '/_tubepulse/authority/backend-migration/chunk', operation: 'authority-backend-migration-chunk' },
+  migrationCommit: { method: 'POST', path: '/_tubepulse/authority/backend-migration/commit', operation: 'authority-backend-migration-commit' },
   rssProbe: { method: 'POST', path: '/_tubepulse/authority/rss-probe', operation: 'authority-rss-probe' },
 });
 
@@ -108,6 +111,9 @@ export class AuthorityClient {
     });
   }
   async releaseReconciliation(leaseId) { return await this.request('reconcileRelease', { leaseId }); }
+  async beginBackendMigration(payload) { return await this.request('migrationBegin', payload); }
+  async appendBackendMigration(payload) { return await this.request('migrationChunk', payload); }
+  async commitBackendMigration(payload) { return await this.request('migrationCommit', payload); }
 }
 
 export const authorityClientRoutes = ROUTES;

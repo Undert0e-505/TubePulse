@@ -1,3 +1,10 @@
+import {
+  canonicalBackendIdentity,
+  canonicalNamespace,
+  D1KvNamespace,
+  withCanonicalNamespace,
+} from './d1-kv.mjs';
+
 const AUTHORITY_VERSION = '1';
 const STATE_KEY = 'authority:state';
 const LEASE_KEY = 'authority:lease';
@@ -6,6 +13,8 @@ const BASELINE_PREFIX = 'authority:baseline:';
 const TX_DELTA_PREFIX = 'authority:transaction:delta:';
 const PENDING_PREFIX = 'authority:pending:';
 const QUOTA_KEY = 'authority:quota';
+const MIGRATION_KEY = 'authority:backend-migration';
+const LEGACY_MIGRATION_KEY = 'authority:legacy-backend-migration';
 const MAX_DELTA_COUNT = 1000;
 const MAX_DELTA_BODY_BYTES = 2 * 1024 * 1024;
 const MAX_SNAPSHOT_EXPORT_BYTES = 10 * 1024 * 1024;
@@ -196,7 +205,42 @@ export class TubePulseAuthorityCoordinator {
     };
   }
 
+  configuredBackend() {
+    return canonicalBackendIdentity(this.env);
+  }
+
+  canonical() {
+    return canonicalNamespace(this.env);
+  }
+
+  backendMatches(replication) {
+    const configured = this.configuredBackend();
+    const storedBackend = replication.backend || 'kv';
+    const storedGeneration = replication.backendGeneration || 'kv-legacy-v1';
+    return storedBackend === configured.backend && storedGeneration === configured.generation;
+  }
+
   quotaLimits() {
+    if (this.configuredBackend().backend === 'd1') {
+      const totalEstimatedRows = boundedInteger(
+        this.env.TUBEPULSE_AUTHORITY_D1_ROW_WRITE_HARD_CAP,
+        50_000,
+        1_000,
+        90_000,
+      );
+      const publicationEstimatedRows = boundedInteger(
+        this.env.TUBEPULSE_AUTHORITY_D1_PUBLICATION_ROW_CAP,
+        45_000,
+        0,
+        totalEstimatedRows,
+      );
+      return {
+        totalEstimatedRows,
+        publicationEstimatedRows,
+        appReserveEstimatedRows: totalEstimatedRows - publicationEstimatedRows,
+        estimatedRowsPerLogicalWrite: 3,
+      };
+    }
     const total = boundedInteger(this.env.TUBEPULSE_AUTHORITY_KV_WRITE_HARD_CAP, 950, 100, 999);
     const publication = boundedInteger(
       this.env.TUBEPULSE_AUTHORITY_KV_PUBLICATION_CAP,
@@ -209,8 +253,27 @@ export class TubePulseAuthorityCoordinator {
 
   async quotaState() {
     const day = new Date().toISOString().slice(0, 10);
+    const identity = this.configuredBackend();
     const stored = await this.state.storage.get(QUOTA_KEY);
-    if (stored?.day === day) return stored;
+    if (stored?.day === day
+      && (stored.backend || 'kv') === identity.backend
+      && (stored.backendGeneration || 'kv-legacy-v1') === identity.generation) return stored;
+    if (identity.backend === 'd1') {
+      const fresh = {
+        day,
+        backend: identity.backend,
+        backendGeneration: identity.generation,
+        logicalWrites: 0,
+        estimatedRowsWritten: 0,
+        publicationEstimatedRowsWritten: 0,
+        apiEstimatedRowsWritten: 0,
+        canonicalReads: 0,
+        canonicalLists: 0,
+        doRequests: 0,
+      };
+      await this.state.storage.put(QUOTA_KEY, fresh);
+      return fresh;
+    }
     const fresh = { day, kvWrites: 0, publicationWrites: 0, apiWrites: 0, kvReads: 0, kvLists: 0, doRequests: 0 };
     await this.state.storage.put(QUOTA_KEY, fresh);
     return fresh;
@@ -229,6 +292,22 @@ export class TubePulseAuthorityCoordinator {
     const quota = await this.quotaState();
     const limits = this.quotaLimits();
     const writes = Math.max(0, Number(count || 0));
+    if (this.configuredBackend().backend === 'd1') {
+      const estimatedRows = writes * limits.estimatedRowsPerLogicalWrite;
+      if (kind === 'publication'
+        && quota.publicationEstimatedRowsWritten + estimatedRows > limits.publicationEstimatedRows) {
+        return { ok: false, quota, limits, reason: 'publication-cap' };
+      }
+      if (quota.estimatedRowsWritten + estimatedRows > limits.totalEstimatedRows) {
+        return { ok: false, quota, limits, reason: 'hard-cap' };
+      }
+      quota.logicalWrites += writes;
+      quota.estimatedRowsWritten += estimatedRows;
+      if (kind === 'publication') quota.publicationEstimatedRowsWritten += estimatedRows;
+      else quota.apiEstimatedRowsWritten += estimatedRows;
+      await this.state.storage.put(QUOTA_KEY, quota);
+      return { ok: true, quota, limits, estimatedRows };
+    }
     if (kind === 'publication' && quota.publicationWrites + writes > limits.publication) {
       return { ok: false, quota, limits, reason: 'publication-cap' };
     }
@@ -240,6 +319,46 @@ export class TubePulseAuthorityCoordinator {
     else quota.apiWrites += writes;
     await this.state.storage.put(QUOTA_KEY, quota);
     return { ok: true, quota, limits };
+  }
+
+  writeBudgetDecision(quota, kind, count) {
+    const limits = this.quotaLimits();
+    if (this.configuredBackend().backend === 'd1') {
+      const estimatedRows = Math.max(0, Number(count || 0)) * limits.estimatedRowsPerLogicalWrite;
+      const overPublication = kind === 'publication'
+        && quota.publicationEstimatedRowsWritten + estimatedRows > limits.publicationEstimatedRows;
+      const overTotal = quota.estimatedRowsWritten + estimatedRows > limits.totalEstimatedRows;
+      return { limits, estimatedRows, overPublication, overTotal };
+    }
+    return {
+      limits,
+      estimatedRows: Math.max(0, Number(count || 0)),
+      overPublication: kind === 'publication'
+        && quota.publicationWrites + count > limits.publication,
+      overTotal: quota.kvWrites + count > limits.total,
+    };
+  }
+
+  quotaPublicSummary(quota) {
+    if (this.configuredBackend().backend === 'd1') {
+      return {
+        day: quota.day,
+        backend: quota.backend,
+        backendGeneration: quota.backendGeneration,
+        logicalWrites: quota.logicalWrites,
+        estimatedRowsWritten: quota.estimatedRowsWritten,
+        publicationEstimatedRowsWritten: quota.publicationEstimatedRowsWritten,
+        apiEstimatedRowsWritten: quota.apiEstimatedRowsWritten,
+        limits: this.quotaLimits(),
+      };
+    }
+    return {
+      day: quota.day,
+      kvWrites: quota.kvWrites,
+      publicationWrites: quota.publicationWrites,
+      apiWrites: quota.apiWrites,
+      limits: this.quotaLimits(),
+    };
   }
 
   async setReplicationState(status, reason, extra = {}) {
@@ -285,6 +404,10 @@ export class TubePulseAuthorityCoordinator {
       // run against the store while its snapshot is being replaced.
       await this.state.storage.delete(LEASE_KEY);
       await this.setReplicationState('stale', 'reconciliation-overlapped');
+    }
+    const replicationBeforeRecovery = await this.replicationState();
+    if (!this.backendMatches(replicationBeforeRecovery)) {
+      return json({ error: 'Canonical backend generation is not active', state: 'stale' }, 409);
     }
     // A previous publication may have committed only a prefix of its batch.
     // Finish that exact journal before admitting another writer. A failed
@@ -356,8 +479,9 @@ export class TubePulseAuthorityCoordinator {
   }
 
   async applyDelta(delta) {
-    if (delta.operation === 'delete') await this.env.TUBEPULSE_KV.delete(delta.key);
-    else await this.env.TUBEPULSE_KV.put(delta.key, delta.value, delta.options || {});
+    const canonical = this.canonical();
+    if (delta.operation === 'delete') await canonical.delete(delta.key);
+    else await canonical.put(delta.key, delta.value, delta.options || {});
     await this.storeBaseline(delta.key, delta.nextHash);
   }
 
@@ -421,6 +545,8 @@ export class TubePulseAuthorityCoordinator {
       quotaReserved: true,
       quotaDay: reserved.quota.day,
       pendingStorageKeys: selected.map(({ storageKey }) => storageKey),
+      backend: this.configuredBackend().backend,
+      backendGeneration: this.configuredBackend().generation,
     };
     await this.state.storage.put(TX_KEY, transaction);
     for (let index = 0; index < selected.length; index++) {
@@ -436,6 +562,11 @@ export class TubePulseAuthorityCoordinator {
   }
 
   async applyStoredTransaction(transaction) {
+    const identity = this.configuredBackend();
+    if ((transaction.backend || 'kv') !== identity.backend
+      || (transaction.backendGeneration || 'kv-legacy-v1') !== identity.generation) {
+      throw new Error('transaction-backend-generation-mismatch');
+    }
     if (!transaction.quotaReserved) {
       const reserved = await this.reserveWrites(transaction.kind, transaction.count);
       if (!reserved.ok) throw new Error(`quota-${reserved.reason}`);
@@ -443,7 +574,20 @@ export class TubePulseAuthorityCoordinator {
       transaction.quotaDay = reserved.quota.day;
       await this.state.storage.put(TX_KEY, transaction);
     }
-    for (let index = transaction.nextIndex || 0; index < transaction.count; index++) {
+    if (identity.backend === 'd1') {
+      const deltas = [];
+      for (let index = 0; index < transaction.count; index++) {
+        const delta = await this.state.storage.get(deltaStorageKey(index));
+        if (!delta) throw new Error('transaction-delta-missing');
+        deltas.push(delta);
+      }
+      await this.canonical().applyConditionalBatch(deltas);
+      for (const delta of deltas) await this.storeBaseline(delta.key, delta.nextHash);
+      transaction.nextIndex = transaction.count;
+      await this.state.storage.put(TX_KEY, transaction);
+    }
+    for (let index = identity.backend === 'd1' ? transaction.count : (transaction.nextIndex || 0);
+      index < transaction.count; index++) {
       const delta = await this.state.storage.get(deltaStorageKey(index));
       if (!delta) throw new Error('transaction-delta-missing');
       await this.applyDelta(delta);
@@ -485,7 +629,11 @@ export class TubePulseAuthorityCoordinator {
     }
     if (await this.state.storage.get(TX_KEY)) return json({ error: 'Authority recovery is pending' }, 409);
     const observedReads = Math.max(0, Math.min(10_000, Number(payload.observedKvReads || 0)));
-    if (Number.isFinite(observedReads) && observedReads > 0) await this.updateQuota({ kvReads: observedReads });
+    if (Number.isFinite(observedReads) && observedReads > 0) {
+      await this.updateQuota(this.configuredBackend().backend === 'd1'
+        ? { canonicalReads: observedReads }
+        : { kvReads: observedReads });
+    }
 
     let appliedDeltas = deltas;
     let pendingStorageKeys = [];
@@ -540,9 +688,7 @@ export class TubePulseAuthorityCoordinator {
       }
 
       const quota = await this.quotaState();
-      const limits = this.quotaLimits();
-      const overPublication = quota.publicationWrites + appliedDeltas.length > limits.publication;
-      const overTotal = quota.kvWrites + appliedDeltas.length > limits.total;
+      const { overPublication, overTotal } = this.writeBudgetDecision(quota, 'publication', appliedDeltas.length);
       if (overPublication || overTotal) {
         const retained = new Set([...pending.values()].map(({ storageKey }) => storageKey));
         const removed = before.map(({ storageKey }) => storageKey).filter((key) => !retained.has(key));
@@ -554,13 +700,7 @@ export class TubePulseAuthorityCoordinator {
           deferred: true,
           reason: overPublication ? 'publication-cap' : 'hard-cap',
           queued: appliedDeltas.length,
-          quota: {
-            day: quota.day,
-            kvWrites: quota.kvWrites,
-            publicationWrites: quota.publicationWrites,
-            apiWrites: quota.apiWrites,
-            limits,
-          },
+          quota: this.quotaPublicSummary(quota),
         });
       }
       pendingStorageKeys = [...new Set([
@@ -576,10 +716,9 @@ export class TubePulseAuthorityCoordinator {
         }
       }
       const quota = await this.quotaState();
-      const limits = this.quotaLimits();
-      if (quota.kvWrites + deltas.length > limits.total) {
+      if (this.writeBudgetDecision(quota, 'api', deltas.length).overTotal) {
         await this.state.storage.delete(LEASE_KEY);
-        return json({ error: 'Cloudflare KV app-write reserve exhausted', reason: 'hard-cap' }, 429);
+        return json({ error: 'Canonical app-write reserve exhausted', reason: 'hard-cap' }, 429);
       }
     }
 
@@ -592,6 +731,8 @@ export class TubePulseAuthorityCoordinator {
       retainLease: lease.kind === 'publication' && payload.retainLease === true,
       quotaReserved: false,
       pendingStorageKeys,
+      backend: this.configuredBackend().backend,
+      backendGeneration: this.configuredBackend().generation,
     };
     await this.state.storage.put(TX_KEY, transaction);
     for (let index = 0; index < appliedDeltas.length; index++) {
@@ -630,29 +771,52 @@ export class TubePulseAuthorityCoordinator {
     };
     await this.state.storage.put(LEASE_KEY, lease);
     try {
+      const replication = await this.replicationState();
+      if (!this.backendMatches(replication)) throw new Error('canonical-backend-generation-mismatch');
+      const canonical = this.canonical();
       const old = await this.state.storage.list({ prefix: BASELINE_PREFIX });
       if (old.size) await this.state.storage.delete([...old.keys()]);
-      const keys = [];
-      let cursor;
-      do {
-        const page = await this.env.TUBEPULSE_KV.list({ limit: 1000, ...(cursor ? { cursor } : {}) });
-        keys.push(...page.keys
-          .filter(({ name }) => isAuthorityCanonicalKey(name))
-          .map(({ name, expiration }) => ({ key: name, expiration })));
-        cursor = page.list_complete ? undefined : page.cursor;
-      } while (cursor);
-      keys.sort((left, right) => left.key.localeCompare(right.key));
-      const fetched = await mapLimit(keys, 16, async ({ key, expiration }) => {
-        const value = await this.env.TUBEPULSE_KV.get(key, 'text');
-        return value === null ? null : {
+      let records;
+      let canonicalReadCount;
+      let canonicalListCount;
+      if (typeof canonical.snapshotRecords === 'function') {
+        const snapshotRecords = (await canonical.snapshotRecords())
+          .filter(({ key }) => isAuthorityCanonicalKey(key));
+        records = await Promise.all(snapshotRecords.map(async ({ key, value, expiration }) => ({
           key,
           value,
           hash: await authoritySha256(value),
           ...(Number.isFinite(expiration) ? { expiration } : {}),
-        };
-      });
-      const records = fetched.filter(Boolean);
-      await this.updateQuota({ kvReads: keys.length, kvLists: Math.max(1, Math.ceil(keys.length / 1000)) });
+        })));
+        canonicalReadCount = records.length;
+        canonicalListCount = 1;
+      } else {
+        const keys = [];
+        let cursor;
+        do {
+          const page = await canonical.list({ limit: 1000, ...(cursor ? { cursor } : {}) });
+          keys.push(...page.keys
+            .filter(({ name }) => isAuthorityCanonicalKey(name))
+            .map(({ name, expiration }) => ({ key: name, expiration })));
+          cursor = page.list_complete ? undefined : page.cursor;
+        } while (cursor);
+        keys.sort((left, right) => left.key.localeCompare(right.key));
+        const fetched = await mapLimit(keys, 16, async ({ key, expiration }) => {
+          const value = await canonical.get(key, 'text');
+          return value === null ? null : {
+            key,
+            value,
+            hash: await authoritySha256(value),
+            ...(Number.isFinite(expiration) ? { expiration } : {}),
+          };
+        });
+        records = fetched.filter(Boolean);
+        canonicalReadCount = keys.length;
+        canonicalListCount = Math.max(1, Math.ceil(keys.length / 1000));
+      }
+      await this.updateQuota(this.configuredBackend().backend === 'd1'
+        ? { canonicalReads: canonicalReadCount, canonicalLists: canonicalListCount }
+        : { kvReads: canonicalReadCount, kvLists: canonicalListCount });
       const exportBytes = records.reduce(
         (total, record) => total + bytes(record.key).byteLength + bytes(record.value).byteLength + 128,
         0,
@@ -704,6 +868,9 @@ export class TubePulseAuthorityCoordinator {
       return json({ error: 'Invalid reconciliation lease' }, 409);
     }
     const current = await this.replicationState();
+    if (!this.backendMatches(current)) {
+      return json({ error: 'Canonical backend generation does not match reconciliation' }, 409);
+    }
     if (current.seeded !== true
       || current.manifestHash !== String(payload.manifestHash || '')
       || current.recordCount !== Number(payload.recordCount)) {
@@ -714,12 +881,154 @@ export class TubePulseAuthorityCoordinator {
     return json({ ok: true, state: next.status, generation: next.generation });
   }
 
+  async beginBackendMigration(payload) {
+    const identity = this.configuredBackend();
+    if (identity.backend !== 'd1') return json({ error: 'D1 backend is not configured' }, 409);
+    if (await this.currentLease() || await this.state.storage.get(TX_KEY)) {
+      return json({ error: 'Authority lease busy' }, 409);
+    }
+    const leaseId = String(payload.leaseId || '');
+    const manifestHash = String(payload.manifestHash || '');
+    const recordCount = Number(payload.recordCount);
+    if (!/^[a-zA-Z0-9_-]{16,128}$/.test(leaseId)
+      || !/^[a-f0-9]{64}$/.test(manifestHash)
+      || !Number.isSafeInteger(recordCount) || recordCount < 0 || recordCount > 10_000) {
+      return json({ error: 'Invalid backend migration request' }, 400);
+    }
+    const legacyPending = await this.state.storage.list({ prefix: PENDING_PREFIX });
+    const d1 = new D1KvNamespace(this.env.TUBEPULSE_D1, identity.generation);
+    if (await d1.active()) return json({ error: 'D1 backend generation is already active' }, 409);
+    const previousStaged = await d1.stagedManifest();
+    const lease = {
+      leaseId, kind: 'reconcile', acquiredAt: Date.now(),
+      expiresAt: Date.now() + RECONCILIATION_LEASE_TTL_MS,
+    };
+    await this.state.storage.put(LEASE_KEY, lease);
+    const migration = {
+      leaseId,
+      backend: identity.backend,
+      backendGeneration: identity.generation,
+      manifestHash,
+      recordCount,
+      receivedCount: 0,
+      legacyPendingCount: legacyPending.size,
+      clearedStagedRows: previousStaged.recordCount,
+      startedAt: new Date().toISOString(),
+    };
+    await this.state.storage.put(MIGRATION_KEY, migration);
+    await d1.clearStagedGeneration();
+    await this.setReplicationState('stale', 'backend-migration-in-progress', {
+      desiredBackend: identity.backend,
+      desiredBackendGeneration: identity.generation,
+    });
+    return json({ ok: true, leaseId, receivedCount: 0, recordCount });
+  }
+
+  async appendBackendMigration(payload) {
+    const migration = await this.state.storage.get(MIGRATION_KEY);
+    const lease = await this.currentLease();
+    const records = Array.isArray(payload.records) ? payload.records : null;
+    if (!migration || !lease || lease.leaseId !== migration.leaseId
+      || lease.leaseId !== String(payload.leaseId || '')) {
+      return json({ error: 'Invalid backend migration lease' }, 409);
+    }
+    if (!records || records.length < 1 || records.length > 40
+      || Number(payload.offset) !== migration.receivedCount
+      || migration.receivedCount + records.length > migration.recordCount) {
+      return json({ error: 'Invalid backend migration chunk' }, 400);
+    }
+    const identity = this.configuredBackend();
+    if (migration.backend !== identity.backend || migration.backendGeneration !== identity.generation) {
+      return json({ error: 'Backend migration generation changed' }, 409);
+    }
+    await new D1KvNamespace(this.env.TUBEPULSE_D1, identity.generation).stageRecords(records);
+    migration.receivedCount += records.length;
+    await this.state.storage.put(MIGRATION_KEY, migration);
+    lease.expiresAt = Date.now() + RECONCILIATION_LEASE_TTL_MS;
+    await this.state.storage.put(LEASE_KEY, lease);
+    return json({ ok: true, receivedCount: migration.receivedCount, recordCount: migration.recordCount });
+  }
+
+  async commitBackendMigration(payload) {
+    const migration = await this.state.storage.get(MIGRATION_KEY);
+    const lease = await this.currentLease();
+    if (!migration || !lease || lease.leaseId !== migration.leaseId
+      || lease.leaseId !== String(payload.leaseId || '')
+      || migration.receivedCount !== migration.recordCount) {
+      return json({ error: 'Backend migration is incomplete' }, 409);
+    }
+    const identity = this.configuredBackend();
+    if (migration.backend !== identity.backend || migration.backendGeneration !== identity.generation) {
+      return json({ error: 'Backend migration generation changed' }, 409);
+    }
+    const d1 = new D1KvNamespace(this.env.TUBEPULSE_D1, identity.generation);
+    const staged = await d1.stagedManifest();
+    if (staged.recordCount !== migration.recordCount || staged.manifestHash !== migration.manifestHash) {
+      return json({ error: 'D1 manifest does not match Home snapshot' }, 409);
+    }
+    await d1.activate(staged);
+    const oldBaseline = await this.state.storage.list({ prefix: BASELINE_PREFIX });
+    if (oldBaseline.size) await this.state.storage.delete([...oldBaseline.keys()]);
+    for (const record of staged.records) await this.storeBaseline(record.key, record.hash);
+    const pending = await this.state.storage.list({ prefix: PENDING_PREFIX });
+    if (pending.size) await this.state.storage.delete([...pending.keys()]);
+    await this.state.storage.put(LEGACY_MIGRATION_KEY, {
+      sourceBackend: 'kv',
+      targetBackend: identity.backend,
+      targetBackendGeneration: identity.generation,
+      verifiedManifestHash: staged.manifestHash,
+      verifiedRecordCount: staged.recordCount,
+      archivedPendingCount: migration.legacyPendingCount,
+      completedAt: new Date().toISOString(),
+    });
+    const migrationEstimatedRowsWritten = Number(migration.clearedStagedRows || 0)
+      + staged.recordCount + 1;
+    await this.state.storage.put(QUOTA_KEY, {
+      day: new Date().toISOString().slice(0, 10),
+      backend: identity.backend,
+      backendGeneration: identity.generation,
+      logicalWrites: staged.recordCount,
+      estimatedRowsWritten: migrationEstimatedRowsWritten,
+      publicationEstimatedRowsWritten: 0,
+      apiEstimatedRowsWritten: 0,
+      migrationEstimatedRowsWritten,
+      canonicalReads: 0,
+      canonicalLists: 0,
+      doRequests: 0,
+    });
+    const current = await this.replicationState();
+    await this.state.storage.put(STATE_KEY, {
+      ...current,
+      status: 'current',
+      reason: 'backend-migrated',
+      changedAt: new Date().toISOString(),
+      generation: Number(current.generation || 0) + 1,
+      backend: identity.backend,
+      backendGeneration: identity.generation,
+      desiredBackend: undefined,
+      desiredBackendGeneration: undefined,
+      seeded: true,
+      manifestHash: staged.manifestHash,
+      recordCount: staged.recordCount,
+      canonicalVersion: Number(current.canonicalVersion || 0) + 1,
+    });
+    await this.state.storage.delete(MIGRATION_KEY);
+    await this.state.storage.delete(LEASE_KEY);
+    return json({ ok: true, backend: identity.backend, backendGeneration: identity.generation,
+      manifestHash: staged.manifestHash, recordCount: staged.recordCount });
+  }
+
   async status() {
     const replication = await this.replicationState();
     const lease = await this.currentLease();
     const transaction = await this.state.storage.get(TX_KEY);
     const quota = await this.quotaState();
     const pending = await this.state.storage.list({ prefix: PENDING_PREFIX });
+    const identity = this.configuredBackend();
+    let backendReady = this.backendMatches(replication);
+    if (backendReady && identity.backend === 'd1') {
+      try { backendReady = await this.canonical().active(); } catch { backendReady = false; }
+    }
     const reset = new Date(`${quota.day}T00:00:00.000Z`);
     reset.setUTCDate(reset.getUTCDate() + 1);
     return json({
@@ -736,6 +1045,12 @@ export class TubePulseAuthorityCoordinator {
       lease: lease ? { kind: lease.kind, expiresAt: lease.expiresAt } : null,
       transaction: transaction ? { kind: transaction.kind, nextIndex: transaction.nextIndex, count: transaction.count } : null,
       pendingBackupKeys: pending.size,
+      backend: {
+        selected: identity.backend,
+        generation: identity.generation,
+        ready: backendReady,
+        legacyKvFrozen: identity.backend === 'd1',
+      },
       quota: { ...quota, limits: this.quotaLimits(), resetsAt: reset.toISOString() },
     });
   }
@@ -753,6 +1068,9 @@ export class TubePulseAuthorityCoordinator {
       if (url.pathname === '/commit') return await this.commit(payload);
       if (url.pathname === '/snapshot') return await this.snapshot(payload);
       if (url.pathname === '/activate') return await this.activate(payload);
+      if (url.pathname === '/backend-migration/begin') return await this.beginBackendMigration(payload);
+      if (url.pathname === '/backend-migration/chunk') return await this.appendBackendMigration(payload);
+      if (url.pathname === '/backend-migration/commit') return await this.commitBackendMigration(payload);
       if (url.pathname === '/recover') {
         const result = await this.recoverTransaction();
         return json({ ok: true, result });
@@ -792,6 +1110,9 @@ const INTERNAL_AUTHORITY_ROUTES = new Map([
   ['POST /_tubepulse/authority/reconcile/activate', { operation: 'authority-reconcile-activate', coordinatorPath: '/activate' }],
   ['POST /_tubepulse/authority/reconcile/release', { operation: 'authority-reconcile-release', coordinatorPath: '/release' }],
   ['POST /_tubepulse/authority/stale', { operation: 'authority-stale', coordinatorPath: '/stale' }],
+  ['POST /_tubepulse/authority/backend-migration/begin', { operation: 'authority-backend-migration-begin', coordinatorPath: '/backend-migration/begin' }],
+  ['POST /_tubepulse/authority/backend-migration/chunk', { operation: 'authority-backend-migration-chunk', coordinatorPath: '/backend-migration/chunk' }],
+  ['POST /_tubepulse/authority/backend-migration/commit', { operation: 'authority-backend-migration-commit', coordinatorPath: '/backend-migration/commit' }],
   ['POST /_tubepulse/authority/rss-probe', { operation: 'authority-rss-probe', handler: 'rss-probe' }],
 ]);
 
@@ -1121,6 +1442,9 @@ async function canonicalFeedWithVersionRetry(appWorker, request, env, ctx, timeo
     const before = !beforeResult.response.ok || beforeResult.payload?.transaction
       ? null
       : Number(beforeResult.payload?.replication?.canonicalVersion);
+    if (beforeResult.response.ok && beforeResult.payload?.backend?.ready !== true) {
+      return json({ error: 'Canonical fallback is temporarily unavailable' }, 503);
+    }
     if (!Number.isSafeInteger(before) || before < 0) {
       await new Promise((resolve) => setTimeout(resolve, 25));
       beforeResult = undefined;
@@ -1185,11 +1509,16 @@ export function createAuthorityWorker(appWorker, options = {}) {
         });
       }
 
+      let appEnv;
+      try { appEnv = withCanonicalNamespace(env); } catch {
+        return json({ error: 'Canonical backend configuration is invalid' }, 503);
+      }
+
       // Configuration and traffic activation are separate, so production can
       // deploy the DO/private ingress, seed Home, and prove exact parity while
       // every app request remains on the pre-authority path. Only the explicit
       // traffic latch changes application behaviour.
-      if (!config.trafficEnabled) return await appWorker.fetch(request, env, ctx);
+      if (!config.trafficEnabled) return await appWorker.fetch(request, appEnv, ctx);
 
       // Existing WebSub leases can continue to deliver briefly after the
       // local scheduler takes ownership. Acknowledge pushes without applying
@@ -1197,7 +1526,7 @@ export function createAuthorityWorker(appWorker, options = {}) {
       // are answered by the legacy handler with persistence disabled.
       if (route === 'POST /websub') return new Response('OK', { status: 200 });
       if (route === 'GET /websub') {
-        return await appWorker.fetch(request, { ...env, TUBEPULSE_DISABLE_WEBSUB: 'true' }, ctx);
+        return await appWorker.fetch(request, { ...appEnv, TUBEPULSE_DISABLE_WEBSUB: 'true' }, ctx);
       }
 
       if (route === 'GET /feed') {
@@ -1207,7 +1536,8 @@ export function createAuthorityWorker(appWorker, options = {}) {
         }
         const homeCurrent = status.response.ok
           && !status.payload?.transaction
-          && status.payload?.replication?.status === 'current';
+          && status.payload?.replication?.status === 'current'
+          && status.payload?.backend?.ready === true;
         if (homeCurrent) {
           try {
             const home = await homeAuthorityRequest(config, env, {
@@ -1224,13 +1554,13 @@ export function createAuthorityWorker(appWorker, options = {}) {
             }
           } catch { /* bounded canonical fallback below */ }
         }
-        return await canonicalFeedWithVersionRetry(appWorker, request, env, ctx, config.timeoutMs, status);
+        return await canonicalFeedWithVersionRetry(appWorker, request, appEnv, ctx, config.timeoutMs, status);
       }
 
-      if (!AUTHORITY_MUTATIONS.has(route)) return await appWorker.fetch(request, env, ctx);
+      if (!AUTHORITY_MUTATIONS.has(route)) return await appWorker.fetch(request, appEnv, ctx);
       const authorization = request.headers.get('Authorization') || '';
       if (!authorization.startsWith('Bearer ') || authorization.slice(7).trim() === '') {
-        return await appWorker.fetch(request, env, ctx);
+        return await appWorker.fetch(request, appEnv, ctx);
       }
       let bodyBuffer;
       try { bodyBuffer = await request.clone().arrayBuffer(); } catch { return json({ error: 'Invalid request body' }, 400); }

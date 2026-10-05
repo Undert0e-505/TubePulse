@@ -460,6 +460,38 @@ export async function authorityManifest(adapter, { exclude = () => false, concur
   };
 }
 
+export async function exportAuthoritySnapshot(adapter, { exclude = () => false, concurrency = 8 } = {}) {
+  const listed = (await adapter.listKeys()).filter(({ name }) => !exclude(name)).sort((a, b) => a.name.localeCompare(b.name));
+  const records = new Array(listed.length);
+  let next = 0;
+  let totalBytes = 0;
+  await Promise.all(Array.from({ length: Math.min(concurrency, listed.length) }, async () => {
+    while (next < listed.length) {
+      const index = next++;
+      const { name, expiration } = listed[index];
+      const value = await adapter.get(name);
+      if (value === null) continue;
+      const record = {
+        key: name,
+        value,
+        hash: contentHash(value),
+        ...(Number.isFinite(expiration) ? { expiration } : {}),
+      };
+      records[index] = record;
+      totalBytes += Buffer.byteLength(name) + Buffer.byteLength(value) + 128;
+      if (Buffer.byteLength(value) > 1_900_000) throw new Error('Canonical snapshot contains a D1-incompatible value');
+      if (totalBytes > 10 * 1024 * 1024) throw new Error('Canonical snapshot is too large');
+    }
+  }));
+  const present = records.filter(Boolean);
+  return {
+    records: present,
+    manifestHash: contentHash(present.map(({ key, hash }) => `${key}\0${hash}\n`).join('')),
+    recordCount: present.length,
+    totalBytes,
+  };
+}
+
 export async function installAuthoritySnapshot(adapter, snapshot) {
   const records = Array.isArray(snapshot?.records) ? snapshot.records : null;
   if (!records || records.length !== Number(snapshot?.recordCount)) {

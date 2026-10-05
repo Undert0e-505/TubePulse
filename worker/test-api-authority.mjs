@@ -8,6 +8,8 @@ import {
   authorityTestHelpers,
   createAuthorityWorker,
 } from './tubepulse-api/authority.mjs';
+import { d1KvTestHelpers } from './tubepulse-api/d1-kv.mjs';
+import { FakeD1 } from './test-support/fake-d1.mjs';
 
 const SECRET = 'synthetic-authority-secret-that-is-at-least-32-characters';
 const DEVICE = 'synthetic-device-authority-test';
@@ -61,6 +63,20 @@ function coordinatorFixture(entries = {}) {
     get() { return { fetch: (input, init) => coordinator.fetch(input instanceof Request ? input : new Request(input, init)) }; },
   };
   return { kv, storage, coordinator, namespace };
+}
+
+function d1CoordinatorFixture(entries = {}, generation = 'production-v1') {
+  const kv = new MemoryKv(entries);
+  const database = new FakeD1();
+  const storage = new MemoryStorage();
+  const env = {
+    TUBEPULSE_KV: kv,
+    TUBEPULSE_D1: database,
+    TUBEPULSE_CANONICAL_BACKEND: 'd1',
+    TUBEPULSE_CANONICAL_BACKEND_GENERATION: generation,
+  };
+  const coordinator = new TubePulseAuthorityCoordinator({ storage }, env);
+  return { kv, database, storage, env, coordinator };
 }
 
 async function callCoordinator(coordinator, path, body, method = 'POST') {
@@ -960,4 +976,119 @@ test('authority canonical signatures are stable and body/authorization sensitive
   const first = authorityTestHelpers.authorityCanonical(base);
   const second = authorityTestHelpers.authorityCanonical({ ...base, bodyDigest: await authoritySha256('{"x":1}') });
   assert.notEqual(first, second);
+});
+
+test('verified Home snapshot activates D1 generation and archives obsolete KV pending state', async () => {
+  const fixture = d1CoordinatorFixture();
+  const records = [
+    { key: 'alpha', value: 'one', hash: await authoritySha256('one') },
+    { key: 'beta', value: JSON.stringify({ zero: 0, nil: null }),
+      hash: await authoritySha256(JSON.stringify({ zero: 0, nil: null })) },
+  ];
+  const manifestHash = await authoritySha256(records.map(({ key, hash }) => `${key}\0${hash}\n`).join(''));
+  await fixture.storage.put('authority:pending:legacy', {
+    key: 'legacy', delta: { key: 'legacy', baseHash: null, nextHash: await authoritySha256('queued') },
+  });
+  const leaseId = 'backend-migration-0001';
+  let result = await callCoordinator(fixture.coordinator, '/backend-migration/begin', {
+    leaseId, manifestHash, recordCount: records.length,
+  });
+  assert.equal(result.response.status, 200);
+  result = await callCoordinator(fixture.coordinator, '/backend-migration/chunk', {
+    leaseId, offset: 0, records,
+  });
+  assert.equal(result.response.status, 200);
+  result = await callCoordinator(fixture.coordinator, '/backend-migration/commit', { leaseId });
+  assert.equal(result.response.status, 200);
+
+  const status = await callCoordinator(fixture.coordinator, '/status', undefined, 'GET');
+  assert.deepEqual(status.payload.backend, {
+    selected: 'd1', generation: 'production-v1', ready: true, legacyKvFrozen: true,
+  });
+  assert.equal(status.payload.replication.status, 'current');
+  assert.equal(status.payload.pendingBackupKeys, 0);
+  assert.equal(status.payload.quota.migrationEstimatedRowsWritten, records.length + 1);
+  assert.equal(status.payload.quota.estimatedRowsWritten, records.length + 1);
+  assert.equal(fixture.kv.writes, 0, 'legacy KV remains frozen throughout migration');
+  const archived = fixture.storage.values.get('authority:legacy-backend-migration');
+  assert.equal(archived.archivedPendingCount, 1);
+  assert.equal(archived.verifiedManifestHash, manifestHash);
+});
+
+test('D1 migration refuses a mismatched manifest without activating or clearing legacy pending', async () => {
+  const fixture = d1CoordinatorFixture();
+  await fixture.storage.put('authority:pending:legacy', { key: 'legacy', delta: { key: 'legacy' } });
+  const leaseId = 'backend-migration-0002';
+  const record = { key: 'alpha', value: 'one', hash: await authoritySha256('one') };
+  await callCoordinator(fixture.coordinator, '/backend-migration/begin', {
+    leaseId, manifestHash: 'f'.repeat(64), recordCount: 1,
+  });
+  await callCoordinator(fixture.coordinator, '/backend-migration/chunk', {
+    leaseId, offset: 0, records: [record],
+  });
+  const result = await callCoordinator(fixture.coordinator, '/backend-migration/commit', { leaseId });
+  assert.equal(result.response.status, 409);
+  assert.equal(fixture.database.backend, null);
+  assert.equal((await fixture.storage.list({ prefix: 'authority:pending:' })).size, 1);
+});
+
+test('D1 coordinator accounts conservative rows, defers at publication cap and fences generation', async () => {
+  const fixture = d1CoordinatorFixture();
+  fixture.env.TUBEPULSE_AUTHORITY_D1_PUBLICATION_ROW_CAP = '3';
+  fixture.env.TUBEPULSE_AUTHORITY_D1_ROW_WRITE_HARD_CAP = '6';
+  const oldHash = await authoritySha256('old');
+  const manifestHash = await authoritySha256(`alpha\0${oldHash}\n`);
+  const leaseId = 'backend-migration-0003';
+  await callCoordinator(fixture.coordinator, '/backend-migration/begin', {
+    leaseId, manifestHash, recordCount: 1,
+  });
+  await callCoordinator(fixture.coordinator, '/backend-migration/chunk', {
+    leaseId, offset: 0, records: [{ key: 'alpha', value: 'old', hash: oldHash }],
+  });
+  await callCoordinator(fixture.coordinator, '/backend-migration/commit', { leaseId });
+
+  let result = await callCoordinator(fixture.coordinator, '/acquire', {
+    leaseId: 'publication-d1-0001', kind: 'publication',
+  });
+  assert.equal(result.response.status, 200);
+  result = await callCoordinator(fixture.coordinator, '/commit', {
+    leaseId: 'publication-d1-0001', deltas: [{
+      key: 'alpha', operation: 'put', value: 'new', baseHash: oldHash,
+      nextHash: await authoritySha256('new'), options: {},
+    }],
+  });
+  assert.equal(result.payload.applied, 1);
+  let status = await callCoordinator(fixture.coordinator, '/status', undefined, 'GET');
+  assert.equal(status.payload.quota.estimatedRowsWritten, 5);
+  assert.deepEqual(status.payload.quota.limits, {
+    totalEstimatedRows: 1000,
+    publicationEstimatedRows: 3,
+    appReserveEstimatedRows: 997,
+    estimatedRowsPerLogicalWrite: 3,
+  });
+
+  const repeat = await callCoordinator(fixture.coordinator, '/backend-migration/begin', {
+    leaseId: 'backend-migration-repeat', manifestHash, recordCount: 1,
+  });
+  assert.equal(repeat.response.status, 409, 'an active generation cannot be cleared and reused');
+
+  await callCoordinator(fixture.coordinator, '/acquire', {
+    leaseId: 'publication-d1-0002', kind: 'publication',
+  });
+  result = await callCoordinator(fixture.coordinator, '/commit', {
+    leaseId: 'publication-d1-0002', deltas: [{
+      key: 'beta', operation: 'put', value: 'queued', baseHash: null,
+      nextHash: await authoritySha256('queued'), options: {},
+    }],
+  });
+  assert.equal(result.payload.deferred, true);
+  assert.equal(result.payload.reason, 'publication-cap');
+
+  fixture.env.TUBEPULSE_CANONICAL_BACKEND_GENERATION = 'production-v2';
+  status = await callCoordinator(fixture.coordinator, '/status', undefined, 'GET');
+  assert.equal(status.payload.backend.ready, false);
+  result = await callCoordinator(fixture.coordinator, '/acquire', {
+    leaseId: 'publication-d1-0003', kind: 'publication',
+  });
+  assert.equal(result.response.status, 409);
 });

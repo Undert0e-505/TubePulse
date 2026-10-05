@@ -40,7 +40,7 @@ Takeover is sticky across service restarts. There is deliberately no automatic f
 
 ### Existing-app canary gateway
 
-The former single-device gateway experiment is retained for history/tests but is disabled. Production now uses `compose.authority.yaml`: the unchanged app still calls its existing `workers.dev` URL, while every authenticated `GET /feed` and all seven authenticated app mutations use one unified Home store through Workers VPC when replication is current. Cloudflare KV remains a bounded backup/fallback, not a periodically mirrored second writer.
+The former single-device gateway experiment is retained for history/tests but is disabled. Production now uses `compose.authority.yaml`: the unchanged app still calls its existing `workers.dev` URL, while every authenticated `GET /feed` and all seven authenticated app mutations use one unified Home store through Workers VPC when replication is current. Cloudflare D1 is the coordinated changed-key backup/fallback, not a periodically mirrored second writer. The old Workers KV namespace is a frozen snapshot and is never selected automatically.
 
 In that historical canary phase, Cloudflare remained authoritative: a successful mutation ran on Cloudflare first and then replicated to Home. That behavior is not the current production mutation path.
 
@@ -50,9 +50,9 @@ This is not a QR enrollment flow and needs no APK or endpoint change. Public ori
 
 There is no distributed transaction across Cloudflare and Home. In particular, if Cloudflare refuses a write, instantaneous two-sided consistency is impossible. The canary deliberately does **not** accept a Home-only mutation: the canonical Cloudflare error is returned and Home is not called.
 
-### Private Workers VPC ingress
+### Historical single-device Workers VPC canary
 
-[`WORKERS-VPC.md`](WORKERS-VPC.md) is the operational runbook for the private canary path. Its separate Compose project uses ignored `data-gateway`, publishes only a loopback status endpoint on port 8789, and runs a digest-pinned `cloudflared` sidecar with no host ports. The VPC Service target is Docker-internal `gateway-origin:8788`. The production flag is currently false and both local services are stopped with data preserved because a full 811-record pull every five minutes projects to about 233,000 KV reads/day. This leaves the standalone Preview pilot and `data-pilot` unchanged.
+[`WORKERS-VPC.md`](WORKERS-VPC.md) records the retired single-device mirror/canary procedure. Do not use its mirror pull or Cloudflare-first mutation flow as production instructions. Current production uses `compose.authority.yaml`, the same private VPC target, one authoritative `data-authority` store, and D1 changed-key backup; it does not run the old periodic full mirror. The isolated Preview pilot and `data-pilot` remain separate.
 
 ## Five-minute Node quick start
 
@@ -180,7 +180,7 @@ Continuous Home scheduling sorts and de-duplicates `channels:active`. On every a
 
 Playlist results flow through the existing durable known/high-watermark, recent-cache, scheduled/live, notification, canonical backup, and visibility-barrier code. A genuinely new channel seeds silently. An established channel keeps its watermark, including across this migration, so an upload missed during the RSS outage can be classified normally. Private/deleted/unavailable items never notify. New item metadata is fetched through `videos.list` in batches of 50 only where playlist data is insufficient; `search.list` is never used.
 
-Video metrics use the official `videos:batchGetStats` endpoint in batches of 50. Only each channel's current app-visible top three are eligible: the newest is always due every five minutes, while the other two back off from 5 to 15 to 60 minutes, then six hours, and finally daily after repeated static observations. Poll state below the top three is pruned; a deletion/private transition therefore makes the promoted item immediately due without weakening durable known-video dedupe. A runtime method-not-found response permanently selects batched `videos.list(part=statistics)` for that persisted runtime state and restricts polling to newest-only. Metric reads remain local observations; canonical recent-video writes retain the existing greater-than-25%-change or 24-hour persistence throttle. Hidden like/comment counts stay `null`.
+Video metrics use the official `videos:batchGetStats` endpoint in batches of 50. Only each channel's current app-visible top three are eligible: the newest is always due every five minutes, while the other two back off from 5 to 15 to 60 minutes, then six hours, and finally daily after repeated static observations. Poll state below the top three is pruned; a deletion/private transition therefore makes the promoted item immediately due without weakening durable known-video dedupe. A runtime method-not-found response permanently selects batched `videos.list(part=statistics)` for that persisted runtime state and restricts polling to newest-only. Known view/like movement may persist at most once per UTC hour; missing values hydrate immediately and unchanged values force a clock refresh after 24 hours. `commentCount` is also retained locally with its observation timestamp, including null and explicit zero, but is excluded from adaptive activity cadence and can never trigger canonical publication. Its latest value may piggyback when structure or an allowed view/like update already requires the same recent-video write.
 
 General and statistics quota counters are persisted before every request, including requests that fail, reset at midnight `America/Los_Angeles` with DST awareness, and enforce separate configurable reserves. Detector work has priority; reconciliation metadata and older metric work are bounded/deferrable. Transient or quota failure retains the last-good cache and never falls back to RSS.
 
@@ -202,21 +202,35 @@ The one-shot CLI is a local/container administrative operation; there is no unau
 
 ### Scheduler cutover and rollback
 
-Production cut over to the unified local-first authority on 2026-10-04. The completed sequence was:
+Production cut over to the unified local-first authority on 2026-10-04. This initial KV-backed sequence is retained as history:
 
-1. Keep Home in `standby`, acquire a signed coordinator lease, and import an exact 721-record canonical snapshot directly through the Worker binding (no REST/full-mirror race).
+1. Keep Home in `standby`, acquire a signed coordinator lease, and import an exact canonical snapshot directly through the Worker binding (no REST/full-mirror race).
 2. Disable exactly the triggers for `tubepulse-rss-0`, `tubepulse-rss-1`, `tubepulse-rss-2`, `tubepulse-posts`, and `tubepulse-aux`. The API Worker remains live and the retired combined cron remains triggerless.
 3. Verify the live trigger lists are empty and all final CronEvents have drained. Prefer a short detection gap over overlap.
-4. Run one local authority/store that executes every signed app mutation with the unchanged API semantics against a buffered local KV view and uses the same locks as scheduled polling. Successful exact deltas enter the Durable Object's deferred Cloudflare-backup queue; semantic failures apply no local writes, and an unavailable Home fails closed.
-5. Poll only local KV, publish only journaled changed keys, and prove projected daily usage below the free limits: 100,000 reads, 1,000 writes, and 1,000 list operations (UTC reset). Do not use a whole-namespace five-minute pull.
+4. Run one local authority/store that executes every signed app mutation with the unchanged API semantics against a buffered local KV view and uses the same locks as scheduled polling. Successful exact deltas enter the Durable Object's deferred cloud-backup queue; semantic failures apply no local writes, and an unavailable Home fails closed.
+5. Poll only local KV and publish only journaled changed keys. Do not use a whole-namespace five-minute pull.
 6. Queue notification intents, confirm the changed records through the canonical production `/feed`, and only then send FCM exactly once.
-7. Verify complete natural sweeps, mutation coordination, restart recovery, Home-backed public feeds, FCM/dedupe ordering, error rate, and measured KV usage.
+7. Verify complete natural sweeps, mutation coordination, restart recovery, Home-backed public feeds, FCM/dedupe ordering, error rate, and measured cloud-storage usage.
 
-Rollback reverses ownership without overlap: stop and drain Home first, checkpoint canonical watermarks/nag/upcoming state where safe, verify it is no longer holding the lease, then restore the exact prior Cloudflare triggers (`*/5` for RSS and every minute for posts/aux) and observe their first events. Never run both notification owners concurrently.
+Rollback reverses ownership without overlap: stop and drain Home first and verify it is no longer holding the lease. Since the retained Workers bind a frozen KV snapshot, they must not be re-enabled after D1 has advanced until an exact quiesced reconciliation makes that snapshot current. Their handlers also require `TUBEPULSE_ENABLE_FROZEN_KV_ROLLBACK=true`; this latch is an acknowledgement, not a substitute for reconciliation. Never run both notification owners concurrently.
+
+### D1 canonical migration and rollback
+
+The active cloud canonical backend is selected by `TUBEPULSE_CANONICAL_BACKEND=d1` and an explicit generation. D1 read replication remains disabled; fallback reads use the primary database. The schema is an opaque key/value compatibility table plus active-manifest and short-lived guard tables, all without secondary indexes. Values over 1.9 MB are rejected before staging.
+
+For an exact migration, build the new authority image first, then stop/drain Home so its file lease is released. Deploy the API Worker with the D1 binding and a never-before-used generation, then run this one-off command using the normal authority Compose environment:
+
+```bash
+node src/home-authority-cli.mjs migrate-d1
+```
+
+The command requires Home's local gate to be current, exports the authoritative canonical snapshot, stages bounded chunks, verifies the D1 manifest, activates the generation, rebuilds Durable Object baselines, and only then archives/clears obsolete KV-pending state. Start Home again only after it succeeds. A failed or incomplete migration leaves D1 inactive and legacy pending data intact. After activation the legacy KV namespace is frozen and not dual-written; rollback requires another exact quiesced reconcile rather than a binding flip.
+
+The coordinator budgets three estimated rows per logical key mutation and enforces 45,000 scheduler / 50,000 total estimated rows per UTC day, leaving 5,000 for app mutations against the 100,000-row D1 free allowance. D1 batching is atomic and reduces round trips, but does not reduce billed rows.
 
 The live authority uses ignored `data-authority`, `secrets/authority-secret.txt`, and `.env.authority`; it does not share writable storage with Preview, the old gateway mirror, or the shadow scheduler. `docker compose --env-file .env.authority -f compose.authority.yaml ps` and loopback `GET /_tubepulse/status` are the primary host checks. Do not run the one-shot reconciliation CLI while the service owns its file lease. On rollback, stop/drain Home before restoring any trigger.
 
-Active startup verifies both the local authority and the signed Cloudflare coordinator before arming the scheduler. If either side is stale, Home acquires its single-process lease, imports an exact canonical snapshot, verifies the manifest, and reactivates both sides before accepting traffic. A publication/timer failure is contained rather than becoming an unhandled process rejection: the interrupted cohort is recorded in `scheduler.lastError`, Home attempts the same exact reconciliation, and the minute timer continues. If reconciliation replaced local state after a cohort began, that cohort is marked failed rather than resuming progress against replaced state; the deterministic cycle resumes safely from current canonical data. An unclean process stop still leaves the file lease protected until its TTL expires; a clean shutdown waits for the active tick, releases the lease before disposing workerd, and permits an immediate restart.
+Active startup verifies both the local authority and the signed Cloudflare coordinator before arming the scheduler. If either side is stale, Home acquires its single-process lease, imports an exact canonical snapshot, verifies the manifest, and reactivates both sides before accepting traffic. D1 recovery exports visible canonical rows with a bounded set-based read rather than one query per key, preserving null expiration as non-expiring and staying below per-invocation query limits. A publication/timer failure is contained rather than becoming an unhandled process rejection: the interrupted cohort is recorded in `scheduler.lastError`, Home attempts the same exact reconciliation, and the minute timer continues. If reconciliation replaced local state after a cohort began, that cohort is marked failed rather than resuming progress against replaced state; the deterministic cycle resumes safely from current canonical data. An unclean process stop still leaves the file lease protected until its TTL expires; a clean shutdown waits for the active tick, releases the lease before disposing workerd, and permits an immediate restart.
 
 ### Historical incident: YouTube RSS 404 diagnosis (2026-10-05)
 
@@ -279,9 +293,9 @@ The API Worker additionally accepts `TUBEPULSE_HOME_GATEWAY_TRANSPORT=vpc` only 
 
 Cloudflare settings are all-or-none. Incomplete credentials stop startup instead of silently running a partial mirror. Automatic push is intentionally off and cannot be enabled unless writes are independently enabled.
 
-## Cloudflare token permissions and quota
+## Cloudflare token permissions and quota (legacy Preview mirror only)
 
-Create a narrowly scoped API token for the one account and namespace:
+This section applies to the optional `TUBEPULSE_MODE=mirror` preview tooling, not the production D1 authority path. Create a narrowly scoped API token for the one account and legacy namespace:
 
 - Pull-only standby: Workers KV Storage **Read**.
 - Push apply: Workers KV Storage **Edit**, only when you genuinely intend this host to write back.

@@ -40,6 +40,21 @@ export function normalizeYoutubeDataApiState(value, nowMs = Date.now()) {
   state.sourceMode = 'youtube-data-api';
   state.channels = state.channels && typeof state.channels === 'object' ? state.channels : {};
   state.metricPoll = state.metricPoll && typeof state.metricPoll === 'object' ? state.metricPoll : {};
+  for (const [videoId, poll] of Object.entries(state.metricPoll)) {
+    if (!poll || typeof poll !== 'object' || Array.isArray(poll)) {
+      delete state.metricPoll[videoId];
+      continue;
+    }
+    if (poll.commentObservation && typeof poll.commentObservation === 'object') {
+      const observedAt = Date.parse(poll.commentObservation.observedAt || '');
+      poll.commentObservation = {
+        count: poll.commentObservation.count == null ? null : String(poll.commentObservation.count),
+        observedAt: Number.isFinite(observedAt)
+          ? new Date(observedAt).toISOString()
+          : null,
+      };
+    }
+  }
   if (state.quota?.day !== window.day) {
     state.quota = {
       day: window.day,
@@ -291,6 +306,42 @@ export function normalizeStatistics(payload) {
     });
   }
   return result;
+}
+
+export function updateMetricPollObservation(previous, metrics, observedAtMs) {
+  const observedAt = new Date(observedAtMs).toISOString();
+  // Comment activity is intentionally excluded from the cadence signature:
+  // it is retained locally for future work but cannot make older videos look
+  // active or influence current view/like polling behavior.
+  const cadenceSignature = JSON.stringify({
+    views: metrics?.views ?? null,
+    likes: metrics?.likes ?? null,
+    dislikes: metrics?.dislikes ?? null,
+  });
+  let previousCadenceSignature = previous?.lastObserved;
+  try {
+    const parsed = JSON.parse(previousCadenceSignature);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      // Normalize the pre-local-observation format, whose signature included
+      // comments, without resetting an otherwise unchanged static streak.
+      previousCadenceSignature = JSON.stringify({
+        views: parsed.views ?? null,
+        likes: parsed.likes ?? null,
+        dislikes: parsed.dislikes ?? null,
+      });
+    }
+  } catch { /* old/malformed signatures simply start a fresh streak */ }
+  return {
+    lastPolledAt: observedAt,
+    lastObserved: cadenceSignature,
+    staticStreak: previousCadenceSignature === cadenceSignature
+      ? Number(previous.staticStreak || 0) + 1
+      : 0,
+    commentObservation: {
+      count: metrics?.comments == null ? null : String(metrics.comments),
+      observedAt,
+    },
+  };
 }
 
 export const youtubeDataApiLimits = { channelBatchSize: CHANNEL_BATCH_SIZE, videoBatchSize: VIDEO_BATCH_SIZE };

@@ -1186,7 +1186,7 @@ test('community post cache ignores only rotating YouTube thumbnail delivery para
   }, [{ ...cached, publishedAt: null }]), true, 'relative label remains authoritative without a timestamp');
 });
 
-test('community post persistence throttles observation and engagement churn without delaying structure', () => {
+test('community post persistence uses hourly engagement gates without delaying structure', () => {
   const cached = {
     id: 'post:Ugpost', activityId: 'Ugpost', postId: 'Ugpost',
     fetchedAt: '2026-10-04T10:05:00.000Z',
@@ -1204,18 +1204,6 @@ test('community post persistence throttles observation and engagement churn with
   });
 
   assert.equal(
-    mergeCachedCommunityPostForPersistence(latest({ likeCount: 124, likeText: '124 likes' }), [cached]),
-    cached,
-    'sub-threshold metrics, relative text and rotating delivery signatures are a true no-op',
-  );
-  const significant = mergeCachedCommunityPostForPersistence(
-    latest({ likeCount: 126, likeText: '126 likes' }), [cached],
-  );
-  assert.equal(significant.likeCount, 126);
-  assert.equal(significant.fetchedAt, '2026-10-04T11:05:00.000Z');
-  assert.equal(significant.thumbnail, cached.thumbnail);
-
-  assert.equal(
     mergeCachedCommunityPostForPersistence(latest({
       fetchedAt: '2026-10-04T10:55:00.000Z', likeCount: 500, likeText: '500 likes',
     }), [cached]),
@@ -1223,10 +1211,17 @@ test('community post persistence throttles observation and engagement churn with
     'a same-hour spike cannot cause a second persistence write',
   );
 
+  const changed = mergeCachedCommunityPostForPersistence(
+    latest({ likeCount: 101, likeText: '101 likes' }), [cached],
+  );
+  assert.equal(changed.likeCount, 101, 'a small known change persists in a later UTC hour');
+  assert.equal(changed.fetchedAt, '2026-10-04T11:05:00.000Z');
+  assert.equal(changed.thumbnail, cached.thumbnail);
+
   const forced = mergeCachedCommunityPostForPersistence(latest({
-    fetchedAt: '2026-10-05T10:05:00.000Z', viewCount: 1100, viewText: '1.1K views',
+    fetchedAt: '2026-10-05T10:05:00.000Z', viewCount: 1000, viewText: '1K views',
   }), [cached]);
-  assert.equal(forced.viewCount, 1100);
+  assert.equal(forced.viewCount, 1000);
   assert.equal(forced.fetchedAt, '2026-10-05T10:05:00.000Z');
 
   const unknown = { ...cached, likeCount: null, likeText: null };
@@ -1242,7 +1237,7 @@ test('community post persistence throttles observation and engagement churn with
   assert.equal(mergeCachedCommunityPostForPersistence(newPost, [cached]), newPost);
 });
 
-test('eligible post comparison with only sub-threshold observation churn publishes zero writes', async () => {
+test('eligible post comparison with same-hour observation churn publishes zero writes', async () => {
   const channelId = 'UC0000000000000000000000';
   const postId = 'Ugpost';
   const now = Date.now();
@@ -1250,7 +1245,7 @@ test('eligible post comparison with only sub-threshold observation churn publish
     id: `post:${postId}`, activityId: postId, postId,
     publishedAt: new Date(now - 24 * 60 * 60 * 1000).toISOString(),
     publishedAtSource: 'estimated_from_relative', publishedText: '1 day ago',
-    fetchedAt: new Date(now - 60_000).toISOString(),
+    fetchedAt: new Date(Math.floor(now / (60 * 60 * 1000)) * 60 * 60 * 1000).toISOString(),
     likeCount: 100, likeText: '100 likes', viewCount: 1000, viewText: '1K views',
     authorName: null, text: 'same',
     thumbnail: 'https://i.ytimg.com/abc/image.jpg?sqp=old&rs=old',

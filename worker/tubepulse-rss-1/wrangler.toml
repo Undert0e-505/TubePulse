@@ -17,3 +17,4 @@ enabled = true
 [vars]
 RSS_SHARD_INDEX = "1"
 RSS_MAX_SHARDS = "3"
+TUBEPULSE_ENABLE_FROZEN_KV_ROLLBACK = "false"

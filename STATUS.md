@@ -21,19 +21,19 @@ Repo evidence as of this document update:
 | Android version | `android/app/build.gradle` has `versionCode 352`, `versionName "3.5.2"` |
 | API base URL | `src/utils/api.js` uses `EXPO_PUBLIC_TUBEPULSE_API_URL` when built with one and otherwise preserves `https://tubepulse-api.jimothyoakley55.workers.dev`; optional fallback is disabled unless separately configured |
 | Release script | `build-and-release.ps1` is the current local release path |
-| API worker config | `worker/tubepulse-api/wrangler.toml` defines worker `tubepulse-api`, KV namespace `52e77ca9f5f6493e89d2478c8d3055ec`, and VPC Service binding `TUBEPULSE_HOME_VPC`; the live `workers.dev` endpoint remains enabled without a committed custom route |
+| API worker config | `worker/tubepulse-api/wrangler.toml` defines worker `tubepulse-api`, active D1 binding/generation, Durable Object coordinator, VPC Service binding `TUBEPULSE_HOME_VPC`, and frozen legacy KV binding; the live `workers.dev` endpoint remains enabled without a committed custom route |
 | Scheduled worker configs | Cron Trigger arrays are empty for RSS0/1/2, posts, aux, API, and the retired combined cron; one local Home authority now owns scheduled work |
-| Self-host preview | `self-host/` runs the existing Worker sources with persistent local KV in standalone or mirror/standby mode; adding it did not deploy or change production Cloudflare resources |
+| Home runtime and preview | `self-host/` contains the production unified Home authority plus isolated standalone/mirror preview tooling; production uses its persistent `data-authority` store and D1 coordinator path |
 | Side-by-side Preview APK | Android build type `selfhost` produces package `com.tubepulse.app.selfhost` / label `TubePulse Preview`, bundles JavaScript without Metro, requires a health-tested runtime Home URL, and permits LAN cleartext only in that test variant |
 | Legacy resolver archive | `worker/archive/tubepulse-resolver/` preserves the old `tubepulse-resolver` source/config for reference only |
 
-Live route verification on 2026-06-25 confirmed Cloudflare serves the app-facing API at `https://tubepulse-api.jimothyoakley55.workers.dev/`. Old notes claiming the `workers.dev` API route is unreachable are stale.
+Live verification after the 2026-10-05 D1 cutover confirmed Cloudflare still serves the app-facing API at the unchanged `workers.dev` URL and routes current authenticated feeds through Home while it is healthy.
 
 ---
 
 ## Worker Deployment Status
 
-The five active scheduled workers were restored and redeployed on 2026-09-01 after stale Cron Trigger records stopped dispatching. Current deployment IDs and post-deploy invocation evidence are recorded below.
+The scheduled Worker deployments below are retained rollback/history assets. Their Cron Triggers are disabled; current scheduling belongs exclusively to Home. Historical deployment IDs are recorded for provenance, not as activation instructions.
 
 | Worker | Deployment state |
 |---|---|
@@ -43,7 +43,7 @@ The five active scheduled workers were restored and redeployed on 2026-09-01 aft
 | `tubepulse-posts` | Version `ed33187c-9c79-4fa7-b215-72194117feb6`; deployment retained, Cron Triggers disabled at the Home cutover. Home checks posts hourly. |
 | `tubepulse-aux` | Version `ea9347cf-67db-4a49-a8d6-7bd671cedd08`; deployment retained, Cron Triggers disabled at the Home cutover. Home runs aux each minute. |
 | `tubepulse-cron` | Retired no-op retained under its historical name with `crons = []`. |
-| `tubepulse-api` | Production deployment `86965f82-97f1-42a6-8730-9c7dd13588ba`, version `35b661e9-d615-44b5-8d6a-26544a53fea8`, serves the unchanged app URL. Every authenticated feed uses the unified Home store over VPC while current, with Cloudflare KV fallback; authenticated mutations are Home-first with deferred KV backup. |
+| `tubepulse-api` | Serves the unchanged app URL. Every authenticated feed uses the unified Home store over VPC while current, with D1 fallback; authenticated mutations are Home-first with deferred atomic D1 backup. See the production D1 cutover section for the currently verified deployment. |
 | `worker/archive/tubepulse-resolver` | Not deployed; archive remains reference-only. |
 
 The checked-in app version is `3.5.2` with Android `versionCode 352`. Worker deployment is separate from app APK release; community-post rollout required both worker deployment and app release.
@@ -62,18 +62,18 @@ Community-post worker/app support is enabled only when `TUBEPULSE_ENABLE_COMMUNI
 | Local Android test build | `android/app/src/selfhost/`, `scripts/Build-SelfHostApk.ps1` | Side-by-side debug-signed Preview APK with a health-tested, persisted runtime Home URL and no production fallback; does not mutate the main application ID or version |
 | Release script | `build-and-release.ps1` | Windows-native local APK build/sign/copy, version bump, commit/push, GitHub release creation/upload |
 | API worker | `worker/tubepulse-api/` | App-facing HTTP API worker in source: register, subscribe/unsubscribe, feed, resolve, bootstrap, settings, seen, dormant WebSub endpoints |
-| RSS shard workers | `worker/tubepulse-rss-0/`, `worker/tubepulse-rss-1/`, `worker/tubepulse-rss-2/` | Triggerless rollback deployments; Home reuses the RSS processing code |
+| RSS shard workers | `worker/tubepulse-rss-0/`, `worker/tubepulse-rss-1/`, `worker/tubepulse-rss-2/` | Triggerless rollback deployments; Home reuses shared watermark/notification helpers but does not fetch RSS |
 | Posts worker | `worker/tubepulse-posts/` | Triggerless rollback deployment; Home reuses the community-post poller hourly |
 | Aux worker | `worker/tubepulse-aux/` | Triggerless rollback deployment; Home reuses bounded nag/prewarn work each minute |
 | Retired cron stub | `worker/tubepulse-cron/index.js` | No-op compatibility deployment; shared helpers remain in `shared.mjs` |
 | Legacy resolver archive | `worker/archive/tubepulse-resolver/` | Historical standalone resolver worker (`tubepulse-resolver`), superseded by `worker/tubepulse-api` `/resolve`; reference only |
-| Self-host preview | `self-host/` | Local workerd-backed API/scheduler, persistent KV, conflict-detecting Cloudflare sync, admin controls, Docker/Windows helpers |
+| Home runtime and preview | `self-host/` | Production unified authority plus isolated preview modes, persistent local key/value storage, D1 reconciliation, admin controls, and Docker/Windows helpers |
 
 ---
 
 ## Verified API Route State
 
-Last verified: 2026-10-04.
+Last verified: 2026-10-05 after the D1 canonical cutover.
 
 The app-facing API route is currently reachable at:
 
@@ -89,7 +89,7 @@ Keep these version labels distinct:
 - App/release version evidence in this repo is `3.5.2` with Android `versionCode 352`.
 - API worker health response reports `version: "3.0.0"`; this appears to be a stale or independently versioned health label, not the app release version.
 
-`worker/tubepulse-api/wrangler.toml` still has a comment saying "No HTTP routes" and no explicit `routes` or `workers_dev` setting. That comment/config is incomplete relative to live Cloudflare behavior. Do not change route/app config or delete worker files until the deployed Cloudflare settings are intentionally reviewed.
+`worker/tubepulse-api/wrangler.toml` intentionally commits no custom route. The live `workers.dev` endpoint remains enabled and unchanged; route ownership is separate from the app release version.
 
 ---
 
@@ -103,8 +103,8 @@ Summary behavior from the script:
 2. Run `npm install --no-audit --no-fund`.
 3. Build Android release APK with `android\gradlew.bat assembleRelease --no-daemon`.
 4. Sign the APK using `android/app/debug.keystore`.
-5. Copy the APK to repo root as `TubePulse-vX.Y.Z.apk`.
-6. For full releases, guard against untracked non-ignored files, then `git add -A`, commit, push current branch, create/update GitHub release through the GitHub API, and upload the APK.
+5. Copy the APK to ignored `dist/TubePulse-vX.Y.Z.apk`.
+6. For full releases, reject unexpected worktree content, stage only `app.json` and `android/app/build.gradle`, commit, push the current branch, create/update the GitHub release through the GitHub API, and upload the verified APK.
 
 `build-and-release.sh` is not the current release path in this repo.
 
@@ -115,21 +115,21 @@ Known risks and the intended safer target flow are documented in [RELEASE.md](RE
 ## Current Backend Summary
 
 - Video detection moved from the three rotating RSS shards to Home on 2026-10-04, then from RSS to the YouTube Data API on 2026-10-05. Home now checks the complete active fleet with two batched `channels.list` requests at every five-minute boundary. The retained RSS Worker deployments have no Cron Triggers and are not an automatic fallback.
-- The unified Home authority is **production-active**. One `data-authority` runtime/store handles signed all-device mutation replication, five-minute all-channel video sweeps, hourly all-channel post sweeps, aux minute work, and all-device private-VPC feeds. Its exact signed seed contained 721 canonical records. It performs no periodic full pull, publishes changed keys only, and uses 900 scheduler/950 total daily write caps with deferred-key coalescing and a 50-write app reserve. The first live sweep applied 33 changed keys, left zero queued/conflicted/pending keys, and delivered one natural notification only after the public Home-backed feed visibility barrier passed. All 12 known profiles returned `200` from the Home route through the unchanged production API URL.
+- The unified Home authority is **production-active**. One `data-authority` runtime/store handles signed all-device mutation replication, five-minute all-channel video sweeps, hourly all-channel post sweeps, aux minute work, and all-device private-VPC feeds. It performs no periodic full pull and publishes changed keys only. The D1 coordinator reserves three estimated rows per logical mutation and enforces 45,000 scheduler / 50,000 total estimated rows per UTC day, leaving a 5,000-row app reserve. Notification delivery still requires the public Home-backed feed visibility barrier.
 - The self-host preview is additive and local-only until an operator configures it. Current APK behavior and production Worker deployments are unchanged by the preview.
 - The earlier single-device gateway/full-mirror experiment remains disabled. Its periodic full pull was replaced by the unified authority's one-time exact seed plus signed deltas; there is no canary selector in the production feed path.
 - The optional `selfhost` APK is separately identified as TubePulse Preview and debug-signed. It gates normal initialization on a health-tested runtime Home URL, permits later changes from Settings, and never falls back to production. Its isolated Compose pilot uses a separate `data-pilot` mount and a fail-closed local-only profile that disables Cloudflare synchronization/writes. Its generated Firebase metadata is a build shim only; this pilot sends a null token until `com.tubepulse.app.selfhost` is registered as a distinct Firebase Android app and push is explicitly enabled.
-- YouTube Data API usage now owns active video discovery, uploads-playlist reconciliation, metadata, and engagement statistics as well as handle/avatar/bootstrap work. Statistics polling is restricted dynamically to the app-visible top three videos per channel; a deletion/private transition promotes the next cached item immediately without weakening the durable known-video watermark or replaying a notification. Community-post polling continues to use the isolated InnerTube helper.
-- Community-post structural changes remain immediate, while observation-only `fetchedAt`, relative-age labels, rotating thumbnail signatures, and sub-threshold engagement movement do not rewrite the canonical cache. Missing observations hydrate once; a strictly greater-than-25% metric change may persist at most once per UTC hour, with a forced refresh after 24 hours.
+- YouTube Data API usage now owns active video discovery, uploads-playlist reconciliation, metadata, and engagement statistics as well as handle/avatar/bootstrap work. Statistics polling is restricted dynamically to the app-visible top three videos per channel; a deletion/private transition promotes the next cached item immediately without weakening the durable known-video watermark or replaying a notification. Comment counts remain requested and are persisted only as local Home observations unless they can piggyback on a canonical write already required for structure or an allowed view/like update; comment-only movement publishes nothing. Community-post polling continues to use the isolated InnerTube helper.
+- Community-post structural changes remain immediate, while observation-only `fetchedAt`, relative-age labels, rotating thumbnail signatures, and same-hour engagement movement do not rewrite the canonical cache. Missing observations hydrate once; any normalized known metric change may persist at most once per UTC hour, with a forced refresh after 24 hours.
 - The active upload path no longer rewrites channel metadata solely to advance compatibility field `lastVideoId`. When the final subscriber removes a channel, the channel leaves `channels:active` and polling stops; display/subscriber state is cleaned through the bounded backup path while the known-video watermark remains for safe resubscription.
-- The current app-facing Worker deployment is version `fa626e36-e02d-4532-98e6-eb83ba6c22b3`. Deployment credentials remain outside the repository.
-- API and all five active scheduled workers share the same KV namespace according to their wrangler configs.
+- The app-facing Worker retains the unchanged public URL. Deployment credentials remain outside the repository.
+- The API Worker uses D1 as its active canonical backup/fallback. The old KV binding is frozen; all retained scheduled Workers are triggerless and fail closed unless an explicit stale-snapshot rollback latch is enabled after reconciliation.
 - WebSub code remains present but should be treated as dormant unless live verification proves otherwise.
-- KV schema and helper logic are duplicated between worker files and have known drift; see [worker/CONTRACTS.md](worker/CONTRACTS.md) before changing worker behavior.
+- The logical key/value schema and some helper logic are duplicated between worker files and have known drift; see [worker/CONTRACTS.md](worker/CONTRACTS.md) before changing worker behavior.
 
 ### 2026-10-05 YouTube RSS 404 incident (historical; superseded by Data API cutover)
 
-Home's five-minute RSS sweeps began receiving generic `404 Not Found` responses from the `YouTube RSS Feeds server`. This is an active operational incident, not evidence that a channel ID is invalid:
+Home's former five-minute RSS sweeps began receiving generic `404 Not Found` responses from the `YouTube RSS Feeds server`. This was an operational incident in the superseded RSS path, not evidence that a channel ID was invalid:
 
 - The Home host and the Home container returned the same generic 404 for known-valid official YouTube channel feeds. At the same time, an independent external request to the identical official feed reached an XML response.
 - Home completed full-fleet sweeps successfully before failures appeared progressively and eventually affected every channel.
@@ -160,9 +160,19 @@ The initial deployment exposed a migration defect: detector counts were captured
 
 Production verification returned `200` with `X-TubePulse-Authority-Route: home` for both the public feed and a no-op `/seen`. The public Forbes feed led with the 08:00:31Z video and contained its thumbnail, view, like, and comment counts. The four-video notification crossed the public-feed visibility barrier and was delivered once. At verification time the persisted quota totals were 183 general units and 46 statistics units, with zero API failures.
 
-The later write-efficiency deployment pruned metric scheduling state to the dynamic visible top three per channel. The first cycle hydrated newly eligible second/third items; the next adaptive cycle checked fewer videos in three batched statistics requests while the detector still used two requests with zero failures. The first live hourly post pass was intentionally not treated as steady state: its 52 backup writes included four real new posts, a silent first seed, missing-clock hydration, valid engagement changes, and video metric updates. A deterministic integration test proves an eligible post poll containing only sub-threshold metrics/observation metadata produces zero KV puts. One channel continues to exceed the existing 2 MiB InnerTube response ceiling; that pre-existing parser limit is recorded for follow-up rather than hidden as a successful poll.
+The later write-efficiency deployment pruned metric scheduling state to the dynamic visible top three per channel. The first cycle hydrated newly eligible second/third items; the next adaptive cycle checked fewer videos in three batched statistics requests while the detector still used two requests with zero failures. The first live hourly post pass was intentionally not treated as steady state: its backup writes included real new posts, a silent first seed, missing-clock hydration, valid engagement changes, and video metric updates. Under the then-active percentage policy, a deterministic integration test proved a post poll containing only sub-threshold metrics/observation metadata produced zero puts. The current policy instead permits any known metric change in a new UTC hour while preserving same-hour no-op behavior. A pre-existing oversized InnerTube response continues to exceed the 2 MiB parser ceiling; that limit is recorded for follow-up rather than hidden as a successful poll.
 
-At the last reliable observation after the 11:00Z pass on 2026-10-05, the signed coordinator was current with no pending backup keys and reported 745 total coordinated operations: 739 scheduler publication and 6 API. The limits were 950 total, 900 scheduler publication, and a 50-operation app reserve, resetting at 00:00Z. These are timestamped same-day observations, not a measured normal daily rate; a full-day observation is still required.
+Historical pre-D1 observation: after the 11:00Z pass on 2026-10-05, the KV-era coordinator was current with no pending backup keys and remained below its then-active operation caps. Those values are not current D1 limits or a measured normal daily rate.
+
+### Production D1 canonical cutover
+
+On 2026-10-05 the active cloud canonical backup/fallback moved from Workers KV to the `tubepulse-canonical` D1 database without changing the public Worker URL. Worker version `dab5d125-abfb-46fb-aa47-f38062a28d31` selects backend generation `production-v1`. Home was stopped and drained, its exact current canonical snapshot was staged in bounded chunks, and D1 was activated only after the staged manifest matched exactly. The Durable Object then rebuilt its hash baselines and archived/cleared the obsolete KV pending queue. Home restarted on the same persistent `data-authority` store.
+
+The old KV namespace is now a frozen point-in-time snapshot: it is not read, written, or selected automatically. Retained scheduled Workers have no Cron Triggers and their scheduled handlers additionally require an explicit frozen-KV acknowledgement latch. Safe rollback after D1 advances requires a new quiesced exact reconciliation; enabling the latch alone is unsafe.
+
+The D1 coordinator uses one atomic four-query `batch()` for a complete logical transaction, with content-hash guard rows preventing partial or stale-baseline commits. It estimates three rows written per logical mutation and enforces 45,000 scheduler / 50,000 total estimated rows per UTC day, leaving 5,000 rows for app mutations. Seed/retry row work is included in the exposed daily counter. D1 batching reduces round trips but not billed rows, and read replication remains disabled.
+
+Restart validation exposed and corrected a recovery-only query-shape defect: D1 canonical snapshots now read visible rows in one bounded set query instead of issuing one query per key, and SQL `NULL` expiration remains non-expiring rather than becoming zero. Home completed an exact automatic reconciliation after the fix; the coordinator returned to current with no transaction or pending backup.
 
 ---
 

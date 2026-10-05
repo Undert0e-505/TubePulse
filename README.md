@@ -6,13 +6,13 @@
 [![Cloudflare Workers](https://img.shields.io/badge/backend-Cloudflare%20Workers-F38020.svg)](https://workers.cloudflare.com/)
 [![React Native](https://img.shields.io/badge/built%20with-React%20Native%20%2F%20Expo-61DAFB.svg)](https://expo.dev/)
 
-TubePulse is an open-source Android app for YouTube channel notifications, including community posts. Its public API remains on Cloudflare Workers; the production scheduler can run as a unified local Home authority and uses Firebase Cloud Messaging for push delivery.
+TubePulse is an open-source Android app for YouTube channel notifications, including community posts. Its unchanged public API runs on Cloudflare Workers, while the production scheduler and primary feed/mutation authority run in the unified local Home service. Firebase Cloud Messaging provides push delivery.
 
 It is designed for people who want direct, lightweight YouTube notifications without relying entirely on the YouTube app's notification behaviour.
 
 - **Android only** — no iOS support planned
 - **MIT licensed** — forkable, modifiable, self-hostable
-- **Self-hostable backend** — Cloudflare Workers remain the default; an additive local-runtime preview is available
+- **Home-first production backend** — private-VPC Home authority with Cloudflare D1 fallback; an isolated local-runtime preview is also available
 
 ## Features
 
@@ -24,8 +24,8 @@ It is designed for people who want direct, lightweight YouTube notifications wit
 - Per-channel notification overrides (mode, DND, prewarn time, community posts opt-out)
 - Scheduled livestream prewarn — get notified before a stream goes live
 - Nag cycle — configurable re-notifications for unwatched videos
-- Cloudflare public API plus an optional unified local scheduler/authority
-- Optional standalone or Cloudflare-mirror self-host preview with local persistent KV
+- Cloudflare public API plus the production unified Home scheduler/authority
+- Optional isolated standalone self-host preview with local persistent KV
 - Firebase Cloud Messaging push delivery
 - MIT licensed and forkable
 
@@ -56,7 +56,7 @@ YouTube's in-app notifications can be inconsistent, especially for community pos
 | Android app | React Native + Expo |
 | Push notifications | Firebase Cloud Messaging (FCM) via HTTP v1 API |
 | Backend | Cloudflare public API plus the self-host/Home runtime |
-| Storage | Persistent local KV with changed-key Cloudflare KV backup |
+| Storage | Persistent local KV with changed-key Cloudflare D1 backup/fallback |
 | Video detection | Batched YouTube Data API channel detection every five minutes, uploads-playlist reconciliation, and adaptive batched statistics |
 | Community post detection | InnerTube polling of every eligible channel hourly |
 | Widgets | react-native-android-widget |
@@ -69,7 +69,7 @@ YouTube's in-app notifications can be inconsistent, especially for community pos
 - **v3.3.2** includes reliable multi-device subscription reconciliation.
 - Community post support exists but depends on unofficial YouTube web data structures, so it may need maintenance if YouTube changes.
 - The app is Android-only. No iOS support is planned.
-- An experimental, functional [self-host preview](self-host/README.md) can run the existing Worker sources locally or as a conflict-detecting Cloudflare standby. It is not deployed to the maintainer's production account by its addition.
+- A separate [self-host preview](self-host/README.md) can run the Worker sources locally for development without replacing the production Home authority or public API.
 - See [STATUS.md](STATUS.md) for current repo status and operational caveats.
 - See [RELEASE.md](RELEASE.md) for the release process.
 
@@ -77,9 +77,9 @@ YouTube's in-app notifications can be inconsistent, especially for community pos
 
 ## Self-host preview
 
-The additive [`self-host/`](self-host/) package runs the existing API and scheduled Worker modules through a workerd-backed local runtime. It supports standalone operation, persistent local KV, explicit Cloudflare reconciliation, and Docker/Windows operation. A debug-signed `TubePulse Preview` APK can be installed beside the main app, selects a health-tested Home URL at runtime, and never falls back to production. Its documented pilot Compose profile uses an isolated `data-pilot` directory and hard-disables Cloudflare sync/write behavior. A private Workers VPC canary was exercised on 2026-10-04 without a public Home hostname or inbound router port, then disabled after its full five-minute mirror was shown to consume about 233,000 KV reads/day at 811 records.
+The additive [`self-host/`](self-host/) package runs the existing API and scheduled Worker modules through a workerd-backed local runtime. It supports standalone operation, persistent local KV, explicit reconciliation tools, and Docker/Windows operation. A debug-signed `TubePulse Preview` APK can be installed beside the main app, selects a health-tested Home URL at runtime, and never falls back to production. Its pilot Compose profile uses an isolated `data-pilot` directory and hard-disables cloud synchronization and writes. The retired single-device mirror/canary experiment is retained only as historical design evidence in [`self-host/WORKERS-VPC.md`](self-host/WORKERS-VPC.md); it is not the production topology.
 
-Production switched to the **unified Home authority** on 2026-10-04: one process/store owns signed all-device mutation execution and the consolidated scheduler, polls community posts hourly, and runs aux work each minute. On 2026-10-05 video detection moved to the YouTube Data API: every aligned five-minute cycle batches active channels into the two `channels.list` requests required by the current fleet, then reconciles uploads playlists only for migration/change/safety-due channels and batches video statistics. The unchanged public Worker URL serves every authenticated `/feed` from this local store over Workers VPC when the authority is current, with bounded Cloudflare-KV fallback. Authenticated app mutations also run on Home through the signed VPC ingress while a Durable Object provides global ordering. Successful exact deltas are durably coalesced for later Cloudflare-KV backup, so `/seen` and the other app writes do not consume or depend on Cloudflare KV reads/writes at request time. Home publishes only changed keys to Cloudflare backup storage; the coordinator caps scheduler backup writes at 900/day and total coordinated writes at 950/day, reserving 50 writes for app mutations. Deferred backup changes are coalesced, and notification intents are suppressed while their backup publication is deferred. No periodic namespace pull runs after the one-time signed snapshot. The RSS, posts, and aux Cloudflare Cron Triggers are disabled; their Worker deployments are retained for rollback. There is no automatic RSS fallback.
+Production uses the **unified Home authority**: one process/store owns signed all-device mutation execution and the consolidated scheduler, polls community posts hourly, and runs aux work each minute. Video detection uses the YouTube Data API; every aligned five-minute cycle batches active channels into at most 50 IDs per `channels.list` request, then reconciles uploads playlists only for migration/change/safety-due channels and batches video statistics. The unchanged public Worker URL serves every authenticated `/feed` from Home over Workers VPC while authority is current, with Cloudflare D1 fallback. Authenticated app mutations also run on Home through signed VPC ingress while a Durable Object provides global ordering. Successful exact deltas are durably coalesced for D1 backup, so `/seen` and the other app writes do not depend on a cloud canonical read at request time. Home publishes only changed keys through an atomic, hash-guarded D1 batch; the coordinator conservatively budgets 45,000 estimated scheduler rows and 50,000 total estimated rows per UTC day, leaving 5,000 rows for app mutations against D1's 100,000-row free allowance. D1 batch operations improve atomicity and latency but still bill every affected row. Deferred backup changes are coalesced, and notification intents are suppressed while their backup publication is deferred. The old Workers KV namespace is a frozen point-in-time snapshot and is never an automatic fallback. No periodic namespace pull runs after the one-time signed snapshot. The RSS, posts, and aux Cloudflare Cron Triggers are disabled; their Worker deployments require an explicit frozen-KV rollback latch and remain historical rollback tools. There is no automatic RSS fallback.
 
 Start with the [self-host guide](self-host/README.md) for its preview limitations, five-minute setup, synchronization safety model, Cloudflare Tunnel guidance, backups, and recovery procedure.
 
@@ -110,7 +110,7 @@ v3.3.1 fixes widget/HomeScreen feed parity so the widget uses the same latest vi
 - **Channel ID is the primary key** — handles can change, but channel IDs don't. Once resolved at add-time, the channel is tracked by ID even if the creator rebrands.
 - Draggable channel list — reorder by priority
 - Per-channel avatars cached locally
-- Comes with two default channels to get you started — remove or add your own
+- Comes with starter channels to get you going — remove or add your own
 
 > **Note:** Each device registers independently. There's no cross-device sync — if you install TubePulse on two phones, each manages its own channel list and settings.
 
@@ -118,9 +118,9 @@ v3.3.1 fixes widget/HomeScreen feed parity so the widget uses the same latest vi
 TubePulse detects new uploads through the YouTube Data API from the production Home authority. The old RSS shard deployments remain triggerless rollback assets and are not an automatic fallback. Originally TubePulse used **WebSub** (PubSubHubbub), but Google's `pubsubhubbub.appspot.com` hub was shut down in 2024.
 
 **Active path:**
-- **Two batched channel checks every five minutes** — `channels.list` accepts at most 50 IDs per request; the current fleet therefore costs 576 general quota units/day for detection.
+- **Batched channel checks every five minutes** — `channels.list` accepts at most 50 IDs per request; the current detector uses two requests per cycle, or 576 general quota units/day.
 - **Structural discovery** — only channels with a changed public `videoCount` need `playlistItems.list`; a six-hour bounded safety pass catches count-neutral changes. `search.list` is not used.
-- **Batched engagement metrics** — `videos:batchGetStats` supplies views, likes, and comments for up to 50 videos per request from its separate statistics bucket. Only each channel's app-visible top three are eligible; polling backs off as those videos age or stay static.
+- **Batched engagement metrics** — `videos:batchGetStats` supplies views, likes, and comments for up to 50 videos per request from its separate statistics bucket. Only each channel's app-visible top three are eligible; polling backs off as those videos age or stay static. A normalized known view/like change may persist at most once per UTC hour, with immediate missing-value hydration and a 24-hour forced refresh. Comment counts are retained as durable local observations for future work, but a comment-only change never publishes to Cloudflare; the latest count may piggyback when another legitimate recent-video write is already required.
 - **Latency** — normally at most one five-minute Home cycle plus request time. Last-good feed data remains available during transient API failures.
 - **Quota guarded** — request counters persist across restart, reset at Pacific midnight, and retain configured reserves below the 10,000-unit daily limits.
 
@@ -194,18 +194,18 @@ YouTube Data API / InnerTube ──poll──▶ unified Home authority ──FC
                                       ▼          │
                               Cloudflare API Worker ─────────────▶ App
                                       │
-                                      └──durable coalesced deltas──▶ Cloudflare KV backup
+                                      └──durable coalesced deltas──▶ Cloudflare D1 backup
 
 The API Worker retains a signed, bounded RSS diagnostic route for historical
 rollback tooling, but the active Home scheduler does not call it. Legacy
 scheduled Workers remain triggerless.
 ```
 
-**Verified API route:** as of 2026-06-25, `GET /` on `https://tubepulse-api.jimothyoakley55.workers.dev` returns Cloudflare-served health JSON identifying `worker: "tubepulse-api"` and `architecture: "channel-first"`. The health JSON reports `version: "3.0.0"`; keep that separate from the app version `3.3.1`. The wrangler config comment saying no HTTP routes is stale/incomplete, so review Cloudflare settings before changing routing.
+**Verified API route:** the existing `workers.dev` URL remains the app endpoint. `GET /` returns Cloudflare-served health JSON, while authenticated feeds route to Home only when the signed authority is current and otherwise fail over to D1. Treat Worker health-schema versions as backend contract metadata, not the Android app version.
 
 **Key principle:** Channels are the unit of work. Devices are the unit of subscription.  
 Every operation asks "what's happening to this channel" first, then "who cares about this channel".  
-This inverts the old device-first approach and eliminates `KV.list()` entirely.
+This inverts the old device-first approach and removes namespace scans from scheduled discovery; the API retains a bounded compatibility prefix-list operation for token migration.
 
 **Detection paths in v3.1:**
 - **Active (videos):** Home batches active channels through `channels.list`, reconciles changed uploads playlists against a durable known-video watermark, and fans out new videos after canonical publication.
@@ -216,7 +216,7 @@ This inverts the old device-first approach and eliminates `KV.list()` entirely.
 
 ### API Worker (`tubepulse-api`)
 
-This is the current live app-facing API worker. The app client points to `https://tubepulse-api.jimothyoakley55.workers.dev`, and live `GET /` verification on 2026-06-25 returned the worker health JSON. `worker/tubepulse-api/wrangler.toml` still has a stale/incomplete route comment, so do not use that comment alone for cleanup decisions.
+This is the current live app-facing API Worker. The app client retains its existing `workers.dev` URL. The Worker coordinates Home-first authenticated operations through the Durable Object, uses the private VPC binding for Home, and selects D1 generation `production-v1` for canonical fallback.
 The central Cloudflare Worker. Handles:
 
 | Endpoint | Method | Purpose |
@@ -225,7 +225,7 @@ The central Cloudflare Worker. Handles:
 | `/subscribe-channel` | POST | Add a channel to this device. Triggers a cached Data API avatar lookup and structural uploads-playlist bootstrap when needed. |
 | `/unsubscribe` | POST | Remove a channel from this device. Removes the device from the channel's subscriber list; if the subscriber list goes empty, the channel is removed from the `channels:active` index. |
 | `/seen` | POST | Mark videos/posts as watched. `{ channelId, ids: [videoId, "post:activityId", ...] }` for taps, `{ channelId, clearAll: true }` for channel-tap. Post IDs are namespaced with `post:` so they share the `deviceState.unwatched` array with videos without collision. |
-| `/feed` | GET | Fetch current video + post data for all tracked channels. Production serves authenticated feeds from the unified Home store over VPC while current, with bounded Cloudflare-KV fallback. Each post carries an `unwatched` flag mirroring the video pattern. |
+| `/feed` | GET | Fetch current video + post data for all tracked channels. Production serves authenticated feeds from the unified Home store over VPC while current, with D1 fallback. Each post carries an `unwatched` flag mirroring the video pattern. |
 | `/resolve` | GET | Resolve `@handle` → channelId + name + avatar (YouTube Data API, key stays server-side). Result cached 7 days in `handle:{lowercase}`. |
 | `/bootstrap` | POST | Fetch channel metadata and recent uploads through the Data API structural path. |
 | `/settings` | POST | Update notification settings (full replacement). Includes `prewarnMinutes` (v3.1). |
@@ -235,8 +235,8 @@ The central Cloudflare Worker. Handles:
 
 **Per-request flow (`/subscribe-channel` example):**
 1. Look up the device profile (from `Authorization: Bearer <deviceId>`) — must exist
-2. Read channel meta from KV; if missing, fetch avatar via YouTube Data API (1 quota unit, cached forever)
-3. Read channel recent from KV; if missing, obtain the uploads playlist and fetch recent items plus batched metadata/statistics
+2. Read channel metadata through the selected canonical adapter; if missing, fetch the avatar through the YouTube Data API and cache it
+3. Read recent content through the Home/canonical path; if missing, obtain the uploads playlist and fetch recent items plus batched metadata/statistics
 4. Add `deviceId` to the channel's `subscribers` list (if not already there)
 5. Add `channelId` to the device's `channels` list (if not already there)
 6. Add `channelId` to `channels:active` (if this is the first subscriber)
@@ -250,14 +250,14 @@ Production scheduling moved to the unified local Home authority on 2026-10-04. O
 
 | Runtime | Live cadence | Work per invocation |
 |---|---|---|
-| Home video detector | Every five minutes | Two batched `channels.list` requests for the current fleet; changed/migration/safety-due uploads playlists enter the shared watermark and notification path. |
+| Home video detector | Every five minutes | Batched `channels.list` requests of at most 50 IDs; changed/migration/safety-due uploads playlists enter the shared watermark and notification path. |
 | Home posts sweep | Hourly | Polls every eligible channel with InnerTube and preserves first-poll suppression. |
 | Home aux | Every minute | Processes bounded nag/prewarn work and drains legacy upcoming buckets. |
 | `tubepulse-rss-0/1/2`, `tubepulse-posts`, `tubepulse-aux` | Disabled (`crons = []`) | Retained code/deployments for stop-Home-first rollback only. |
 
-Home publishes changed keys to `TUBEPULSE_KV` as a bounded backup while the public API serves current feeds from Home over Workers VPC. The retained scheduled-only Workers intentionally do not export `fetch()`, so opening their `workers.dev` URLs is not a valid health check.
+Home publishes changed keys to `TUBEPULSE_D1` as a bounded backup while the public API serves current feeds from Home over Workers VPC. The retained scheduled-only Workers intentionally do not export `fetch()`, so opening their `workers.dev` URLs is not a valid health check.
 
-### Data Model (Cloudflare KV) — v3.1
+### Canonical key model (D1-backed in production) — v3.1
 
 | Key Pattern | Contents |
 |-------------|----------|
@@ -275,11 +275,11 @@ Home publishes changed keys to `TUBEPULSE_KV` as a bounded backup while the publ
 | `upcoming:events:list` | Array of currently-scheduled live events: { channelId, videoId, scheduledFor, addedAt }. Pruned 24h after live. (v3.1) |
 | `upcoming:prewarn:{videoId}:{deviceId}` | Set to the prewarnMinutes value when a prewarn push has been sent for that (event, device). Cleaned when the event is pruned. (v3.1) |
 | `upcoming:{bucket}` | Pre-v3.1 only — drained by the new `runUpcomingCron` on the first tick after upgrade |
-| `nag:{bucket}` | Nag entries for a 15-min window |
+| `nag:{bucket}` | Legacy unused reminder-bucket key retained for compatibility; current nags use timestamps in device state |
 | `channels:active` | Index of all channels with at least one subscriber |
 | `handle:{lowercase}` | Cached handle→channelId resolution (7-day TTL) |
 
-**Zero `KV.list()` calls.** The `channels:active` index replaces all list operations.
+**No scheduled canonical `list()` calls.** The `channels:active` index replaces scheduler-side namespace scans. The API's bounded compatibility adapter may still use prefix listing for token migration.
 
 ### App → Server Communication
 
@@ -293,7 +293,7 @@ Home publishes changed keys to `TUBEPULSE_KV` as a bounded backup while the publ
    - Channel tap → `POST /seen { channelId, clearAll: true }`
    - Post tap (v3.1) → `POST /seen { channelId, ids: ["post:activityId"] }`, then open the channel's community tab
    - Prewarn tap (v3.1) → open the YouTube watch URL for the scheduled video. The video is NOT marked as seen on tap (the prewarn is a reminder; the live-time push will still fire later)
-7. **On feed refresh**: `GET /feed` → returns cached data from KV, merged with per-device state to compute `unwatched` flags on both videos and posts
+7. **On feed refresh**: `GET /feed` → returns cached data from Home while authority is current, otherwise from D1, merged with per-device state to compute `unwatched` flags on both videos and posts
 8. **On FCM token refresh**: `POST /register` with the new token (handled by `onTokenRefresh` in App.js)
 
 **Device identity:** Each device generates a persistent UUID on first launch. This UUID is the auth token and primary key — independent of the FCM token, which is stored as a mutable field on the device record and updated on token refresh. This avoids orphan records when FCM tokens rotate.
@@ -310,7 +310,7 @@ and reconciles due uploads playlists                 through InnerTube once per 
          ▼                                                     ▼
 Diff against channel:{id}:recent → new videoIds       Diff against channel:{id}:recent:posts
          │                                                     │
-         ├─ Type 'live_scheduled' (future publishedAt)?       │
+         ├─ Type 'live_scheduled' (future scheduledFor)?     │
          │   → append to upcoming:events:list                 │
          │   → runPrewarnCron will iterate and fire           │
          │     per-device prewarn pushes                      │
@@ -330,12 +330,12 @@ Device receives notification                        Device receives notification
          ├─ User ignores → nag cycle re-notifies              ├─ User ignores → no nag (posts don't
          │                                                     │  enter the nag cycle in v3.1)
          ▼                                                     ▼
-Nag Cycle (every 15 min, scheduled into nag:{bucket} keys)
+Home aux cycle (runs every minute; eligibility is timestamp-based)
          │
          ├─ Relentless: re-nag if nagInterval elapsed
          ├─ Chill: nudge if 4h elapsed
          ├─ DND active (no dndBypass)? → skip
-         ├─ Video seen? → drop from batch
+         ├─ Video seen? → no longer eligible
          │
          ▼
 Repeat until user watches
@@ -367,7 +367,7 @@ TubePulse/
 │   │   └── constants.js           # Colours, defaults, nag intervals, prewarn options, storage keys, preseeded channels
 │   └── App.js                     # Navigation, FCM setup, notification tap handling, init
 ├── worker/
-│   ├── README.md                  # Cloud architecture — KV schema, endpoints, cost analysis
+│   ├── README.md                  # Cloud architecture — canonical schema, endpoints, cost analysis
 │   ├── archive/
 │   │   └── tubepulse-resolver/     # Historical standalone resolver worker; reference only
 │   ├── tubepulse-api/
@@ -427,9 +427,9 @@ When `perChannelNotifications` is enabled, long-press a channel to configure:
 - Community posts opt-out (Global / On / Off, v3.1)
 - Prewarn time (Override switch + 15m/30m/1h/2h/4h/1d picker, v3.1)
 
-## Known Limitations (v3.1)
+## Known Limitations
 
-- **Posts do not enter the nag cycle.** Only the initial push fires for posts; no 4-hour reminders. Adding it would need a parallel nag bucket and FCM payload differentiation. Flagged for v3.2.
+- **Posts do not enter the nag cycle.** Only the initial push fires for posts; no 4-hour reminders. Adding it would need explicit reminder-state and FCM payload differentiation. Flagged for v3.2.
 
 ## Getting Started
 
@@ -458,20 +458,17 @@ The resulting ignored `dist/TubePulse-Preview-<version>-debug.apk` uses package 
 # Deploy API worker source (app-facing API in repo; verify live route state first)
 cd worker/tubepulse-api && npx wrangler deploy
 
-# Optional rollback-only Worker deploys (do not enable Cron Triggers while Home owns scheduling)
-for worker in tubepulse-rss-0 tubepulse-rss-1 tubepulse-rss-2 tubepulse-posts tubepulse-aux; do
-  (cd "worker/$worker" && npx wrangler deploy)
-done
 ```
 
-Before worker cleanup, note that the app's workers.dev API URL is verified reachable, while the repo wrangler comment remains stale/incomplete; review deployed Cloudflare settings before route/config changes.
+Do not deploy or activate the retained scheduled Workers during ordinary releases. They are frozen rollback assets with no Cron Triggers. Restoring them requires stopping Home first, reconciling the current D1 state into the selected rollback backend, explicitly acknowledging the frozen snapshot latch, and validating notification ownership before any trigger is enabled.
 
-For the full cloud architecture — KV schema, endpoint reference, FCM details, cost analysis, free tier budget — see **[worker/README.md](worker/README.md)**.
+For the full cloud architecture — canonical key schema, endpoint reference, FCM details, cost analysis, and D1 safety budget — see **[worker/README.md](worker/README.md)**.
 
-Required Cloudflare secrets:
+Required service secrets and bindings:
 - `YOUTUBE_API_KEY` — Home authority for active discovery/metrics/bootstrap; API Worker for handle resolution where configured
 - `FIREBASE_SERVICE_ACCOUNT` — Home authority for active FCM; retained Workers need it only during an explicit rollback
-- `TUBEPULSE_KV` — configured KV binding for the public API and triggerless rollback Workers; Home journals bounded backup deltas into it
+- `TUBEPULSE_D1` — active canonical backup/fallback binding for the public API; Home journals bounded changed-key deltas into it
+- `TUBEPULSE_KV` — frozen legacy snapshot binding retained only for an explicit quiesced rollback/reconciliation procedure
 
 ## License
 

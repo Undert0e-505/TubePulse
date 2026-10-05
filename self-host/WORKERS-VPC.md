@@ -1,6 +1,8 @@
-# Workers VPC Home canary runbook
+# Historical Workers VPC Home canary runbook
 
-This is the retained private-ingress design for the existing-app Home canary. The one-device production exercise completed on 2026-10-04, but routing is now disabled and both local services are stopped with data preserved. It uses a remotely managed Cloudflare Tunnel and a Workers VPC Service; it does **not** create a public hostname, DNS record, router port-forward, or Cloudflare Access application.
+> **Historical only:** this records the retired single-device mirror/canary exercise. Current production uses the unified Home authority in `compose.authority.yaml`, Home-first mutations/feeds, and D1 fallback as documented in `README.md`. Do not re-enable this mirror or treat its KV-first flow as a rollback procedure.
+
+The exercise used a remotely managed Cloudflare Tunnel and a Workers VPC Service without creating a public hostname, DNS record, router port-forward, or Cloudflare Access application. The network pattern remains useful context, but the ownership and storage model below is superseded.
 
 Workers VPC is currently a Cloudflare beta. Review the current [Tunnel requirements](https://developers.cloudflare.com/workers-vpc/configuration/tunnel/), [VPC Service configuration](https://developers.cloudflare.com/workers-vpc/configuration/vpc-services/), and [binding API](https://developers.cloudflare.com/workers-vpc/api/) before each rollout because names, roles, and limits may change.
 
@@ -23,7 +25,7 @@ cloudflared sidecar -- Docker DNS --> gateway-origin:8788
                                       `-- data-gateway (mirror/standby)
 ```
 
-Cloudflare remains canonical and currently continues all polling and FCM delivery. While a canary is enabled, its writes execute in Cloudflare first and are then copied to Home. Home never takes over its scheduler in this phase. If Tunnel, VPC, HMAC, freshness, or response validation fails, the Worker returns the existing Cloudflare response. This cannot provide instantaneous two-sided consistency when Cloudflare itself refuses a write.
+During this retired phase Cloudflare KV remained canonical and continued polling and FCM delivery. Canary writes executed in Cloudflare first and were then copied to Home; Home did not own scheduling. If Tunnel, VPC, HMAC, freshness, or response validation failed, the Worker returned the existing Cloudflare response. This design could not provide instantaneous two-sided consistency when Cloudflare itself refused a write.
 
 ## Fixed local layout
 
@@ -138,12 +140,10 @@ redirect mode while the separately supported public HTTPS transport retains
 
 ## Canary rollout and rollback
 
-Current production state: `TUBEPULSE_HOME_GATEWAY_ENABLED=false`; the
-`gateway-origin` and `cloudflared` containers are stopped. The preserved mirror
-contained 811 records, so its former 300-second full pull projected to 233,568
-KV key reads/day before normal API traffic. Do not restart that cadence on the
-free 100,000-read/day plan. A future run needs a bounded/delta synchronization
-budget before step 2.
+Retired-canary end state: `TUBEPULSE_HOME_GATEWAY_ENABLED=false` and its
+separate mirror store was preserved. Its former frequent full pull exceeded the
+available Workers KV read budget before normal API traffic. Do not restart that
+cadence. Current production uses Home changed-key journaling to D1 instead.
 
 1. Deploy the verified VPC binding and variables with the gateway flag still `false`; feature-off performs no extra KV read or VPC fetch.
 2. Confirm the local full pull is current and conflict-free. The Home admin reconciliation operation performs another complete pull and creates a short-lived signed receipt. With the reconcile URL configured, a clean automatic pull submits this receipt itself.
@@ -152,7 +152,7 @@ budget before step 2.
 5. Tail privacy-safe Worker logs. The canary should report `outcome=home`; non-canaries never enter the Home path. Force a brief connector interruption and verify `outcome=cloudflare-fallback` before restoring it.
 6. On any regression, immediately set `TUBEPULSE_HOME_GATEWAY_ENABLED=false` and deploy the API Worker. The VPC binding and connector may remain present while routing is disabled.
 
-The gateway writes its canary state only on stale/current transitions. It does not add polling or per-request KV writes. Home refuses signed app operations while a mirror pull is active; a canonical mutation that overlaps that pull may therefore turn the canary stale temporarily. The signed shadow request marks that snapshot as overlapped, a fresh pull proves parity, and only then may Home automatically restore `current`. A real conflict remains blocked. Do not alter RSS schedules, notification ownership, or accept Home-only mutations during this canary.
+The retired gateway wrote its canary state only on stale/current transitions. It did not add polling or per-request KV writes. Home refused signed app operations while a mirror pull was active; a canonical mutation that overlapped that pull could therefore turn the canary stale temporarily. The signed shadow request marked that snapshot as overlapped, a fresh pull proved parity, and only then could Home restore `current`. A real conflict remained blocked.
 
 The first production canary completed this sequence on 2026-10-04 before the
 route and connector were deliberately disabled. A real
@@ -175,7 +175,7 @@ schema resolver selected the Cloudflare record only after proving every other
 field and key identical. One clean pull resolved that sole conflict, signed
 reconciliation restored `current`, and two subsequent automatic pulls remained
 at zero conflicts and zero pending records. A controlled connector stop again
-returned the byte-identical eight-channel Cloudflare feed before four QUIC
+returned the byte-identical Cloudflare feed before four QUIC
 connections and Home routing recovered.
 
 ## Recovery and rotation

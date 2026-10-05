@@ -36,16 +36,19 @@ function makeCached(upload, overrides = {}) {
   };
 }
 
-// Sub-threshold metric movement must produce exactly the persisted value so KV
-// write-on-change remains stable.
+// Any known metric movement may persist in a later UTC hour, including a
+// change that was below the former percentage threshold.
 {
-  const upload = makeUpload('latest', { views: '1240', likes: '124', dislikes: '24' });
+  const upload = makeUpload('latest', { views: '1001', likes: '101', dislikes: '20' });
   const cached = makeCached(upload, { views: '1000', likes: '100', dislikes: '20' });
-  const merged = mergeRssUploadsIntoRecentVideos([cached], [upload], NOW_MS);
-  assert.deepEqual(merged, [cached]);
+  const [merged] = mergeRssUploadsIntoRecentVideos([cached], [upload], NOW_MS);
+  assert.equal(merged.views, '1001');
+  assert.equal(merged.likes, '101');
+  assert.equal(merged.viewsLastCheckedHour, CURRENT_HOUR);
+  assert.equal(merged.likesLastCheckedHour, CURRENT_HOUR);
 }
 
-// A strict greater-than-25% view change refreshes in a later UTC hour.
+// A large view change also refreshes in a later UTC hour.
 {
   const upload = makeUpload('latest', { views: '1251' });
   const cached = makeCached(upload, { views: '1000' });
@@ -65,22 +68,22 @@ function makeCached(upload, overrides = {}) {
   assert.deepEqual(merged, [cached]);
 }
 
-// The 24-hour refresh persists the current value even below the threshold.
+// The 24-hour refresh advances the clock even when the known value is unchanged.
 {
-  const upload = makeUpload('latest', { views: '1100' });
+  const upload = makeUpload('latest', { views: '1000' });
   const cached = makeCached(upload, {
     views: '1000',
     viewsLastCheckedHour: CURRENT_HOUR - 24,
   });
   const [merged] = mergeRssUploadsIntoRecentVideos([cached], [upload], NOW_MS);
-  assert.equal(merged.views, '1100');
+  assert.equal(merged.views, '1000');
   assert.equal(merged.viewsLastCheckedHour, CURRENT_HOUR);
 }
 
-// Likes/dislikes have their own clock. A >25% change in either member refreshes
+// Likes/dislikes have their own clock. A change in either member refreshes
 // the group even when views are same-hour blocked.
 {
-  const upload = makeUpload('latest', { views: '5000', likes: '126', dislikes: '21' });
+  const upload = makeUpload('latest', { views: '5000', likes: '101', dislikes: '20' });
   const cached = makeCached(upload, {
     views: '1000',
     likes: '100',
@@ -91,17 +94,38 @@ function makeCached(upload, overrides = {}) {
   const [merged] = mergeRssUploadsIntoRecentVideos([cached], [upload], NOW_MS);
   assert.equal(merged.views, '1000');
   assert.equal(merged.viewsLastCheckedHour, CURRENT_HOUR);
-  assert.equal(merged.likes, '126');
-  assert.equal(merged.dislikes, '21');
+  assert.equal(merged.likes, '101');
+  assert.equal(merged.dislikes, '20');
   assert.equal(merged.likesLastCheckedHour, CURRENT_HOUR);
 }
 
-// Exactly 25% is not beyond the threshold for either engagement metric.
+// Numerically equivalent decimal strings do not cause a write.
 {
-  const upload = makeUpload('latest', { likes: '125', dislikes: '25' });
-  const cached = makeCached(upload, { likes: '100', dislikes: '20' });
+  const upload = makeUpload('latest', { views: '01000', likes: '0100', dislikes: '020' });
+  const cached = makeCached(upload, { views: '1000', likes: '100', dislikes: '20' });
   const merged = mergeRssUploadsIntoRecentVideos([cached], [upload], NOW_MS);
   assert.deepEqual(merged, [cached]);
+}
+
+// A known nonzero value may transition to an explicit public zero in a later
+// UTC hour, while an unavailable incoming value preserves the known count.
+{
+  const zeroUpload = makeUpload('zero-transition', { views: '0', likes: '0', dislikes: null });
+  const cached = makeCached(zeroUpload, { views: '1', likes: '1', dislikes: null });
+  const [zeroed] = mergeRssUploadsIntoRecentVideos([cached], [zeroUpload], NOW_MS);
+  assert.equal(zeroed.views, '0');
+  assert.equal(zeroed.likes, '0');
+  const repeatedZero = makeUpload('zero-transition', { views: '0', likes: '0', dislikes: null });
+  assert.deepEqual(
+    mergeRssUploadsIntoRecentVideos([zeroed], [repeatedZero], NOW_MS + HOUR_MS),
+    [zeroed],
+  );
+  const hiddenUpload = makeUpload('hidden-known', { views: null, likes: null, dislikes: null });
+  const known = makeCached(hiddenUpload, { views: '7', likes: '3', dislikes: null });
+  assert.deepEqual(
+    mergeRssUploadsIntoRecentVideos([known], [hiddenUpload], NOW_MS),
+    [known],
+  );
 }
 
 // The app-visible top three may refresh metrics; entries outside the visible
@@ -204,6 +228,41 @@ function makeCached(upload, overrides = {}) {
   assert.equal(healed.likes, null);
   assert.equal(healed.dislikes, null);
   assert.equal(healed.likesLastCheckedHour, CURRENT_HOUR);
+}
+
+// Comment observations are local-only unless another canonical mutation is
+// already due. Even a large comment movement and stale comment clock alone
+// must leave the recent-video value byte-for-byte stable.
+{
+  const upload = makeUpload('comment-only', {
+    views: '100', likes: '10', dislikes: null, comments: '99',
+  });
+  const cached = makeCached(upload, {
+    comments: '3',
+    viewsLastCheckedHour: CURRENT_HOUR,
+    likesLastCheckedHour: CURRENT_HOUR,
+    commentsLastCheckedHour: CURRENT_HOUR - 48,
+  });
+  const merged = mergeRssUploadsIntoRecentVideos([cached], [upload], NOW_MS);
+  assert.deepEqual(merged, [cached]);
+}
+
+// When views already justify the canonical write, the latest comment count
+// and clock piggyback on the same record without adding another KV mutation.
+{
+  const upload = makeUpload('comment-piggyback', {
+    views: '200', likes: '10', dislikes: null, comments: '0',
+  });
+  const cached = makeCached(upload, {
+    views: '100', comments: '9',
+    viewsLastCheckedHour: CURRENT_HOUR - 1,
+    likesLastCheckedHour: CURRENT_HOUR,
+    commentsLastCheckedHour: CURRENT_HOUR - 1,
+  });
+  const [merged] = mergeRssUploadsIntoRecentVideos([cached], [upload], NOW_MS);
+  assert.equal(merged.views, '200');
+  assert.equal(merged.comments, '0');
+  assert.equal(merged.commentsLastCheckedHour, CURRENT_HOUR);
 }
 
 // Some legacy zeros may already have acquired a clock from an older cron

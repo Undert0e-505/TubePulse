@@ -40,6 +40,7 @@ import {
   normalizeYoutubeDataApiState,
   selectDueMetricVideos,
   pruneMetricPollToVisibleVideos,
+  updateMetricPollObservation,
 } from './youtube-data-api.mjs';
 
 const FIVE_MINUTES_MS = 5 * 60 * 1000;
@@ -1089,13 +1090,12 @@ export class HomeSchedulerRunner {
     for (const entry of due) {
       const metrics = allStatistics.get(entry.video.videoId);
       if (!metrics) continue;
-      const signature = stableJson(metrics);
       const previous = health.metricPoll[entry.video.videoId] || {};
-      health.metricPoll[entry.video.videoId] = {
-        lastPolledAt: iso(scheduledTime),
-        lastObserved: signature,
-        staticStreak: previous.lastObserved === signature ? Number(previous.staticStreak || 0) + 1 : 0,
-      };
+      health.metricPoll[entry.video.videoId] = updateMetricPollObservation(
+        previous,
+        metrics,
+        scheduledTime,
+      );
     }
     health.metricPoll = pruneMetricPollToVisibleVideos(health.metricPoll, channelRecents);
     health.lastGoodAt = iso(this.now());

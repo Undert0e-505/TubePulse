@@ -13,5 +13,8 @@ crons = []
 [observability]
 enabled = true
 
+[vars]
+TUBEPULSE_ENABLE_FROZEN_KV_ROLLBACK = "false"
+
 # Secrets (set via wrangler secret put):
 # - FIREBASE_SERVICE_ACCOUNT

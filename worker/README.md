@@ -1,20 +1,20 @@
 # TubePulse — Cloud Services
 
-This document describes the TubePulse backend: the HTTP API Worker, the active unified Home authority, five retained scheduled Worker deployments, the shared Cloudflare KV backup, YouTube integrations, and Firebase Cloud Messaging. For the current endpoint, trigger, KV, notification, and deployment inventory, start with [CONTRACTS.md](CONTRACTS.md). The Android app is documented separately in the project root README.
+This document describes the TubePulse backend: the HTTP API Worker, the active unified Home authority, five retained scheduled Worker deployments, the Cloudflare D1 canonical backup/fallback, YouTube integrations, and Firebase Cloud Messaging. For the current endpoint, trigger, storage, notification, and deployment inventory, start with [CONTRACTS.md](CONTRACTS.md). The Android app is documented separately in the project root README.
 
 The [self-host runtime](../self-host/README.md) executes these same source files through a local workerd-backed runtime with persistent KV. Its Preview and shadow profiles remain additive; the separately guarded unified Home authority is now the production scheduler and fresh feed authority.
 
-`tubepulse-api` retains the former one-device canary wrapper only for history and tests. Production routes every authenticated `GET /feed` to the unified Home store over `TUBEPULSE_HOME_VPC` while replication is current, with bounded Cloudflare-KV fallback. The seven authenticated app mutations are Home-first: the Worker holds the Durable Object global lease, Home runs the unchanged raw API handler against a buffered local KV view, and only a successful semantic response is committed locally. The Worker then durably coalesces the exact deltas in the coordinator's pending Cloudflare-backup queue without reading or writing Cloudflare KV on that request.
+`tubepulse-api` retains the former one-device canary wrapper only for history and tests. Production routes every authenticated `GET /feed` to the unified Home store over `TUBEPULSE_HOME_VPC` while replication is current, with D1 fallback. The seven authenticated app mutations are Home-first: the Worker holds the Durable Object global lease, Home runs the unchanged raw API handler against a buffered local KV view, and only a successful semantic response is committed locally. The Worker then durably coalesces the exact deltas in the coordinator's pending D1-backup queue without requiring a canonical cloud read on that request.
 
-`self-host/compose.authority.yaml` is the production successor to the earlier scheduler shadow. One local runtime/store combines signed all-device mutation execution and scheduled work, publishes exact changed-key journals through a SQLite Durable Object coordinator, and serves all authenticated feeds over Workers VPC while current. It performs no periodic full pull. The coordinator caps scheduler backup publication at 900 writes/day and total coordinated writes at 950/day, leaving a 50-write app reserve; deferred keys are coalesced and later drained by the existing publication path. App mutations no longer depend on Cloudflare KV read availability. Semantic `4xx`/`5xx` responses discard the buffered overlay, Home transport failures fail closed, and deferred scheduler batches still suppress FCM. WebSub is acknowledged but suppressed while authority traffic owns detection. Production switched on 2026-10-04 after an exact 721-record seed; RSS0/1/2, posts, and aux deployments are retained but all five Cron Trigger lists are empty.
+`self-host/compose.authority.yaml` is the production successor to the earlier scheduler shadow. One local runtime/store combines signed all-device mutation execution and scheduled work, publishes exact changed-key journals through a SQLite Durable Object coordinator, and serves all authenticated feeds over Workers VPC while current. It performs no periodic full pull. D1 commits are atomic and content-hash guarded. The coordinator conservatively caps scheduler publication at 45,000 estimated rows/day and total coordinated D1 writes at 50,000 estimated rows/day, leaving a 5,000-row app reserve; deferred keys are coalesced and later drained by the existing publication path. App mutations no longer depend on cloud canonical read availability. Semantic `4xx`/`5xx` responses discard the buffered overlay, Home transport failures fail closed, and deferred scheduler batches still suppress FCM. WebSub is acknowledged but suppressed while authority traffic owns detection. RSS0/1/2, posts, and aux deployments are retained but all five Cron Trigger lists are empty and their handlers require an explicit frozen-KV rollback latch.
 
-The current app-facing Worker deployment is version `fa626e36-e02d-4532-98e6-eb83ba6c22b3`. Deployment authentication is intentionally external to the repository.
+The current app-facing Worker deployment is version `23a053f8-e258-4ce4-b460-46965c335a5f`. Deployment authentication is intentionally external to the repository.
 
 ---
 
 ## 1. High-level architecture
 
-Current production traffic keeps the existing app URL: `tubepulse-api` coordinates mutations and forwards authenticated feeds through private VPC to the unified Home authority. Cloudflare KV is the bounded fallback/backup, and the five scheduled Worker deployments below are triggerless rollback artifacts.
+Current production traffic keeps the existing app URL: `tubepulse-api` coordinates mutations and forwards authenticated feeds through private VPC to the unified Home authority. Cloudflare D1 is the canonical fallback/backup, and the five scheduled Worker deployments below are triggerless rollback artifacts.
 
 ```
                                                 ┌─────────────────────────────┐
@@ -31,7 +31,7 @@ Current production traffic keeps the existing app URL: `tubepulse-api` coordinat
                                      │
                                      ▼
                             ┌─────────────────┐
-                            │ Cloudflare KV   │
+                            │ Cloudflare D1   │
                             │ bounded backup  │
                             └─────────────────┘
                                        ▲
@@ -43,21 +43,22 @@ Current production traffic keeps the existing app URL: `tubepulse-api` coordinat
                             └─────────────────────┘
 ```
 
-**One public API Worker, one active unified Home authority, five triggerless rollback Workers, one KV backup namespace, one Firebase project.**
+**One public API Worker, one active unified Home authority, five triggerless rollback Workers, one D1 canonical database, one frozen legacy KV snapshot, one Firebase project.**
 
 | Component | Repo path/config | Purpose | Route/deploy evidence |
 |-----------|------------------|---------|-----------------------|
-| `tubepulse-api` | `worker/tubepulse-api/` | Current live app-facing API worker source + dormant WebSub callback | `GET /` at `https://tubepulse-api.jimothyoakley55.workers.dev` returned Cloudflare-served health JSON on 2026-06-25. Wrangler route comments are stale/incomplete. |
+| `tubepulse-api` | `worker/tubepulse-api/` | Current live app-facing API worker source + dormant WebSub callback | The unchanged `workers.dev` endpoint was verified after the D1 cutover; authenticated feeds route Home-first with D1 fallback. |
 | `tubepulse-rss-0/1/2` | `worker/tubepulse-rss-{0,1,2}/` | Retained time-derived RSS shards | No Cron Triggers; rollback cadence is five minutes. |
 | `tubepulse-posts` | `worker/tubepulse-posts/` | Retained rotating community-post poller | No Cron Trigger; rollback wrapper cadence is one minute. |
 | `tubepulse-aux` | `worker/tubepulse-aux/` | Retained bounded nag/prewarn processing | No Cron Trigger; rollback cadence is one minute. |
 | `tubepulse-cron` | `worker/tubepulse-cron/` | Retired compatibility stub | Deliberate no-op with `triggers.crons = []`; do not deploy it as the active scheduler. |
 | `tubepulse-resolver` | `worker/archive/tubepulse-resolver/` | Historical standalone resolver worker | Archived for reference only; do not deploy unless deliberately restoring historical resolver behaviour. |
-| `TUBEPULSE_KV` | KV namespace `52e77ca9f5f6493e89d2478c8d3055ec` | Bounded canonical backup/fallback state | Shared by the API and five triggerless rollback Workers; Home is the current primary store. |
+| `TUBEPULSE_D1` | D1 database `tubepulse-canonical` | Active canonical backup/fallback state | Bound only to the API Worker; Home is the current primary store. |
+| `TUBEPULSE_KV` | Legacy Workers KV namespace | Frozen point-in-time snapshot | Never selected automatically; retained Workers require explicit stale-snapshot acknowledgement. |
 
-> **Verified route:** on 2026-06-25, `GET /` at the app API URL returned `200 OK` with `{"status":"ok","version":"3.0.0","worker":"tubepulse-api","architecture":"channel-first"}`. The health `version` is an API worker label and appears stale or independent from the app release version `3.3.3`. `worker/tubepulse-api/wrangler.toml` has no explicit route setting and still contains a stale/incomplete "No HTTP routes" comment.
+> **Verified route:** after the 2026-10-05 D1 cutover, the unchanged app API URL returned Cloudflare-served health and authenticated feeds routed Home-first while authority was current. The health `version` is an API contract label independent from the Android release version. Wrangler intentionally commits no custom route; the existing `workers.dev` endpoint remains enabled.
 
-The API Worker and retained rollback Workers share the **same KV namespace**. Current scheduled state is owned by Home and journaled into that namespace as a bounded backup; live authenticated feeds normally come from Home over VPC.
+The API Worker selects D1 through an explicit backend identity and generation. Current scheduled state is owned by Home and journaled into D1 as a bounded backup; live authenticated feeds normally come from Home over VPC. The retained Workers still bind the frozen legacy KV namespace, but default to a no-op unless `TUBEPULSE_ENABLE_FROZEN_KV_ROLLBACK=true` is deliberately set after a quiesced reconciliation.
 
 ---
 
@@ -69,7 +70,7 @@ The retained scheduled Workers have no `fetch()` handler. They are currently tri
 - **Free-tier CPU bounds on rollback** — each invocation performs one RSS/post channel or a bounded aux batch rather than one large combined scan.
 - **Independent rollback deployment** — RSS, posts, aux, and API changes can be deployed separately.
 
-If deliberately re-enabled after Home has stopped and drained, these Workers use the same Cloudflare KV namespace. They are not part of normal production scheduling.
+If deliberately re-enabled after Home has stopped and drained, these Workers use the frozen Cloudflare KV snapshot. They must not be activated after D1 has advanced until an exact quiesced reconciliation has made that snapshot current; the explicit latch documents that risk. They are not part of normal production scheduling.
 
 ---
 
@@ -105,10 +106,10 @@ Playlist items provide structural upload identity and publication data. Batched 
 **Flow for each five-minute cycle:**
 
 1. Read, sort, and de-duplicate `channels:active`.
-2. Call `channels.list` in batches of at most 50 IDs. The current fleet fits in exactly two requests per cycle.
+2. Call `channels.list` in batches of at most 50 IDs. Production currently uses two requests per cycle.
 3. Reconcile a channel's cached uploads playlist when its baseline is missing, public `videoCount` changed, or its staggered six-hour safety check is due. A one-time migration marker ensures capturing a count baseline cannot suppress catch-up.
 4. Compare playlist IDs against the durable known/high-watermark state, fetch missing detail in 50-ID batches, and pass results through the existing recent/scheduled/live/notification path. New channels seed silently; established channels retain their watermark.
-5. Poll due video metrics adaptively in 50-ID batches for only each channel's current app-visible top three, and persist canonical metric changes only under the existing 25%-or-24-hour throttle.
+5. Poll due video metrics adaptively in 50-ID batches for only each channel's current app-visible top three. Persist any normalized known view/like change at most once per UTC hour, hydrate missing values immediately, and force unchanged values fresh after 24 hours. Home keeps comment observations locally; comments may piggyback on an already-required canonical write but never trigger one.
 
 **Normal detector quota cost: 576 general units/day.** Two one-unit `channels.list` calls every five minutes yield `2 × 288 = 576`. A six-hour first-page safety sweep adds up to `active channels × 4` general units/day; changed-channel playlist/detail calls are event-driven. `videos:batchGetStats` uses the separately accounted statistics bucket. Request counters persist across restart, reset at Pacific midnight, and enforce reserves. There is no active RSS fallback.
 
@@ -130,13 +131,13 @@ For each new video, the cron does the standard fan-out (which is identical to wh
 
 `worker/tubepulse-api/index.js` - app-facing API worker source. Line counts in older notes may be stale; check the file directly when needed.
 
-**Route status verified.** The API worker source has a `fetch(request, env, ctx)` entry point and app-facing routes. The app client hardcodes `https://tubepulse-api.jimothyoakley55.workers.dev`, and live `GET /` verification on 2026-06-25 returned the worker health JSON. The wrangler route comment is stale/incomplete; review deployed Cloudflare settings before changing route config.
+**Route status verified.** The API worker source has a `fetch(request, env, ctx)` entry point and app-facing routes. The app client keeps the existing `workers.dev` endpoint unless a build-time override is supplied. Live verification after the D1 cutover returned Worker health and a Home-routed authenticated feed; review deployed Cloudflare settings before changing route ownership.
 
 ### 4.1 Endpoint map
 
 | Method | Path | Auth | Purpose |
 |--------|------|------|---------|
-| `GET`  | `/` | none | Health check (inlined — verified live on 2026-06-25 as `{ status: 'ok', version: '3.0.0', worker: 'tubepulse-api', architecture: 'channel-first' }`). The `version` field is a worker health label and appears stale/independent from the app release version. |
+| `GET`  | `/` | none | Health check returning the Worker status/contract label. The health `version` is independent from the Android app release version. |
 | `POST` | `/register` | Bearer | `handleRegister` — create/update device profile (FCM token optional). Two-phase deviceId migration for cross-version upgrades (see §11.1). |
 | `POST` | `/subscribe-channel` | Bearer | `handleSubscribeChannel` — add a channel, fetch cached metadata if needed, and bootstrap recent uploads through `channels.list` → uploads playlist → `playlistItems.list` |
 | `POST` | `/unsubscribe` | Bearer | `handleUnsubscribe` — remove a channel and subscriber state; the final subscriber removes it from `channels:active`, stops polling, cleans display caches, and retains the known-video watermark for safe resubscribe |
@@ -171,7 +172,9 @@ The WebSub handlers are intact but unused since 2024 (Google's hub was shut down
 
 ---
 
-## 5. KV schema (the only persistent state)
+## 5. Canonical key/value schema
+
+Home keeps the current working copy in its persistent local store. D1 generation `production-v1` is the active coordinated cloud backup/fallback for the same logical keys. The legacy Workers KV namespace is frozen and is not part of normal reads or writes.
 
 `worker/tubepulse-api/index.js` - app-facing API worker source. Line counts in older notes may be stale; check the file directly when needed.
 
@@ -181,7 +184,7 @@ The WebSub handlers are intact but unused since 2024 (Google's hub was shut down
 | `channel:{channelId}:subscribers` | JSON array | `[deviceId, ...]` | API (subscribe, unsubscribe) | Home (FCM fan-out), API (unsubscribe cleanup) |
 | `channel:{channelId}:websub` | JSON | `{ leaseExpiresAt, hmacSecret, lastVerified }` | API (subscribe, dormant) | (none — never used) |
 | `channel:{channelId}:recent` | JSON array | `[{ videoId, title, publishedAt, thumbnail, type, link, views, likes, comments, dislikes, viewsLastCheckedHour?, likesLastCheckedHour? }]` — metrics are decimal strings when known and `null` when hidden/unavailable; persistence clocks gate canonical metric writes | Home Data API scheduler | API (feed, bootstrap), API (subscribe for first-time populate) |
-| `channel:{channelId}:recent:posts` | JSON array | `[{ activityId, kind, text, thumbnail, link, publishedAt, fetchedAt, likeCount, viewCount }, ...]`; engagement observations use the same 25%/hour-or-24-hour persistence throttle | Home posts sweep | API (feed) |
+| `channel:{channelId}:recent:posts` | JSON array | `[{ activityId, kind, text, thumbnail, link, publishedAt, fetchedAt, likeCount, viewCount }, ...]`; normalized known engagement changes persist at most once per UTC hour, with hydration and a 24-hour forced refresh | Home posts sweep | API (feed) |
 | `channel:{channelId}:firstPollAt:posts` | string | ISO timestamp of the first posts sweep for this channel — drives the first-run guard (**v3.1**) | Home posts sweep | Home posts sweep |
 | `device:{deviceId}:profile` | JSON | `{ fcmToken, platform, appVersion, createdAt, lastSeenAt }` | API (register) | API (any auth call), Home (FCM fan-out) |
 | `device:{deviceId}:settings` | JSON | `{ mode, nagInterval, dndEnabled, dndStart, dndEnd, dndTimezone, dndBypass, tapAction, includeCommunityPosts (v3.1), prewarnMinutes (v3.1), ... }` | API (settings) | Home (FCM fan-out filter) |
@@ -213,7 +216,7 @@ The nag system sends repeat reminder push notifications while items remain unrea
 1. Iterate `channels:active` → `channel:{id}:subscribers` → `device:{id}:state:{channelId}`
 2. For each subscriber with `unwatched.length > 0`, check `now - state.lastNagAt >= intervalMs`
 3. If enough time has passed, send an FCM nag push and update `state.lastNagAt` + `state.nagCount`
-4. If not enough time has passed, skip (no push, no KV write)
+4. If not enough time has passed, skip (no push, no canonical publication)
 
 **Interval calculation (`getNagIntervalMs`):**
 
@@ -226,7 +229,7 @@ The nag system sends repeat reminder push notifications while items remain unrea
 | Relentless | 120 min | 120 min |
 | Chill | any | 4 hours |
 
-**Backoff rationale:** Relentless 5-minute mode would burn KV writes (12 nags/hour per device/channel) if sustained indefinitely. After the first hour (12 nags), the interval backs off to 15 minutes (4 nags/hour), a 67% reduction.
+**Backoff rationale:** Relentless 5-minute mode would create frequent notification-state publications if sustained indefinitely. After the first hour, the interval backs off to 15 minutes, substantially reducing reminder and persistence churn.
 
 **nagCount lifecycle:**
 - `nagCount` counts only reminder nags (the initial new-video push does NOT increment it)
@@ -323,12 +326,12 @@ Different channels don't collide (channel-specific tags). A dismissed notificati
 
 ### 5.5 Worker free-tier cautions
 
-KV writes are the primary budget concern. The free tier allows 1,000 writes/day (Cloudflare plan-dependent).
+D1 rows written are the primary cloud-storage budget concern. The free plan allows 100,000 rows written per UTC day (Cloudflare plan-dependent).
 
-- Each successful nag writes `device:state` (1 KV write per device/channel per nag)
+- Each successful nag changes `device:state` (one logical canonical mutation; D1 guard/application/cleanup rows are budgeted conservatively)
 - Relentless 5-min with persistent unread items: 12 writes in the first hour, then 4 writes/hour after backoff — a 67% reduction
 - Multiple test devices on 5-min relentless with uncleared items can accumulate writes quickly
-- Monitor at: `https://dash.cloudflare.com/<account_id>/storage/kv`
+- Monitor at: `https://dash.cloudflare.com/<account_id>/workers/d1`
 - Do not leave several test devices on 5-min relentless indefinitely
 
 ---
@@ -341,13 +344,13 @@ KV writes are the primary budget concern. The free tier allows 1,000 writes/day 
 |-----------|-------------|------|
 | `/resolve` (`channels.list?part=snippet&forHandle=...`) | 1 unit | Per unique handle, cached 7 days |
 | `handle:*` cache hit | 0 units | Subsequent lookups for the same handle |
-| Home detector — `channels.list` | **576 general units/day** | Current fleet = 2 batched calls every 5 minutes = `2 × 288` |
+| Home detector — `channels.list` | **576 general units/day** | Production detector = 2 batched calls every 5 minutes = `2 × 288` |
 | Six-hour uploads safety sweep | **up to `active channels × 4` general units/day** | One first-page `playlistItems.list` per channel, four times/day; staggered and bounded |
 | Changed/migration uploads reconciliation | 1+ general units/channel/event | First playlist page, with pagination only until known overlap or the configured three-page bound |
 | New-video metadata | 1 general unit per 50 IDs | Event-driven `videos.list`; requested only where playlist data is insufficient |
 | Adaptive engagement metrics | 1 statistics unit per 50 IDs | `videos:batchGetStats`; only each channel's current top three are eligible, with the newest remaining frequent |
 | Community posts | 0 units | InnerTube `youtubei/v1/browse` is not a YouTube Data API request |
-| **Normal general baseline** | **576 + (`active channels × 4`) units/day plus events** | Detector plus bounded safety; comfortably below the configured 10,000-unit cap and reserve for the current fleet |
+| **Normal general baseline** | **576 + (`active channels × 4`) units/day plus events** | Detector plus bounded safety; comfortably below the configured 10,000-unit cap and reserve |
 
 Every request, including a failed request, is reserved in persisted Pacific-day accounting before it is issued. Detector work has priority; safety pagination, metadata, and old-video metrics are deferrable. Partial-response `fields` reduce payload, not quota units. RSS consumes no quota because it is not called by the active scheduler.
 
@@ -359,14 +362,15 @@ Every request, including a failed request, is reserved in persisted Pacific-day 
 | RSS/posts/aux scheduled Workers | **0** | N/A | Cron Triggers disabled; rollback only |
 | `tubepulse-api` (HTTP) | ~20-50 | ~5ms | Depends on app open frequency and action count |
 
-### 6.3 Cloudflare KV (free tier: 100K reads, 1K writes, 1K list, 1GB storage)
+### 6.3 Cloudflare D1 (free tier: 5M rows read/day, 100K rows written/day)
 
-**Reads per day depend on fleet and app use:**
-- Home scheduled work reads persistent local KV. It does not perform routine Cloudflare KV reads.
-- API (per app open): 4 `channel:{id}:*` reads × 4 channels = 16 reads × 20 opens = **320 reads/day**
-- Production app mutations execute Home-first; successful changed keys are later coalesced into the bounded Cloudflare backup journal.
+Home scheduled work reads persistent local KV. The API reads D1 only when Home is unavailable or stale, and correctness-sensitive reads use the direct binding's primary database; read replication is disabled. Production app mutations execute Home-first; successful changed keys are later coalesced into the bounded D1 backup journal.
 
-**Writes are workload-dependent.** New uploads, notification state, app activity, subscription changes, cleanup, posts, aux work, and throttled metric changes share the backup namespace. The coordinator caps scheduler publication at 900 writes/day and total coordinated publication at 950/day, leaving a 50-write app reserve; deferred keys coalesce. Any source-specific daily total remains a projection until measured.
+**Rows written are workload-dependent.** New uploads, notification state, app activity, subscription changes, cleanup, posts, aux work, and throttled metric changes share the canonical table. The coordinator reserves three estimated rows per logical mutation (guard insert, canonical row mutation, guard cleanup), caps scheduler publication at 45,000 estimated rows/day and total coordinated writes at 50,000 estimated rows/day, and leaves a 5,000-row app reserve. This deliberately keeps at least half the free daily allowance outside the coordinator budget for accounting uncertainty and operational headroom. D1 `batch()` makes a multi-key commit atomic and reduces round trips; it does not reduce per-row billing. Deferred keys coalesce.
+
+The generic schema has no secondary indexes: `canonical_records` uses a `(generation, key)` primary key, `canonical_backend` records the active manifest, and a short-lived guard table enforces content-hash preconditions. Values over 1.9 MB are rejected before publication, below D1's 2 MB row/value boundary.
+
+### 6.3.1 Historical KV evidence (superseded by D1)
 
 Predeployment evidence supplied from Cloudflare adaptive analytics on 2026-09-20 (approximate and potentially delayed):
 
@@ -375,26 +379,27 @@ Predeployment evidence supplied from Cloudflare adaptive analytics on 2026-09-20
 - Before the five-minute cron change, RSS ran about **5 invocations per worker per 5 minutes** and the shared namespace recorded about **6–14 writes per 5 minutes**.
 - After the cron-only change, RSS ran about **1 invocation per worker per 5 minutes** and the shared namespace recorded about **1–2 writes per 5 minutes**.
 
-Those observations motivated the persistence-code fix below. They are not measurements of the corrected code; the initial postdeployment observation is recorded in §6.5. Namespace totals also include API, posts, and aux writes.
+Those observations motivated the persistence-code fix and later D1 migration. They are historical Workers KV measurements, not D1 projections.
 
-**Scheduled `KV.list()` calls: 0 in the current code.** The `channels:active` index replaces scheduler-side namespace scans. The API `/register` path intentionally uses `KV.list({ prefix: 'device:' })` for FCM-token migration; see [CONTRACTS.md](CONTRACTS.md).
+**Scheduled canonical `list()` calls: 0 in the current code.** The `channels:active` index replaces scheduler-side namespace scans. The API `/register` path intentionally uses the compatibility adapter's prefix list for FCM-token migration; see [CONTRACTS.md](CONTRACTS.md).
 
-**Deletes per day (cleanup):** dead-device cleanup is event-driven, not scheduled — it only fires when FCM reports a token as `UNREGISTERED`. Steady-state cost is ~0 deletes/day. A single cleanup of a device subscribed to N channels costs roughly `1 + 5N + 3N` KV ops (1 read of `device:{id}:channels` + N reads + N writes of subscriber lists + 3 + 2N deletes). In practice this is one user uninstalling every few months, well under free tier. See §11.
+**Deletes (cleanup):** dead-device cleanup is event-driven, not scheduled — it only fires when FCM reports a token as `UNREGISTERED`. Each changed/deleted key enters the same D1 row budget and atomic journal. See §11.
 
-### 6.4 Engagement-metric write throttle (since v3.0.18, refined v3.1, threshold raised 2026-09-20)
+### 6.4 Engagement-metric hourly write gate (since v3.0.18, refined 2026-10-05)
 
-The 25% rule was ineffective in the predeployment shard code. After conditionally refreshing the cached latest entry, each shard rebuilt the recent array with fresh RSS metrics for every entry. Whole-array change detection therefore persisted routine view/like movement anyway. The likes/dislikes gate also used `viewsLastCheckedHour` instead of an independent likes clock.
+Historical context: the 25% rule introduced during the RSS era was initially ineffective because each shard rebuilt the recent array with fresh metrics for every entry. Whole-array change detection therefore persisted routine movement anyway. The likes/dislikes gate also used `viewsLastCheckedHour` instead of an independent likes clock. That implementation defect was corrected before the current hourly policy replaced the percentage threshold.
 
-Current policy (updated 2026-09-20):
+Current policy (updated 2026-10-05):
 
 - Existing cached videos preserve `views`, `likes`, and `dislikes`; videos below the app-visible top three do not receive further metric observations or persistence-clock state.
 - The current top three existing videos are eligible for a metric refresh. A deletion/private transition promotes the new third item immediately without changing durable known-video dedupe history.
 - Views use `viewsLastCheckedHour`; likes/dislikes use `likesLastCheckedHour` as an independent group clock.
-- Each group can refresh at most once per UTC hour and only when a metric changes by **strictly more than 25%**, or when that group has not been persisted for at least 24 hours.
-- New entries seed current API metrics and both clocks. Missing or hidden metrics remain `null`; explicit zero remains zero. Missing legacy clocks are migrated with one refresh. Older synthetic zeros are also repaired once from the current API value even if an earlier worker already assigned them a clock; normal threshold gating resumes immediately afterward.
+- Each group can refresh at most once per UTC hour when any normalized known metric changes. Numerically equivalent decimal strings do not create writes. An unchanged known group is forced fresh when it has not been persisted for at least 24 hours.
+- New entries seed current API metrics and both clocks. Missing or hidden metrics remain `null`; explicit zero remains zero. Missing legacy clocks are migrated with one refresh. Older synthetic zeros are also repaired once from the current API value even if an earlier worker already assigned them a clock; normal hourly gating resumes immediately afterward.
 - Current uploads-playlist order, structural edits, additions/restorations, and removals are still persisted.
+- `commentCount` remains requested and parsed for each eligible statistics response. Home stores the latest known/null count and observation timestamp in durable local metric state. Comment movement is excluded from adaptive activity cadence and cannot independently dirty `channel:{id}:recent`; when structure or an allowed view/like update already requires that cache write, the latest comment count may piggyback at no additional canonical-publication cost.
 
-Community-post engagement uses the same strict greater-than-25%, once-per-UTC-hour, or 24-hour forced refresh policy, with `fetchedAt` as its persisted observation clock. Missing metrics hydrate once; rotating thumbnail signatures and stable relative-time churn remain no-ops. The policy reduces metric-driven writes regardless of discovery source. The dated shared-namespace observation below is historical RSS-era evidence and is not a guaranteed daily write count.
+Community-post engagement uses the same any-known-change, once-per-UTC-hour, or 24-hour forced refresh policy, with `fetchedAt` as its persisted observation clock. Missing metrics hydrate once; rotating thumbnail signatures, stable relative-time churn, and same-hour metric movement remain no-ops. The dated shared-namespace observation below is historical RSS-era evidence and is not a guaranteed daily write count.
 
 ### 6.5 Historical RSS deployment observation (2026-09-20)
 
@@ -458,9 +463,9 @@ No API, posts, aux, or retired cron worker was deployed, and production KV was n
 
 ## 7. Firebase Cloud Messaging (FCM)
 
-The API and scheduled workers use FCM v1 HTTP API for notification fan-out.
+The active Home authority uses FCM v1 for notification fan-out through the shared helper. The API's dormant WebSub path and retained scheduled Workers contain the same helper for compatibility/rollback, but they are not active notification owners.
 
-**Required secret:** `FIREBASE_SERVICE_ACCOUNT` (JSON blob stored in Cloudflare Workers secret manager). This is the Firebase service account key — `secrets/fcm-service-account.json` in the local repo (gitignored).
+**Required secret:** `FIREBASE_SERVICE_ACCOUNT`. Production Home reads the mounted, ignored service-account file. Cloudflare Worker copies are needed only for a deliberately reconciled rollback or dormant-path test; never commit the JSON.
 
 **How a push is sent:**
 
@@ -499,11 +504,25 @@ source ../../secrets/load-secrets.sh   # sets CLOUDFLARE_* and YOUTUBE_API_KEY
 npx wrangler dev                       # starts local miniflare on port 8787
 ```
 
-The local miniflare has its own KV simulator. The state is cached in `worker/*/.wrangler/state/v3/kv/...` — gitignored.
+Wrangler uses isolated local simulators for KV and D1. Their `.wrangler/` state is gitignored and is never a production seed.
 
 **Secrets permissions:** the `secrets/` directory contains live credentials. The whole directory is gitignored (see `.gitignore` line 23), so perms are not enforced by git. After copying or creating the files, run `chmod 600 secrets/*.env secrets/*.json` and `chmod 700 secrets/*.sh` to make them private to your user. On Windows-native or NTFS-mounted filesystems (e.g. `/mnt/d/...` in WSL) the POSIX mode bits are ignored — security is then controlled by Windows ACLs.
 
-### 8.2 Deploying rollback Workers
+### 8.2 D1 schema and canonical cutover
+
+`worker/tubepulse-api/migrations/0001_canonical_store.sql` is idempotent. Provision the `tubepulse-canonical` database with a Western Europe location hint, keep read replication disabled, set its binding ID in `wrangler.toml`, and apply the migration before deploying the Worker. A safe production cutover is:
+
+1. Build the new Home image while the active authority continues running.
+2. Stop and drain Home so the local file lease is released and no canonical mutation can overlap the snapshot.
+3. Deploy `tubepulse-api` with `TUBEPULSE_CANONICAL_BACKEND=d1` and a fresh explicit generation. The Worker fails fallback reads and mutations closed until that generation is activated.
+4. Run `node src/home-authority-cli.mjs migrate-d1` in a one-off authority container. It exports the exact local canonical snapshot, stages bounded chunks, verifies the D1 manifest, activates the generation, rebuilds Durable Object baselines, and only then archives/clears obsolete KV-pending state.
+5. Restart Home, verify authority/D1 status is current with no transaction or pending keys, and exercise read-only feed plus inert mutation canaries.
+
+Never reuse a generation for a different snapshot. The old KV namespace is not dual-written after cutover. Rolling back after D1 has advanced requires stopping Home and reconciling an exact D1 snapshot into the chosen target; merely re-enabling old Cron Triggers would operate on stale data.
+
+Authority recovery uses a set-based D1 snapshot query for all visible rows, then verifies the exact Home manifest before reactivation. It does not issue one D1 query per key, and a SQL `NULL` expiration is preserved as non-expiring. This keeps recovery below D1's per-invocation query limit while retaining the existing 10 MiB snapshot-export bound.
+
+### 8.3 Deploying rollback Workers
 
 The active scheduler is the Home authority and is deployed with `self-host/compose.authority.yaml`. The following loop only updates the triggerless Cloudflare rollback artifacts; it does not make them active and must not be paired with Cron Triggers while Home owns scheduling.
 
@@ -516,7 +535,7 @@ done
 
 Deploy only affected rollback Workers when deliberately maintaining that path. All five production Cron Trigger lists remain empty; `tubepulse-cron` deliberately has none.
 
-### 8.3 Pushing secrets to a worker
+### 8.4 Pushing secrets to a worker
 
 ```bash
 ./secrets/set-worker-secrets.sh tubepulse-api
@@ -527,9 +546,9 @@ Deploy only affected rollback Workers when deliberately maintaining that path. A
 ./secrets/set-worker-secrets.sh tubepulse-aux
 ```
 
-This pushes secrets via `wrangler secret put` for the public API and retained rollback Workers. Active discovery and notification credentials live only in Home's mounted secret files; do not copy the Home Data API key into unnecessary Workers.
+This pushes secrets via `wrangler secret put`. Run it only for a Worker that genuinely requires the changed secret. Active discovery and notification credentials live in Home's mounted secret files; do not copy the Home Data API key or FCM credential into unnecessary Workers. Retained scheduled Workers need notification credentials only during an explicitly reconciled rollback.
 
-### 8.4 Tailing live logs
+### 8.5 Tailing live logs
 
 ```bash
 source secrets/load-secrets.sh
@@ -562,30 +581,20 @@ Live-streamed logs from a deployed rollback Worker. With Cron Triggers disabled,
 1. Generate a new key in the Firebase console: `https://console.firebase.google.com/project/tubepulse-470a1/settings/serviceaccounts/adminsdk`
 2. Save the new JSON to `secrets/fcm-service-account.json` (overwrite)
 3. Verify the new key is the right size: `node -e "const k=JSON.parse(require('fs').readFileSync('secrets/fcm-service-account.json','utf8')); const b=Buffer.from(k.private_key.replace(/-----[^-]+-----|\n/g,''),'base64'); console.log('PKCS8 DER bytes:', b.length);"` — should print `1217`. Anything else is corrupted.
-4. Push the replacement to `tubepulse-api`, RSS 0/1/2, posts, and aux using `set-worker-secrets.sh`.
-5. Test by triggering a push (next cron tick with a new video, or manually: `curl or invoke the configured API route only after verifying live Cloudflare route state; otherwise use `wrangler dev` for local testing)
+4. Recreate only `home-authority` with the established Compose procedure so the mounted secret is reloaded without replacing `data-authority` or overlapping the scheduler lease.
+5. Verify Home readiness/current state and observe the next legitimate notification result. Do not manufacture a user-visible push. Update a retained Worker's secret only if an explicitly authorized rollback requires that Worker to become a notification owner.
 
-### Debugging KV state
+### Debugging canonical state
 
-The KV namespace is shared and not directly inspectable from the CLI. To see what's in there:
-- Add temporary `console.log(...)` calls in the worker, deploy, and tail
-- Or write a one-shot debug endpoint that returns specific keys
-- For a quick check, the API worker's `/feed` returns the current state for a given device
+D1 can be inspected with read-only SQL in the Cloudflare dashboard or `wrangler d1 execute --remote` when the operator credential has D1 read permission. Avoid selecting raw values in shared logs; compare manifest hashes/counts through the signed coordinator status. For an application-level check, the API Worker's authenticated `/feed` returns the selected canonical state when Home fallback is active.
 
 ### Manually forcing a dead-device cleanup (for testing)
 
-1. Get a real FCM token from a device (e.g. by tailing the API worker's logs while the app registers)
-2. Kill the token via FCM: `curl -X POST -H "Authorization: Bearer <oauth-token>" -H "Content-Type: application/json" -d '{"tokens":["<fcm-token>"]}' "https://fcm.googleapis.com/v1/projects/tubepulse-470a1/tokens:batchDelete"`
-3. Plant the test token on a test device via `POST /register` with that token
-4. Subscribe the test device to a real channel via `POST /subscribe-channel`
-5. Trigger a WebSub push for that channel (curl a fake `<feed>` XML to `POST /websub`)
-6. Tail the API worker's logs — you should see `[Cleanup] device ...` and `[Cleanup] channel ...` lines within ~5 seconds
-
-The cleanup helpers are also unit-testable by adding a temp `POST /_test_cleanup` endpoint that takes a deviceId in the body — verified this way during the v3.0.18 deploy, then the endpoint was removed.
+Do not invalidate a production token, plant credentials, invoke dormant WebSub, or add a temporary production endpoint. Exercise dead-token cleanup with the existing mocked Worker/Home tests. A real cleanup should be observed only when FCM naturally reports `UNREGISTERED`, then verified through redacted state/status evidence.
 
 ### Monitoring free tier usage
 
-Cloudflare's dashboard shows daily usage: `https://dash.cloudflare.com/<account_id>/workers/overview`. KV usage is at `https://dash.cloudflare.com/<account_id>/storage/kv`. YouTube Data API quota is at `https://console.cloud.google.com/apis/api/youtube.googleapis.com/quotas`.
+Cloudflare's dashboard shows daily usage at `https://dash.cloudflare.com/<account_id>/workers/overview`; D1 usage and query history are under Storage & databases → D1. The frozen KV namespace remains visible under Workers KV but should show no active canonical writes after cutover. YouTube Data API quota is at `https://console.cloud.google.com/apis/api/youtube.googleapis.com/quotas`.
 
 ---
 

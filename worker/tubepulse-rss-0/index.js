@@ -15,6 +15,10 @@ const RSS_MAX_SHARDS = 3;
 
 export default {
   async scheduled(event, env, ctx) {
+    if (String(env.TUBEPULSE_ENABLE_FROZEN_KV_ROLLBACK || '').toLowerCase() !== 'true') {
+      console.log('[RSS] Frozen KV rollback is not explicitly enabled; no-op.');
+      return;
+    }
     const shardIndex = Number(env.RSS_SHARD_INDEX || 0);
     const maxShards = Number(env.RSS_MAX_SHARDS || RSS_MAX_SHARDS);
     const active = await getKV(env.TUBEPULSE_KV, key.channelsActive()) || [];

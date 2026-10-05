@@ -168,23 +168,27 @@ Purpose: deploy Cloudflare workers deliberately and separately.
 Expected behavior:
 
 - Deploy `worker/tubepulse-api` only when API worker changes require it.
-- Deploy the affected active scheduled workers individually: `worker/tubepulse-rss-0`, `worker/tubepulse-rss-1`, `worker/tubepulse-rss-2`, `worker/tubepulse-posts`, and `worker/tubepulse-aux`.
+- Deploy Home-owned scheduler changes by rebuilding/recreating only `home-authority` with `self-host/compose.authority.yaml`, preserving `data-authority` and the scheduler lease.
+- Keep the RSS/posts/aux Worker deployments triggerless. They are frozen rollback assets, not active scheduled workers; do not deploy or activate them during an ordinary release.
+- Apply D1 schema changes before any Worker version that depends on them, then verify the configured backend generation, exact manifest state, and coordinator readiness.
 - Keep `worker/tubepulse-cron` deployed as a no-op with `crons = []`; do not use it for background-worker releases.
 - Never deploy archived workers unless deliberately restoring historical behavior.
 - Never bundle worker deploys into app APK release automation.
 
 ---
 
-## Staged Cleanup Plan
+## Release-tooling cleanup status
 
 Recommended small commits:
 
-1. `docs: document release process and risks`
-2. `chore: ignore local release output directories`
-3. `chore: move APK output to dist` - done
-4. `chore: narrow release script git staging`
-5. `chore: make commit/push failures fatal`
-6. `chore: add validate-only mode`
-7. Later: review signing, Google Services ownership, and `versionCode` policy.
+Completed in the current script:
+
+- documentation of the release flow and risks;
+- ignored local output under `dist/`;
+- narrow staging of only the two version files;
+- fatal commit/push handling before release upload;
+- build-only and validate-only modes.
+
+Remaining review items are release signing, Google Services ownership, and a future-proof `versionCode` policy.
 
 Historical local APKs can be deleted locally after confirming they are ignored and no longer needed for manual rollback. Do not commit those artifacts.

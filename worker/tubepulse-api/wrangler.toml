@@ -9,6 +9,21 @@ account_id = "77bb7769185bbfeb53feef16b9f72803"
 binding = "TUBEPULSE_KV"
 id = "52e77ca9f5f6493e89d2478c8d3055ec"
 
+# Active canonical cloud backup/fallback. The legacy KV binding above remains
+# attached only as a frozen point-in-time rollback snapshot; code never falls
+# back to it automatically while D1 is selected.
+[[d1_databases]]
+binding = "TUBEPULSE_D1"
+database_name = "tubepulse-canonical"
+database_id = "bc49a996-5576-4000-8cf5-b104c2bb7e84"
+migrations_dir = "migrations"
+
+[vars]
+TUBEPULSE_CANONICAL_BACKEND = "d1"
+TUBEPULSE_CANONICAL_BACKEND_GENERATION = "production-v1"
+TUBEPULSE_AUTHORITY_D1_PUBLICATION_ROW_CAP = "45000"
+TUBEPULSE_AUTHORITY_D1_ROW_WRITE_HARD_CAP = "50000"
+
 [[vpc_services]]
 binding = "TUBEPULSE_HOME_VPC"
 service_id = "01a106c3-0990-7410-b88d-08d96a726127"
@@ -47,15 +62,15 @@ new_sqlite_classes = ["TubePulseAuthorityCoordinator"]
 # Unified local-first authority. Values stay encrypted Worker secrets; never
 # commit them under [vars]. The production deployment enables this separately
 # from source: all authenticated feeds use the one Home store over VPC while
-# current, with bounded Cloudflare-KV fallback. App mutations execute on Home;
-# their exact deltas are durably queued for later KV backup by the coordinator.
+# current, with bounded D1 fallback. App mutations execute on Home;
+# their exact deltas are durably queued for later atomic D1 backup by the coordinator.
 # TUBEPULSE_HOME_AUTHORITY_ENABLED=false
 # TUBEPULSE_HOME_AUTHORITY_TRAFFIC_ENABLED=false
 # TUBEPULSE_HOME_AUTHORITY_TRANSPORT=vpc
 # TUBEPULSE_HOME_AUTHORITY_ORIGIN=http://gateway-origin:8788
 # TUBEPULSE_HOME_AUTHORITY_TIMEOUT_MS=5000
-# TUBEPULSE_AUTHORITY_KV_PUBLICATION_CAP=900
-# TUBEPULSE_AUTHORITY_KV_WRITE_HARD_CAP=950
+# TUBEPULSE_AUTHORITY_D1_PUBLICATION_ROW_CAP=45000
+# TUBEPULSE_AUTHORITY_D1_ROW_WRITE_HARD_CAP=50000
 # wrangler secret put TUBEPULSE_HOME_AUTHORITY_SECRET
 
 [observability]

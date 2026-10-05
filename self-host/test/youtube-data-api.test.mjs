@@ -14,6 +14,7 @@ import {
   pacificQuotaWindow,
   pruneMetricPollToVisibleVideos,
   selectDueMetricVideos,
+  updateMetricPollObservation,
 } from '../src/youtube-data-api.mjs';
 import { classifyRssVideosForNotification } from '../../worker/tubepulse-cron/shared.mjs';
 
@@ -149,15 +150,88 @@ test('quota state persists within a Pacific day and resets at DST-aware midnight
   assert.notEqual(pacificQuotaWindow(before).day, pacificQuotaWindow(after).day);
 });
 
+test('local comment observations preserve null and explicit zero across normalization and restart', async (t) => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tubepulse-comment-observation-'));
+  t.after(() => fs.rm(dataDir, { recursive: true, force: true }));
+  const now = Date.parse('2026-10-05T12:00:00Z');
+  const first = updateMetricPollObservation({}, {
+    views: '100', likes: '10', dislikes: null, comments: null,
+  }, now);
+  assert.deepEqual(first.commentObservation, {
+    count: null,
+    observedAt: '2026-10-05T12:00:00.000Z',
+  });
+  const second = updateMetricPollObservation(first, {
+    views: '100', likes: '10', dislikes: null, comments: '0',
+  }, now + 300_000);
+  assert.deepEqual(second.commentObservation, {
+    count: '0',
+    observedAt: '2026-10-05T12:05:00.000Z',
+  });
+  assert.equal(second.staticStreak, 1, 'comment movement cannot change adaptive metric cadence');
+  const migrated = updateMetricPollObservation({
+    lastObserved: '{"comments":"9","dislikes":null,"likes":"10","views":"100"}',
+    staticStreak: 4,
+  }, {
+    views: '100', likes: '10', dislikes: null, comments: '11',
+  }, now + 600_000);
+  assert.equal(migrated.staticStreak, 5, 'legacy comment signatures migrate without resetting cadence');
+
+  const normalized = normalizeYoutubeDataApiState({ metricPoll: { videoid00001: second } }, now);
+  const stateFile = createHomeSchedulerStateFile(dataDir, 'shadow');
+  const state = await stateFile.read();
+  state.youtubeDataApi = normalized;
+  await stateFile.write(state);
+  const restored = normalizeYoutubeDataApiState((await stateFile.read()).youtubeDataApi, now);
+  assert.deepEqual(restored.metricPoll.videoid00001.commentObservation, second.commentObservation);
+});
+
 class MemoryKv {
-  constructor(values = {}) { this.values = new Map(Object.entries(values).map(([key, value]) => [key, JSON.stringify(value)])); }
+  constructor(values = {}) {
+    this.values = new Map(Object.entries(values).map(([key, value]) => [key, JSON.stringify(value)]));
+    this.puts = [];
+  }
   async get(key, type) {
     const value = this.values.get(key) ?? null;
     return type === 'json' && value !== null ? JSON.parse(value) : value;
   }
-  async put(key, value) { this.values.set(key, String(value)); }
+  async put(key, value) { this.puts.push(key); this.values.set(key, String(value)); }
   async delete(key) { this.values.delete(key); }
 }
+
+test('comment-only statistics advance no canonical KV write or publication delta', async (t) => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tubepulse-comment-only-'));
+  t.after(() => fs.rm(dataDir, { recursive: true, force: true }));
+  const now = Date.parse('2026-10-05T12:00:00Z');
+  const currentHour = Math.floor(now / 3_600_000);
+  const channelId = 'UC0000000000000000000000';
+  const video = {
+    videoId: 'videoid00001', title: 'Stable', publishedAt: '2026-10-05T11:00:00Z',
+    thumbnail: null, type: 'video', link: 'https://www.youtube.com/watch?v=videoid00001',
+    views: '100', likes: '10', dislikes: null, comments: '3',
+    viewsLastCheckedHour: currentHour, likesLastCheckedHour: currentHour,
+    commentsLastCheckedHour: currentHour - 48,
+  };
+  const recentKey = `channel:${channelId}:recent`;
+  const kv = new MemoryKv({ [recentKey]: [video] });
+  const stateFile = createHomeSchedulerStateFile(dataDir, 'shadow');
+  const runner = new HomeSchedulerRunner({
+    config: {
+      mode: 'shadow', dataDir, repoRoot: path.resolve('.'), workerBindings: {}, quiet: true,
+      sync: { configured: false }, leaseTtlMs: 10_000,
+    },
+    stateFile,
+    now: () => now,
+  });
+  const recents = new Map([[channelId, [video]]]);
+  await runner.applyStatistics(kv, recents, [{ channelId, video }], new Map([[
+    video.videoId,
+    { views: '100', likes: '10', dislikes: null, comments: '99' },
+  ]]));
+  assert.deepEqual(kv.puts, []);
+  assert.deepEqual(await kv.get(recentKey, 'json'), [video]);
+  assert.deepEqual(recents.get(channelId), [video]);
+});
 
 test('unchanged 85-channel detector uses two calls and no playlist request; count changes reconcile', async (t) => {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tubepulse-data-api-'));

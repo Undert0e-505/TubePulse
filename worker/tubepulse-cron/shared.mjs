@@ -191,15 +191,20 @@ export function parseRSSFeed(xmlText) {
 
 // ─── RSS recent-video persistence ────────────────────────────────────────
 
-const RSS_METRIC_REFRESH_THRESHOLD = 0.25;
 const RSS_METRIC_FORCE_REFRESH_HOURS = 24;
 
-function metricChangedBeyondThreshold(persistedValue, rssValue) {
-  if (rssValue === undefined || rssValue === null) return false;
-  const persisted = Number(persistedValue ?? 0);
-  const current = Number(rssValue);
-  if (!Number.isFinite(persisted) || !Number.isFinite(current)) return false;
-  return Math.abs(current - persisted) / Math.max(Math.abs(persisted), 1) > RSS_METRIC_REFRESH_THRESHOLD;
+function normalizedKnownMetric(value) {
+  if (value === undefined || value === null) return null;
+  const text = String(value).trim();
+  if (/^\d+$/.test(text)) return BigInt(text).toString();
+  const numeric = Number(text);
+  return Number.isFinite(numeric) ? String(numeric) : null;
+}
+
+function knownMetricChanged(persistedValue, incomingValue) {
+  const persisted = normalizedKnownMetric(persistedValue);
+  const incoming = normalizedKnownMetric(incomingValue);
+  return persisted !== null && incoming !== null && persisted !== incoming;
 }
 
 function shouldPersistMetricGroup(lastCheckedHour, currentHour, metricPairs) {
@@ -207,7 +212,7 @@ function shouldPersistMetricGroup(lastCheckedHour, currentHour, metricPairs) {
   // then enrich it from the batched statistics endpoint seconds later. Allow
   // that one-time null -> known hydration even though both operations happen
   // in the same hour; subsequent known values remain subject to the normal
-  // hourly/threshold write throttle.
+  // once-per-UTC-hour write gate.
   const hydratesMissingMetric = metricPairs.some(([persistedValue, incomingValue]) => (
     (persistedValue === undefined || persistedValue === null)
     && incomingValue !== undefined
@@ -221,8 +226,8 @@ function shouldPersistMetricGroup(lastCheckedHour, currentHour, metricPairs) {
   const stale = missingLastCheckedHour
     || currentHour - normalizedLastCheckedHour >= RSS_METRIC_FORCE_REFRESH_HOURS;
   return differentHour && (
-    stale || metricPairs.some(([persistedValue, rssValue]) => (
-      metricChangedBeyondThreshold(persistedValue, rssValue)
+    stale || metricPairs.some(([persistedValue, incomingValue]) => (
+      knownMetricChanged(persistedValue, incomingValue)
     ))
   );
 }
@@ -256,15 +261,19 @@ function copyPersistedMetricFields(target, cached) {
 }
 
 /**
- * Merge the current RSS ordering/structure with persisted metrics.
+ * Merge the current RSS/API ordering and structure with persisted metrics.
  * Only the three app-visible entries are eligible for a metric refresh; new
- * entries are seeded from RSS. `nowMs` is explicit so this helper remains deterministic.
+ * entries are seeded from the current source. Comment counts are observational:
+ * they may piggyback on a write already required by structure/views/likes, but
+ * never make the canonical recent list dirty by themselves. `nowMs` is explicit
+ * so this helper remains deterministic.
  */
 export function mergeRssUploadsIntoRecentVideos(cachedRecent, rssUploads, nowMs) {
   const currentHour = Math.floor(nowMs / 3600000);
   const cachedByVideoId = new Map((cachedRecent || []).map((video) => [video.videoId, video]));
+  const uploads = (rssUploads || []).slice(0, 15);
 
-  return (rssUploads || []).slice(0, 15).map((upload, index) => {
+  const mergedVideos = uploads.map((upload, index) => {
     const hasCommentMetric = Object.prototype.hasOwnProperty.call(upload, 'comments');
     const merged = {
       videoId: upload.videoId,
@@ -325,15 +334,24 @@ export function mergeRssUploadsIntoRecentVideos(cachedRecent, rssUploads, nowMs)
       merged.likesLastCheckedHour = currentHour;
     }
 
-    if ((hasCommentMetric || Object.prototype.hasOwnProperty.call(cached, 'comments'))
-      && shouldPersistMetricGroup(cached.commentsLastCheckedHour, currentHour, [
-      [cached.comments, upload.comments],
-      ])) {
-      merged.comments = currentMetricValue(upload.comments, cached.comments);
-      merged.commentsLastCheckedHour = currentHour;
-    }
-
     return merged;
+  });
+
+  // At this point existing comments/clocks are copied verbatim, so inequality
+  // can only come from a legitimate structural, view, like, or dislike write.
+  // If comments are the sole new observation, return the canonical value
+  // unchanged and let Home retain the fresh count only in its local state.
+  if (jsonEqual(cachedRecent || [], mergedVideos)) return mergedVideos;
+
+  return mergedVideos.map((video, index) => {
+    const upload = uploads[index];
+    if (index >= 3 || !Object.prototype.hasOwnProperty.call(upload, 'comments')
+      || upload.comments === undefined) return video;
+    return {
+      ...video,
+      comments: upload.comments === null ? null : String(upload.comments),
+      commentsLastCheckedHour: currentHour,
+    };
   });
 }
 
@@ -814,11 +832,9 @@ function knownCommunityMetric(value) {
   return value !== undefined && value !== null && Number.isFinite(Number(value));
 }
 
-function communityMetricChangedBeyondThreshold(cachedValue, latestValue) {
+function knownCommunityMetricChanged(cachedValue, latestValue) {
   if (!knownCommunityMetric(cachedValue) || !knownCommunityMetric(latestValue)) return false;
-  const cached = Number(cachedValue);
-  const latest = Number(latestValue);
-  return Math.abs(latest - cached) / Math.max(Math.abs(cached), 1) > RSS_METRIC_REFRESH_THRESHOLD;
+  return normalizedKnownMetric(cachedValue) !== normalizedKnownMetric(latestValue);
 }
 
 export function mergeCachedCommunityPostForPersistence(latestPost, cachedPosts) {
@@ -855,10 +871,10 @@ export function mergeCachedCommunityPostForPersistence(latestPost, cachedPosts) 
   ));
   const differentHour = latestHour !== null && (cachedHour === null || latestHour !== cachedHour);
   const stale = latestHour !== null && (cachedHour === null || latestHour - cachedHour >= RSS_METRIC_FORCE_REFRESH_HOURS);
-  const significant = ['likeCount', 'viewCount'].some((field) => (
-    communityMetricChangedBeyondThreshold(cached[field], candidate[field])
+  const metricChanged = ['likeCount', 'viewCount'].some((field) => (
+    knownCommunityMetricChanged(cached[field], candidate[field])
   ));
-  if (!hydratesClock && !hydratesMetric && !(differentHour && (stale || significant))) return cached;
+  if (!hydratesClock && !hydratesMetric && !(differentHour && (stale || metricChanged))) return cached;
 
   const merged = { ...cached };
   if (candidate.fetchedAt) merged.fetchedAt = candidate.fetchedAt;

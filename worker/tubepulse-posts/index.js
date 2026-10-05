@@ -29,6 +29,10 @@ export function isCommunityPostsDebugEnabled(env) {
 
 export default {
   async scheduled(event, env, ctx) {
+    if (String(env.TUBEPULSE_ENABLE_FROZEN_KV_ROLLBACK || '').toLowerCase() !== 'true') {
+      console.log('[Posts] Frozen KV rollback is not explicitly enabled; no-op.');
+      return;
+    }
     if (!isCommunityPostsEnabled(env)) return;
 
     const allowlist = parseCommunityPostChannelAllowlist(env);

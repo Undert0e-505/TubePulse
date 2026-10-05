@@ -62,14 +62,23 @@ for (const worker of [
 ]) {
   const config = await readFile(new URL(`./${worker}/wrangler.toml`, import.meta.url), 'utf8');
   assert.match(config, /crons\s*=\s*\[\]/, `${worker} must remain unscheduled while Home owns polling`);
+  assert.match(config, /TUBEPULSE_ENABLE_FROZEN_KV_ROLLBACK\s*=\s*"false"/,
+    `${worker} must fail closed against the frozen KV snapshot`);
 
   const source = await readFile(new URL(`./${worker}/index.js`, import.meta.url), 'utf8');
   assert.match(source, /scheduledTime \?\? Date\.now\(\)\) \/ 300000/, `${worker} must use a five-minute epoch tick`);
+  assert.match(source, /TUBEPULSE_ENABLE_FROZEN_KV_ROLLBACK/,
+    `${worker} must require explicit stale-KV rollback selection`);
 }
 
 for (const worker of ['tubepulse-posts', 'tubepulse-aux']) {
   const config = await readFile(new URL(`./${worker}/wrangler.toml`, import.meta.url), 'utf8');
   assert.match(config, /crons\s*=\s*\[\]/, `${worker} must remain unscheduled while Home owns polling`);
+  assert.match(config, /TUBEPULSE_ENABLE_FROZEN_KV_ROLLBACK\s*=\s*"false"/,
+    `${worker} must fail closed against the frozen KV snapshot`);
+  const source = await readFile(new URL(`./${worker}/index.js`, import.meta.url), 'utf8');
+  assert.match(source, /TUBEPULSE_ENABLE_FROZEN_KV_ROLLBACK/,
+    `${worker} must require explicit stale-KV rollback selection`);
 }
 
 const retiredConfig = await readFile(new URL('./tubepulse-cron/wrangler.toml', import.meta.url), 'utf8');

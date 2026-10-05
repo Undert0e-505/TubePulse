@@ -43,6 +43,10 @@ function currentUpcomingBucket() {
 
 export default {
   async scheduled(event, env, ctx) {
+    if (String(env.TUBEPULSE_ENABLE_FROZEN_KV_ROLLBACK || '').toLowerCase() !== 'true') {
+      console.log('[Aux] Frozen KV rollback is not explicitly enabled; no-op.');
+      return;
+    }
     await runAuxTick(env, ctx, Date.now());
   },
 };

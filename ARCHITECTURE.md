@@ -1,8 +1,8 @@
 # TubePulse — Architecture Specification
 
 **Version:** Current architecture reference for the v3.x app line. See [STATUS.md](STATUS.md) for current checked-in version and operational caveats.
-**Date:** 2026-04-19 (initial), updated through the Home Data API production cutover on 2026-10-05
-**Status:** Architecture reference. Sections before §15 retain historical RSS/WebSub design context; §15.6 and [STATUS.md](STATUS.md) describe the current production video path.
+**Date:** 2026-04-19 (initial), updated through the Home Data API and D1 canonical-backup cutovers on 2026-10-05
+**Status:** Architecture reference. Explicitly labelled historical sections retain RSS/WebSub/KV design context; §15.6 and [STATUS.md](STATUS.md) describe current production.
 
 ---
 
@@ -84,55 +84,34 @@ The architectural difference is roughly 100x at this scale, and it widens as you
 ## 4. Component overview
 
 ```
-┌─────────────────┐    WebSub push    ┌──────────────────────┐
-│  YouTube RSS    │ ────────────────→ │   tubepulse-api      │
-│  Hub (PubSub)   │                   │   (Cloudflare Worker)│
-└─────────────────┘                   │                      │
-                                      │   /websub  ← push    │
-┌─────────────────┐  REST + FCM push  │   /register          │
-│  Android App    │ ←──────────────── │   /subscribe-channel │
-│  (RN/Expo)      │                   │   /unsubscribe       │
-└─────────────────┘                   │   /seen              │
-        ▲                             │   /feed              │
-        │ FCM                         │   /resolve           │
-        │                             │   /bootstrap         │
-┌───────┴─────────┐                   │   /settings          │
-│   Firebase      │                   │   /channel-override  │
-│   Cloud         │ ←── FCM send ──── └──────────┬───────────┘
-│   Messaging     │                              │
-└─────────────────┘                   ┌──────────▼───────────┐
-                                      │   tubepulse-cron     │
-                                      │   (Cloudflare Worker)│
-                                      │                      │
-                                      │   */5  upcoming events│
-                                      │   */15 nag bucket    │
-                                      │   0 */6 lease renewal│
-                                      └──────────┬───────────┘
-                                                 │
-                                      ┌──────────▼───────────┐
-                                      │   Cloudflare KV      │
-                                      │   (single namespace) │
-                                      └──────────────────────┘
+YouTube Data API / InnerTube ──poll──▶ unified Home authority ──FCM──▶ Android
+                                      │          ▲
+                                      │ local KV │ signed VPC feed/mutations
+                                      ▼          │
+                              Cloudflare API Worker
+                                      │
+                                      ├── SQLite Durable Object ordering/baselines
+                                      └── atomic changed-key deltas ──▶ Cloudflare D1
 ```
 
 ### 4.1 Components
 
 | Component | Role | Triggered by |
 |-----------|------|--------------|
-| `tubepulse-api` | Current live app-facing REST API + WebSub callback (dormant) | HTTP requests; `workers.dev` route verified reachable on 2026-06-25 |
+| `tubepulse-api` | Current live app-facing REST API, Durable Object coordinator, D1 fallback, and dormant WebSub callback | HTTP requests on the unchanged `workers.dev` URL |
 | Unified Home authority | Production app mutation/feed authority plus Data API video, InnerTube post, and aux scheduling | Local Docker timer + signed VPC ingress |
 | Retained scheduled Workers | Triggerless RSS/posts/aux rollback and historical code | No active Cron Triggers |
 
-Live route note: `GET /` at `https://tubepulse-api.jimothyoakley55.workers.dev` returned `200 OK` from Cloudflare on 2026-06-25 with health JSON identifying `worker: "tubepulse-api"`, `architecture: "channel-first"`, and `version: "3.0.0"`. That health version is not the app release version (`3.2.4` in the repo).
-| Cloudflare KV | Single namespace, all persistent state | Workers |
-| Firebase Cloud Messaging | Push notifications to devices | API + cron workers |
+| Cloudflare D1 | Active changed-key canonical backup and Worker fallback | API Worker through the D1 binding |
+| Legacy Workers KV | Frozen point-in-time snapshot | Explicit quiesced rollback/reconciliation only; never automatic |
+| Firebase Cloud Messaging | Push notifications to devices | Home authority after canonical visibility succeeds |
 | Android app | UI, device-local cache, FCM receiver | User + push |
 
 ### 4.2 What is NOT a component
 
-- No database (KV only — see §5.1 for why)
-- No queue (KV operations are fast enough)
-- No separate cache layer (KV is already edge-cached)
+- No relational application model: D1 stores the existing opaque canonical key/value contract
+- No external message queue; the Durable Object keeps the bounded pending-delta journal required for safe D1 publication
+- No separate cloud cache layer; Home local KV serves current reads and D1 is the canonical cloud fallback
 - No public Home ingress — the local authority is reached only through the Cloudflare Worker/VPC path
 
 ### 4.3 Historical RSS detection path (superseded 2026-10-05)
@@ -150,20 +129,23 @@ Current production uses the YouTube Data API for video discovery, uploads reconc
 
 ---
 
-## 5. Storage layer (Cloudflare KV)
+## 5. Storage layer (local KV contract + Cloudflare D1)
 
-### 5.1 Why KV and not D1
+### 5.1 Why the key/value contract remains
 
-D1 (Cloudflare's SQLite) would let us write JOINs to express the channel↔device relationship naturally. We're not using it because:
+Home and the Worker modules still use the established key/value interface because:
 
-- KV reads are edge-cached and faster
 - The "denormalised inverse views" pattern (§5.3) makes JOINs unnecessary
-- D1 has its own free-tier limits and adds another moving part
-- The access pattern is overwhelmingly key-by-known-ID, which is exactly KV's strength
+- The access pattern is overwhelmingly key-by-known-ID
+- Preserving the interface avoids a risky application-schema rewrite during the storage cutover
 
-### 5.2 Single namespace
+Production's cloud adapter stores exact string values in a generic D1 table keyed by backend generation and canonical key. Expired rows behave as absent. A SQLite Durable Object remains the serialization, baseline, and pending-delta coordinator; each D1 commit uses content-hash preconditions and one atomic `batch()`. Batch improves latency/atomicity but does not reduce billed rows. Direct D1 binding reads use the primary database; read replication is not enabled.
 
-All keys live in one KV namespace. Prefix conventions distinguish entity types.
+The legacy Workers KV namespace is frozen at cutover. There is no automatic read or write fallback to that stale snapshot. A backend identity/generation fence prevents an old transaction from replaying against D1.
+
+### 5.2 One canonical key space
+
+All records live in one logical key space. Prefix conventions distinguish entity types. Home persists that key space locally; D1 is its coordinated changed-key backup and public-Worker fallback.
 
 ### 5.3 Key schema
 
@@ -174,23 +156,22 @@ All keys use `:` as separator, lowercase, with stable identifier components.
 ```
 channel:{channelId}:meta
   → JSON { name, avatarUrl, lastVideoId, addedAt }
-  Read on:  every WebSub push (to compose notifications)
-  Written:  on bootstrap, on metadata refresh
+  Read on:  feed/bootstrap and notification composition
+  Written:  on bootstrap and bounded metadata repair; active uploads do not rewrite lastVideoId
 
 channel:{channelId}:subscribers
   → JSON [deviceId, deviceId, ...]
-  Read on:  every WebSub push (to find who to notify)
+  Read on:  Home notification fan-out
   Written:  on subscribe / unsubscribe
 
 channel:{channelId}:websub
   → JSON { leaseExpiresAt, hmacSecret, lastVerified }
-  Read on:  WebSub callback verification, lease renewal cron
-  Written:  on subscribe (first), on lease renewal
+  Dormant compatibility state; not renewed by current production
 
 channel:{channelId}:recent
   → JSON [ { videoId, title, publishedAt, type, ... }, ... ]  (last 15)
-  Read on:  /feed, /bootstrap, "live now" detection
-  Written:  on every WebSub push for this channel
+  Read on:  /feed, /bootstrap, scheduled/live processing
+  Written:  by Home uploads reconciliation and hourly-gated top-three metrics
 ```
 
 `type` is one of `video`, `live`, `live_scheduled`, `premiere`. See §7.2 for derivation rules.
@@ -222,8 +203,8 @@ device:{deviceId}:override:{channelId}
 
 device:{deviceId}:state:{channelId}
   → JSON { unwatched: [videoIds], lastNagAt, nagCount }
-  Read on:  WebSub push for this channel + this device
-  Written:  on push, on /seen
+  Read on:  Home notification fan-out and /feed
+  Written:  on notification state changes and /seen
   Note: keyed per (device, channel) to keep individual reads small and
         avoid hot-key contention on a single device:state blob
 ```
@@ -251,14 +232,14 @@ Buckets are aligned to wall-clock minutes (5-min for upcoming, 15-min for nag) s
 ```
 channels:active
   → JSON [channelId, channelId, ...]
-  Read on:  WebSub lease renewal cron (to know what to renew)
+  Read on:  Home video/post scheduling
   Written:  on first subscriber added to a channel
             on last subscriber removed from a channel
   Note: This is the ONLY list-style index. We maintain it manually
-        rather than using KV.list() in the cron hot path. Note: the current API `/register` path intentionally uses `KV.list({ prefix: 'device:' })` for slow-path FCM-token migration; see [worker/CONTRACTS.md](worker/CONTRACTS.md).
+        rather than using canonical list operations in the scheduler hot path. Note: the current API `/register` path intentionally uses the compatibility adapter's prefix list for slow-path FCM-token migration; see [worker/CONTRACTS.md](worker/CONTRACTS.md).
 ```
 
-### 5.4 `KV.list()` constraints and current exception
+### 5.4 Canonical `list()` constraints and current exception
 
 Most hot-path places where the previous version called `KV.list()` now either:
 
@@ -266,9 +247,11 @@ Most hot-path places where the previous version called `KV.list()` now either:
 2. Reads a maintained index key (`channels:active` for lease renewal)
 3. Uses a time-bucketed key the cron reads directly
 
-New `KV.list()` calls in hot paths should be treated as suspicious. The current `/register` migration exception is documented in [worker/CONTRACTS.md](worker/CONTRACTS.md).
+New canonical list calls in hot paths should be treated as suspicious. The current `/register` migration exception is documented in [worker/CONTRACTS.md](worker/CONTRACTS.md).
 
-### 5.5 Read/write costs per operation
+### 5.5 Historical Worker-era read/write estimates
+
+The following estimates describe the superseded WebSub/Worker design. Current Home/D1 accounting is documented in §15.6.
 
 | Operation | Reads | Writes |
 |-----------|-------|--------|
@@ -300,7 +283,9 @@ This is a soft cap — if the requirement changes, raising it requires no schema
 
 ---
 
-## 6. Cron jobs
+## 6. Historical Worker-era cron jobs
+
+Sections 6–14 retain the superseded Worker/WebSub/RSS design record. Their schedules and ownership are not current production instructions; use §15.6, [STATUS.md](STATUS.md), and [self-host/README.md](self-host/README.md) for current operations.
 
 Four separate scheduled jobs in the same Worker, each with a single responsibility. Splitting them lets each run at its natural frequency without the others becoming a bottleneck. All four use the same KV namespace.
 
@@ -643,7 +628,7 @@ These can vary with implementation and will appear in the codebase as they're bu
 
 ---
 
-## 14. v3.1 deltas (2026-06-04)
+## 14. Historical v3.1 deltas (2026-06-04)
 
 v3.1 is a strict superset of v3.0 — the channel-first, zero-`KV.list()`, time-bucket architecture in §§1-12 is unchanged. The following sections were added or modified for the v3.1 release. For full design notes see [PLAN_v3.1.md](PLAN_v3.1.md); for the current shipping state see [STATUS.md](STATUS.md).
 
@@ -760,21 +745,21 @@ The temporary local-package `google-services.json` exists only to satisfy the Gr
 
 ### 15.6 Unified Home production authority
 
-The scheduled-worker replacement is a separate process from both the app gateway origin and the standalone Preview pilot. Video discovery is Data API-only in active mode: every aligned five-minute cycle batches sorted unique active IDs into `channels.list` groups of at most 50, compares persisted public `videoCount`, and reconciles only changed/missing-baseline uploads playlists. The current fleet fits in two detector requests, costing 576 general units/day. A bounded six-hour first-page safety pass adds at most `active channels × 4` general units/day and catches count-neutral replacement and propagation lag. Playlist/video/statistics results enter the existing canonical KV schema and notification path; there is no parallel notifier and no `search.list` dependency. The scheduler reuses the existing post poller for an all-eligible-channel hourly sweep and the existing aux routine each minute. Configurable post cadence carries an explicit daily-quota projection and guard.
+The scheduled-worker replacement is a separate process from both the retired app gateway experiment and the standalone Preview pilot. Video discovery is Data API-only in active mode: every aligned five-minute cycle batches sorted unique active IDs into `channels.list` groups of at most 50, compares persisted public `videoCount`, and reconciles only changed/missing-baseline uploads playlists. Production currently uses two detector requests per cycle, costing 576 general units/day. A bounded six-hour first-page safety pass adds at most `active channels × 4` general units/day and catches count-neutral replacement and propagation lag. Playlist/video/statistics results enter the existing canonical key schema and notification path; there is no parallel notifier and no `search.list` dependency. The scheduler reuses the existing post poller for an all-eligible-channel hourly sweep and the existing aux routine each minute. Configurable post cadence carries an explicit daily-quota projection and guard.
 
-Only each channel's dynamic app-visible top three videos are eligible for statistics polling. Their adaptive cadence remains intact; when a visible item becomes deleted/private, the promoted cached item is immediately due because non-visible poll clocks are pruned. The durable known-video watermark is independent of this optimization, so promotion cannot replay a notification. Community-post structural changes persist immediately, while `fetchedAt`, relative-age labels, rotating delivery signatures, and sub-threshold engagement movement remain no-ops. Missing metrics hydrate once, a strictly greater-than-25% change can persist once per UTC hour, and every metric is forced fresh after 24 hours. The active upload path does not rewrite channel metadata merely to advance compatibility field `lastVideoId`.
+Only each channel's dynamic app-visible top three videos are eligible for statistics polling. Their adaptive cadence remains intact; when a visible item becomes deleted/private, the promoted cached item is immediately due because non-visible poll clocks are pruned. The durable known-video watermark is independent of this optimization, so promotion cannot replay a notification. `commentCount` is collected into durable local observation state for possible future activity work, but comment movement is excluded from cadence and can never cause a canonical publication. A latest comment value may piggyback on a recent-video write already required by structure or allowed view/like persistence. Community-post structural changes persist immediately, while `fetchedAt`, relative-age labels, rotating delivery signatures, and same-hour engagement movement remain no-ops. Missing metrics hydrate once; any normalized known view/like change may persist once per UTC hour, and unchanged canonical metrics are forced fresh after 24 hours. The active upload path does not rewrite channel metadata merely to advance compatibility field `lastVideoId`.
 
 Three fail-closed modes exist: shadow measures local mutations and notification decisions with no remote writes or FCM network request; standby does no scheduled work; active requires an independent write flag, notification flag, live-trigger-disable confirmation, Firebase credential, and exact activation latch. A persisted exclusive lease, heartbeat, overlap guard, in-progress channel list, timeout, and retry/backoff make a single runner restartable without knowingly duplicating a completed channel. Shadow publication compares final local state with canonical state and classifies predicted writes by key family/reason, including a distinct metrics-only category.
 
-Moving compute does not eliminate canonical writes. An earlier 2026-10-04 exercise proved that making Cloudflare KV the scheduler's live backing store is not viable on the free tier: per-channel reads approach/exceed 100,000/day, and a separate full mirror of 811 records every five minutes alone projects to about 233,000 reads/day. It also exposed notification-before-feed visibility and was rolled back before this unified design replaced it.
+Moving compute does not eliminate canonical writes. An earlier 2026-10-04 exercise proved that making Cloudflare KV the scheduler's live backing store is not viable on the free tier: its frequent full mirror exceeded the available read budget. It also exposed notification-before-feed visibility and was rolled back before this unified design replaced it.
 
-The implemented successor is one local authority/runtime/store. Signed Cloudflare-first mutations for every authenticated device and scheduled polling share one global Durable Object lease followed by one local lease, so lock order is deterministic. Home polls local KV and publishes an exact changed-key journal. The SQLite-backed coordinator stores conditional baselines and resumable transactions; genuine divergence marks the authority stale. Authenticated `GET /feed` is routed for all devices over the private VPC binding to that same store only while current, with bounded canonical-KV fallback. This strong Home read path—not a fixed propagation sleep—is the notification visibility barrier.
+The implemented successor is one local authority/runtime/store. Signed Cloudflare-first mutations for every authenticated device and scheduled polling share one global Durable Object lease followed by one local lease, so lock order is deterministic. Home polls local KV and publishes an exact changed-key journal. The SQLite-backed coordinator stores conditional baselines and resumable transactions; genuine divergence marks the authority stale. Authenticated `GET /feed` is routed for all devices over the private VPC binding to that same store only while current, with D1 canonical fallback. This strong Home read path—not a fixed propagation sleep—is the notification visibility barrier.
 
-Cloudflare backup publication has two explicit budgets: 900 scheduler writes/day and 950 total coordinated writes/day, reserving 50 for app mutations under the platform's 1,000-write ceiling. At the scheduler cap, the coordinator durably coalesces the latest change per key and retries on later ticks after the UTC reset. An API mutation first flushes any overlapping deferred keys from its reserve before the legacy Cloudflare handler runs, preventing stale-base overwrites such as `/seen` racing a new video. Home polling/feed service continues, but FCM for a batch whose canonical backup is deferred is suppressed: a subsequent VPC outage must not recreate push-with-missing-content on the Cloudflare fallback. WebSub pushes are acknowledged without writes/FCM while Home traffic ownership is active, and verification handshakes persist no lease state.
+Cloudflare D1 backup publication has two conservative row-write budgets: 45,000 estimated scheduler rows/day and 50,000 total estimated rows/day, reserving 5,000 for app mutations under the free plan's 100,000-row daily allowance. Every logical mutation is charged as three rows before execution: a precondition-guard insert, the canonical row mutation, and guard cleanup. Tables use `WITHOUT ROWID` primary keys and no secondary indexes. At the scheduler cap, the coordinator durably coalesces the latest change per key and retries on later ticks after the UTC reset. An API mutation first flushes any overlapping deferred keys from its reserve before the application handler runs, preventing stale-base overwrites such as `/seen` racing a new video. Home polling/feed service continues, but FCM for a batch whose canonical backup is deferred is suppressed: a subsequent VPC outage must not recreate push-with-missing-content on the D1 fallback. WebSub pushes are acknowledged without writes/FCM while Home traffic ownership is active, and verification handshakes persist no lease state.
 
-Configuration and traffic activation are separate latches. Production cut over on 2026-10-04 after disabling/draining all scheduled Workers and importing an exact signed 721-record snapshot through the Worker KV binding. The first active sweep covered the complete fleet with no failures, applied only changed keys, and sent its natural notification after the public Home-backed feed visibility barrier passed. All known profiles then returned Home-routed feeds through the unchanged API URL. Rollback still stops/drains Home before restoring the saved RSS and posts/aux triggers. An old mirror plus public feeds is never accepted as a replacement for a full canonical snapshot.
+Configuration and traffic activation are separate latches. Production initially cut over to Home on 2026-10-04 after disabling/draining all scheduled Workers and importing an exact signed snapshot. The D1 migration later quiesced Home, staged the full authoritative snapshot under an explicit backend generation, verified its exact manifest, atomically activated that generation, and only then archived obsolete KV-pending state. The old KV namespace is frozen and never dual-written or selected automatically. Safe rollback after new D1 writes therefore requires another quiesced exact reconciliation; the retained Workers additionally require an explicit frozen-KV acknowledgement latch before their scheduled handlers do anything.
 
-Community-post cache comparisons discard rotating YouTube thumbnail delivery parameters when the stable image origin/path is unchanged, and ignore relative-age label churn when the cached post has the same valid `publishedAt`. Structural post changes remain immediate. Engagement observations hydrate missing values, persist a strictly greater-than-25% numeric change at most once per UTC hour, and force a refresh after 24 hours, using `fetchedAt` as the persisted observation clock.
+Community-post cache comparisons discard rotating YouTube thumbnail delivery parameters when the stable image origin/path is unchanged, and ignore relative-age label churn when the cached post has the same valid `publishedAt`. Structural post changes remain immediate. Engagement observations hydrate missing values, persist any normalized known numeric change at most once per UTC hour, and force a refresh after 24 hours, using `fetchedAt` as the persisted observation clock.
 
 The final subscriber leaving removes the channel from `channels:active`, which stops video and post polling. Display/subscriber caches are cleaned through the coordinated backup journal, while `channel:{id}:known:videos` remains durable so a later resubscribe cannot replay historical uploads.
 
