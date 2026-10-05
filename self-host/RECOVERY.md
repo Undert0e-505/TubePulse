@@ -21,7 +21,8 @@ The total-loss procedure does **not** assume an independent file backup. It is d
 The tracked Windows mechanism consists of:
 
 - `windows/Start-HomeAuthority.ps1`: an idempotent, bounded startup supervisor;
-- `windows/Install-HomeAuthorityStartupTask.ps1`: an elevated installer for a hidden at-logon Scheduled Task;
+- `windows/Install-HomeAuthorityStartupShortcut.ps1`: the production, non-administrator per-user Startup installer;
+- `windows/Install-HomeAuthorityStartupTask.ps1`: an optional elevated installer for an at-logon Scheduled Task;
 - Docker Compose `restart: unless-stopped`, the authority health check, persistent `data-authority`, and reconnecting `cloudflared`.
 
 The supervisor resolves repository paths from its own location, takes an exclusive non-destructive lock, starts Docker Desktop with `--minimized` only when `docker info` is unavailable, waits with exponential backoff, and runs the existing authority Compose stack with absolute Compose/environment paths. It rotates one bounded local log generation and never logs secrets or raw status payloads.
@@ -34,51 +35,52 @@ It verifies more than HTTP success:
 - local authority current state and no local transaction;
 - signed coordinator status through `home-authority-cli.mjs status`;
 - selected/ready D1 backend, remote current state, no transaction, and no pending backup keys;
-- active scheduler mode, fresh lease heartbeat, and recent minute progress (with a startup grace window).
+- active scheduler mode, a held scheduler lease, and recent aligned-cycle/minute progress (with a startup grace window).
 
 The Compose health check itself proves only HTTP success plus service identity. Docker can report healthy while authority is stale or scheduler progress is stuck. The supervisor never clears pending state or activates stale authority. It performs at most one bounded container restart for a proven liveness-health failure; readiness, coordinator, progress, or WAN failures are retried/reported without destructive restart loops.
 
-### Install, inspect, disable, or remove the task
+### Install, inspect, or remove per-user startup
 
-First initialize and manually verify the authority. Then preview the task without changing Windows:
+First initialize and manually verify the authority. Then preview the production mechanism without changing Windows:
 
 ```powershell
-.\self-host\windows\Install-HomeAuthorityStartupTask.ps1 -DryRun
+.\self-host\windows\Install-HomeAuthorityStartupShortcut.ps1 -DryRun
 .\self-host\windows\Start-HomeAuthority.ps1 -DryRun -InitialDelaySeconds 0
 ```
 
-From an elevated PowerShell session, install or idempotently replace the task:
+From the auto-login profile's ordinary PowerShell session, install or idempotently replace its Startup shortcut; no administrator elevation is required:
 
 ```powershell
-.\self-host\windows\Install-HomeAuthorityStartupTask.ps1
-Get-ScheduledTask -TaskName 'TubePulse Home Authority'
+.\self-host\windows\Install-HomeAuthorityStartupShortcut.ps1
+.\self-host\windows\Install-HomeAuthorityStartupShortcut.ps1 -Inspect
 ```
 
-The task runs at interactive sign-in after a short delay, uses a hidden PowerShell window, ignores overlapping instances, and asks Task Scheduler to retry bounded failures. It starts Docker Desktop minimized and waits for the engine instead of relying on Docker Desktop's separate autostart setting. This avoids duplicate startup owners.
+The shortcut runs at interactive sign-in with hidden PowerShell. The supervisor supplies the startup delay, bounded retry/backoff, and exclusive lock; it starts Docker Desktop minimized and waits for the engine instead of relying on Docker Desktop's separate autostart setting.
 
-Disable or remove only the task; neither command removes containers or data:
+Remove only the shortcut; this does not remove containers or data:
 
 ```powershell
-.\self-host\windows\Install-HomeAuthorityStartupTask.ps1 -Disable
-.\self-host\windows\Install-HomeAuthorityStartupTask.ps1 -Uninstall
+.\self-host\windows\Install-HomeAuthorityStartupShortcut.ps1 -Uninstall
 ```
 
-Docker Desktop is a user-session application. The task therefore runs at logon, not before any user session exists. `--minimized`, hidden Task Scheduler execution, and `-WindowStyle Hidden` prevent a persistent foreground window under normal versions, but Docker Desktop may still show a tray icon, first-run agreement, update prompt, or brief vendor-controlled splash. A service-oriented runtime would be required for a strict pre-login/no-UI guarantee.
+Docker Desktop is a user-session application. Startup therefore runs at logon, not before any user session exists. `--minimized` and `-WindowStyle Hidden` prevent a persistent foreground window under normal versions, but Docker Desktop may still show a tray icon, first-run agreement, update prompt, or brief vendor-controlled splash. A service-oriented runtime would be required for a strict pre-login/no-UI guarantee.
+
+The Scheduled Task installer remains an optional administrator-controlled alternative. On hosts where UAC uses a different administrator account, Windows can create a task whose ACL prevents the auto-login profile from inspecting or invoking it even when the task principal was requested explicitly. Prefer the per-user Startup shortcut here. An administrator may later inspect/remove a possibly retained `TubePulse Home Authority` task; do not repeatedly elevate from automation to repair its ACL. If both launchers ever run, the supervisor lock and idempotent Compose operation make the duplicate invocation harmless.
 
 ### Expected common-failure behavior
 
 | Event | Expected behavior | Target recovery band |
 |---|---|---:|
 | Home process/container exits | Docker restarts it with the persistent bind mount; lease/transaction safeguards still apply. | At most 5 minutes |
-| Docker is stopped at sign-in | Hidden task starts Docker Desktop minimized, waits for `docker info`, then applies Compose idempotently. | At most 10 minutes after sign-in |
+| Docker is stopped at sign-in | Hidden per-user Startup launcher starts Docker Desktop minimized, waits for `docker info`, then applies Compose idempotently. | At most 10 minutes after sign-in |
 | Reboot or power restoration | Same at-logon flow; an unclean lease must expire naturally. | At most 10 minutes after sign-in/network |
 | Sleep/hibernation | Docker/containers normally resume; cloudflared reconnects. A later task retry or manual dry status can reassert Compose without overlap. | At most 10 minutes after usable network |
 | Internet/Cloudflare outage | Containers remain intact; cloudflared and Home retry/back off. Supervisor classifies dependency failure and does not restart repeatedly. | At most 10 minutes after dependency return |
 | Container HTTP health is genuinely unhealthy | Supervisor may perform one bounded restart, then alerts/fails if liveness does not return. | At most 5 minutes when dependencies are healthy |
-| Authority stale, pending, or transaction fault | No destructive restart/clear/activation. Task exits unsuccessfully after bounded observation so the fault remains actionable. | Manual integrity recovery |
-| Scheduler heartbeat/progress stuck while HTTP remains healthy | Classified separately and surfaced; not treated as an upstream outage or automatic data reset. | Manual diagnosis after bounded alert |
+| Authority stale, pending, or transaction fault | No destructive restart/clear/activation. The supervisor exits unsuccessfully after bounded observation so the fault remains actionable. | Manual integrity recovery |
+| Scheduler lease/progress stuck while HTTP remains healthy | Classified separately and surfaced; not treated as an upstream outage or automatic data reset. | Manual diagnosis after bounded alert |
 
-The current host must have the installer executed and reboot-tested before these become host guarantees. Repository presence alone does not register a task.
+The current host has the per-user Startup shortcut installed and has passed an idempotent live invocation against the running authority without replacing the healthy container. A controlled sign-out/reboot test remains outstanding, so post-boot timing is not yet a measured guarantee.
 
 ## Total-loss recovery: what survives remotely
 
@@ -271,7 +273,7 @@ Notification intent history cannot be reconstructed. Canonical recent/unwatched 
 
 ### 9. Install unattended startup
 
-Only after application recovery succeeds, dry-run and install the Scheduled Task described at the top of this document. Reboot-test it during controlled maintenance with public D1 fallback verified first. Confirm Docker starts minimized, the dashboard does not remain foregrounded, Compose is idempotent, and the supervisor records active/current/progress success without exposing data.
+Only after application recovery succeeds, dry-run and install the per-user Startup shortcut described at the top of this document. Reboot-test it during controlled maintenance with public D1 fallback verified first. Confirm Docker starts minimized, the dashboard does not remain foregrounded, Compose is idempotent, and the supervisor records active/current/progress success without exposing data. Use the Scheduled Task path only when an administrator intentionally owns and validates its ACL.
 
 ## Total-loss failure/rollback table
 

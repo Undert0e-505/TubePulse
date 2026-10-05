@@ -14,6 +14,7 @@ import { requestPermissionAndGetToken, onTokenRefresh, onForegroundMessage, onNo
 import { registerDevice, markSeen, getDeviceId, subscribeChannel, updateSettings, bootstrapChannel } from './src/utils/api';
 import { setupNotificationChannel } from './src/utils/notifications';
 import { ConfirmHost } from './src/components/Confirm';
+import SettingsCogIcon from './src/components/SettingsCogIcon';
 import { updateWidget } from './src/components/widgetTaskHandler';
 import {
   IS_TUBEPULSE_PREVIEW,
@@ -59,7 +60,7 @@ const screenOptions = {
   contentStyle: { backgroundColor: COLORS.bg },
 };
 
-function HeaderButton({ title, onPress, style, textStyle, accessibilityLabel, accessibilityHint }) {
+function HeaderButton({ title, children, onPress, style, textStyle, accessibilityLabel, accessibilityHint }) {
   return (
     <TouchableOpacity
       onPress={onPress}
@@ -68,9 +69,11 @@ function HeaderButton({ title, onPress, style, textStyle, accessibilityLabel, ac
       accessibilityLabel={accessibilityLabel || title}
       accessibilityHint={accessibilityHint}
     >
-      <Text style={[{ color: COLORS.accent, fontSize: 14, fontWeight: '500' }, textStyle]}>
-        {title}
-      </Text>
+      {children || (
+        <Text style={[{ color: COLORS.accent, fontSize: 14, fontWeight: '500' }, textStyle]}>
+          {title}
+        </Text>
+      )}
     </TouchableOpacity>
   );
 }
@@ -548,13 +551,13 @@ function TubePulseApplication() {
                 <>
                   <HeaderButton title="Channels" onPress={() => navigation.navigate('Channels')} />
                   <HeaderButton
-                    title="⚙"
                     onPress={() => navigation.navigate('Settings')}
                     style={{ marginLeft: 6 }}
-                    textStyle={{ fontSize: 22 }}
                     accessibilityLabel="Settings"
                     accessibilityHint="Opens TubePulse settings"
-                  />
+                  >
+                    <SettingsCogIcon />
+                  </HeaderButton>
                 </>
               ),
             })}

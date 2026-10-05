@@ -1,9 +1,11 @@
 import React, { useState, useCallback } from 'react';
 import {
   View, Text, TouchableOpacity, StyleSheet,
-  Platform, Switch, ScrollView,
+  Switch, ScrollView, Linking,
 } from 'react-native';
 import { useFocusEffect, useNavigation } from '@react-navigation/native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import appConfig from '../../app.json';
 import { COLORS, DEFAULT_SETTINGS, NAG_INTERVALS, PREWARN_OPTIONS, VIDEOS_PER_CHANNEL_OPTIONS } from '../utils/constants';
 import TimeSpinner from '../components/TimeSpinner';
 import { getSettings, saveSettings } from '../utils/storage';
@@ -13,6 +15,7 @@ import { IS_TUBEPULSE_PREVIEW } from '../utils/apiEndpointConfig';
 // ── Main Screen ───────────────────────────────────────────────────────────────
 export default function SettingsScreen() {
   const navigation = useNavigation();
+  const insets = useSafeAreaInsets();
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
 
   useFocusEffect(
@@ -38,7 +41,8 @@ export default function SettingsScreen() {
   const mode = settings.notificationMode || 'relentless';
 
   return (
-    <ScrollView style={styles.container} contentContainerStyle={styles.content}>
+    <View style={styles.container}>
+      <ScrollView style={styles.scroll} contentContainerStyle={styles.content}>
 
       {/* Tap Action */}
       <Text style={[styles.sectionTitle, styles.sectionTitleFirst]}>On tap, open:</Text>
@@ -246,7 +250,19 @@ export default function SettingsScreen() {
         </>
       ) : null}
 
-    </ScrollView>
+      </ScrollView>
+      <View style={[styles.footer, { paddingBottom: Math.max(insets.bottom, 8) }]}>
+        <Text style={styles.footerVersion}>Version {appConfig.expo.version}</Text>
+        <TouchableOpacity
+          onPress={() => Linking.openURL('https://github.com/Undert0e-505/TubePulse')}
+          accessibilityRole="link"
+          accessibilityLabel="Link to Source"
+          hitSlop={8}
+        >
+          <Text style={styles.footerLink}>Link to Source</Text>
+        </TouchableOpacity>
+      </View>
+    </View>
   );
 }
 
@@ -255,10 +271,13 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: COLORS.bg,
   },
+  scroll: {
+    flex: 1,
+  },
   content: {
     paddingHorizontal: 16,
     paddingTop: 0,
-    paddingBottom: 40,
+    paddingBottom: 16,
   },
   sectionTitle: {
     color: COLORS.textDim,
@@ -383,5 +402,25 @@ const styles = StyleSheet.create({
     color: COLORS.textDim,
     fontSize: 20,
     marginTop: 20,
+  },
+  footer: {
+    minHeight: 36,
+    paddingTop: 7,
+    paddingHorizontal: 16,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: COLORS.border,
+    backgroundColor: COLORS.bg,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  footerVersion: {
+    color: COLORS.textDim,
+    fontSize: 12,
+  },
+  footerLink: {
+    color: COLORS.accent,
+    fontSize: 12,
+    fontWeight: '600',
   },
 });

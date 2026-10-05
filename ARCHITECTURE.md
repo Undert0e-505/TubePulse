@@ -409,7 +409,7 @@ If a push ever does arrive (e.g. from a self-hosted hub), the handler does the s
 
 WebSub was the preferred path because it was push-based, free, and standard. The shutdown of Google's hub in 2024 changed the calculus. The fallback that was always sketched in the design is now the production path: poll the YouTube Data API on a cron schedule, with the same "process new video for channel" function the WebSub handler uses.
 
-**Quota math (§6.2 revisited):** at 35 channels, 5-min polling fits in the free tier. Beyond that, either upgrade or accept coarser polling for low-priority channels.
+**Quota math (§6.2 revisited):** the five-minute detector batches up to 50 channel IDs per request. Capacity planning must use the active subscription set, safety reconciliation formula, event-driven metadata requests, and the configured daily reserve rather than a hard-coded fleet example.
 
 ---
 
@@ -773,7 +773,7 @@ Community-post cache comparisons discard rotating YouTube thumbnail delivery par
 
 The final subscriber leaving removes the channel from `channels:active`, which stops video and post polling. Display/subscriber caches are cleaned through the coordinated backup journal, while `channel:{id}:known:videos` remains durable so a later resubscribe cannot replay historical uploads.
 
-Host availability and disaster recovery are deliberately separate from this data-plane design. Compose health proves only HTTP liveness/service identity—not authority readiness/current state or scheduler progress. The checked-in Windows supervisor starts Docker minimized, applies Compose idempotently, and separately evaluates signed coordinator/D1 readiness and scheduler progress without clearing stale/pending state or restarting for dependency outages. Its Scheduled Task still must be installed/reboot-tested on the host. After total disk loss, GitHub plus active D1/DO and the existing cloud projects reconstruct canonical service; secrets rotate and host-only scheduler/quota/notification state follows conservative loss rules. See [`self-host/RECOVERY.md`](self-host/RECOVERY.md).
+Host availability and disaster recovery are deliberately separate from this data-plane design. Compose health proves only HTTP liveness/service identity—not authority readiness/current state or scheduler progress. The checked-in Windows supervisor starts Docker minimized, applies Compose idempotently, and separately evaluates signed coordinator/D1 readiness and scheduler progress without clearing stale/pending state or restarting for dependency outages. A verified per-user Startup shortcut now invokes it at interactive sign-in; the idempotent live test passed without replacing the healthy container, while a real reboot test remains outstanding. The elevated Scheduled Task route is optional because cross-account UAC task ACLs can exclude the auto-login profile. After total disk loss, GitHub plus active D1/DO and the existing cloud projects reconstruct canonical service; secrets rotate and host-only scheduler/quota/notification state follows conservative loss rules. See [`self-host/RECOVERY.md`](self-host/RECOVERY.md).
 
 ---
 

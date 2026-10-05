@@ -27,6 +27,7 @@ Set-StrictMode -Version Latest
 $selfHostDirectory = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $composePath = [IO.Path]::GetFullPath((Join-Path $selfHostDirectory 'compose.authority.yaml'))
 $environmentPath = [IO.Path]::GetFullPath((Join-Path $selfHostDirectory '.env.authority'))
+$sourceDirectory = [IO.Path]::GetFullPath((Join-Path $selfHostDirectory 'src'))
 $dataDirectory = [IO.Path]::GetFullPath((Join-Path $selfHostDirectory 'data-authority'))
 $logPath = [IO.Path]::GetFullPath((Join-Path $dataDirectory 'startup-supervisor.log'))
 $previousLogPath = [IO.Path]::GetFullPath((Join-Path $dataDirectory 'startup-supervisor.previous.log'))
@@ -47,7 +48,7 @@ function Assert-ChildPath {
     }
 }
 
-foreach ($path in @($composePath, $environmentPath, $dataDirectory, $logPath, $previousLogPath, $lockPath)) {
+foreach ($path in @($composePath, $environmentPath, $sourceDirectory, $dataDirectory, $logPath, $previousLogPath, $lockPath)) {
     Assert-ChildPath -Parent $selfHostDirectory -Child $path
 }
 if (-not (Test-Path -LiteralPath $composePath -PathType Leaf)) {
@@ -123,8 +124,18 @@ function Resolve-DockerCommand {
 
 function Invoke-Docker {
     param([Parameter(Mandatory = $true)][string[]]$Arguments)
-    $output = @(& $script:DockerCommand @Arguments 2>&1)
-    return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = @($output | ForEach-Object { [string]$_ }) }
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        # Docker/Compose writes ordinary progress messages to stderr. Capture them
+        # and decide success from the native exit code instead of PowerShell's
+        # ErrorRecord conversion.
+        $ErrorActionPreference = 'Continue'
+        $output = @(& $script:DockerCommand @Arguments 2>&1)
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    return [pscustomobject]@{ ExitCode = $exitCode; Output = @($output | ForEach-Object { [string]$_ }) }
 }
 
 function Test-DockerReady {
@@ -187,11 +198,15 @@ function Get-LocalAuthorityStatus {
 }
 
 function Get-RemoteAuthorityStatus {
+    $sourceMount = '{0}:/app/self-host/src:ro' -f $sourceDirectory
     $result = Invoke-Docker -Arguments (Compose-Arguments -Tail @(
-        'run', '--rm', '--no-deps', 'home-authority', 'node', 'src/home-authority-cli.mjs', 'status'
+        'run', '--rm', '--no-deps', '--volume', $sourceMount,
+        'home-authority', 'node', 'src/home-authority-cli.mjs', 'status'
     ))
     if ($result.ExitCode -ne 0 -or $result.Output.Count -eq 0) { return $null }
-    foreach ($line in @($result.Output | Select-Object -Reverse)) {
+    $lines = @($result.Output)
+    for ($index = $lines.Count - 1; $index -ge 0; $index--) {
+        $line = $lines[$index]
         if ([string]::IsNullOrWhiteSpace($line) -or -not $line.Trim().StartsWith('{')) { continue }
         try { return ($line | ConvertFrom-Json) } catch { continue }
     }
@@ -205,6 +220,14 @@ function Test-FreshTimestamp {
     if (-not [DateTimeOffset]::TryParse([string]$Value, [ref]$parsed)) { return $false }
     $age = [DateTimeOffset]::Now - $parsed
     return $age.TotalMinutes -ge -1 -and $age.TotalMinutes -le $MaximumAgeMinutes
+}
+
+function Get-OptionalProperty {
+    param([object]$Object, [string]$Name)
+    if ($null -eq $Object) { return $null }
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+    return $property.Value
 }
 
 function Evaluate-Authority {
@@ -230,13 +253,24 @@ function Evaluate-Authority {
     if ([string]$Local.mode -ne 'active' -or [string]$Local.scheduler.mode -ne 'active') {
         return [pscustomobject]@{ Success = $false; Category = 'scheduler-mode'; Message = 'Authority scheduler is not active.' }
     }
-    $heartbeatAt = if ($null -ne $Local.scheduler.lease) { $Local.scheduler.lease.heartbeatAt } else { $null }
-    $minuteScheduledAt = if ($null -ne $Local.scheduler.lastMinuteJobs) { $Local.scheduler.lastMinuteJobs.scheduledAt } else { $null }
-    $heartbeatFresh = Test-FreshTimestamp -Value $heartbeatAt -MaximumAgeMinutes $ProgressMaximumAgeMinutes
+    $leaseHeld = [string](Get-OptionalProperty -Object $Local.scheduler.lease -Name 'state') -eq 'held'
+    $minuteScheduledAt = Get-OptionalProperty -Object $Local.scheduler.lastMinuteJobs -Name 'scheduledAt'
+    $sweepProgressAt = Get-OptionalProperty -Object $Local.scheduler.youtubeDataApi -Name 'lastGoodAt'
+    if ($null -eq $sweepProgressAt) {
+        $lastVideoCycle = Get-OptionalProperty -Object $Local.scheduler.youtubeDataApi -Name 'lastCycle'
+        $sweepProgressAt = Get-OptionalProperty -Object $lastVideoCycle -Name 'finishedAt'
+    }
+    if ($null -eq $sweepProgressAt) {
+        $sweepProgressAt = Get-OptionalProperty -Object $Local.scheduler.currentSweep -Name 'startedAt'
+    }
+    if ($null -eq $sweepProgressAt) {
+        $sweepProgressAt = Get-OptionalProperty -Object $Local.scheduler.lastSweep -Name 'finishedAt'
+    }
     $minuteFresh = Test-FreshTimestamp -Value $minuteScheduledAt -MaximumAgeMinutes $ProgressMaximumAgeMinutes
+    $sweepFresh = Test-FreshTimestamp -Value $sweepProgressAt -MaximumAgeMinutes $ProgressMaximumAgeMinutes
     $recentStart = Test-FreshTimestamp -Value $Local.scheduler.startedAt -MaximumAgeMinutes $ProgressMaximumAgeMinutes
-    if (-not $heartbeatFresh -or (-not $minuteFresh -and -not $recentStart)) {
-        return [pscustomobject]@{ Success = $false; Category = 'scheduler-progress'; Message = 'Scheduler heartbeat or minute progress is stale.' }
+    if (-not $leaseHeld -or -not $minuteFresh -or (-not $sweepFresh -and -not $recentStart)) {
+        return [pscustomobject]@{ Success = $false; Category = 'scheduler-progress'; Message = 'Scheduler lease or aligned-cycle progress is stale.' }
     }
     return [pscustomobject]@{ Success = $true; Category = 'active-current'; Message = 'Authority and scheduler are current and progressing.' }
 }

@@ -153,22 +153,23 @@ Stop it without deleting persistent state with `docker compose down`. To return 
 
 ## Windows always-on operation
 
-`windows/Start-TubePulse.ps1` remains the simple foreground restart loop for the standalone Preview runtime. Production unified Home uses the narrower Docker supervisor and Scheduled Task installer:
+`windows/Start-TubePulse.ps1` remains the simple foreground restart loop for the standalone Preview runtime. Production unified Home uses the narrower Docker supervisor and non-administrator per-user Startup installer:
 
 ```powershell
 .\windows\Start-HomeAuthority.ps1 -DryRun -InitialDelaySeconds 0
-.\windows\Install-HomeAuthorityStartupTask.ps1 -DryRun
+.\windows\Install-HomeAuthorityStartupShortcut.ps1 -DryRun
 ```
 
-After manual authority recovery/readiness is proven, run the installer from an elevated PowerShell session. It registers one hidden at-logon task for the current interactive identity, with a startup delay, bounded retry, and `IgnoreNew` overlap policy:
+After manual authority recovery/readiness is proven, run the installer from the auto-login profile without elevation. It creates one hidden per-user Startup shortcut; the supervisor supplies the startup delay, bounded retry, and exclusive overlap lock:
 
 ```powershell
-.\windows\Install-HomeAuthorityStartupTask.ps1
+.\windows\Install-HomeAuthorityStartupShortcut.ps1
+.\windows\Install-HomeAuthorityStartupShortcut.ps1 -Inspect
 ```
 
-The startup script resolves absolute repo paths safely, starts Docker Desktop minimized only when necessary, waits for `docker info`, applies `compose.authority.yaml` idempotently, and checks local readiness, signed coordinator/D1 state, pending/transaction state, and scheduler heartbeat/progress. It does not clear or activate stale state and does not restart containers merely because an upstream dependency is unavailable. Logs rotate under ignored `data-authority` and never contain raw status or credentials. Disable/remove instructions, dry-run validation, expected recovery bands, and Docker Desktop UI limitations are in [`RECOVERY.md`](RECOVERY.md).
+The startup script resolves absolute repo paths safely, starts Docker Desktop minimized only when necessary, waits for `docker info`, applies `compose.authority.yaml` idempotently, and checks local readiness, signed coordinator/D1 state, pending/transaction state, and scheduler lease/aligned-cycle progress. It does not clear or activate stale state and does not restart containers merely because an upstream dependency is unavailable. Logs rotate under ignored `data-authority` and never contain raw status or credentials. Disable/remove instructions, dry-run validation, expected recovery bands, and Docker Desktop UI limitations are in [`RECOVERY.md`](RECOVERY.md).
 
-The latest host audit found no matching task installed and Docker Desktop autostart disabled. The code is implemented in the repository, but unattended recovery is not a host guarantee until the installer is deliberately run and reboot-tested. Docker Desktop needs an interactive sign-in; the task cannot provide pre-login service semantics.
+The production auto-login profile now has this shortcut installed and a safe idempotent invocation completed with the existing healthy container unchanged. A real sign-out/reboot test remains outstanding. Docker Desktop still needs an interactive sign-in, so this mechanism cannot provide pre-login service semantics. The elevated Scheduled Task installer remains optional; cross-account UAC can create task ACLs inaccessible to the auto-login profile, and an administrator may need to remove a possibly retained task later. Duplicate invocation is harmless because the supervisor lock and idempotent Compose operation reject overlap.
 
 ## Home scheduler consolidation and production authority
 
@@ -183,7 +184,7 @@ docker compose --env-file .env.scheduler -f compose.scheduler.yaml run --rm home
 
 For historical write-rate evidence, `once --sweeps=2` performs two shadow-only whole-fleet measurements in one process. It is a diagnostic compatibility path, not the continuous production cadence, and should not be used while YouTube is suppressing the Home egress because it intentionally concentrates requests. Active mode rejects `once`. Normal `run` mode checks posts only on the configured hourly boundary.
 
-For a continuous shadow, use `up -d`; `restart: unless-stopped` resumes after Docker Desktop starts, the file lease excludes a second runner, and the health check rejects an expired heartbeat. Configure Docker Desktop to start with Windows and verify the container after every host reboot. `docker compose --env-file .env.scheduler -f compose.scheduler.yaml down` stops only this service and preserves `data-scheduler`. After an unclean container stop, a replacement intentionally refuses the old lease until its configured TTL expires (180 seconds by default), then archives that stale lease and resumes; do not delete the lock to bypass this safety window.
+For a continuous shadow, use `up -d`; `restart: unless-stopped` resumes after Docker Desktop starts and the file lease excludes a second runner. Its container health is liveness-only, so verify lease/progress separately after every host reboot. `docker compose --env-file .env.scheduler -f compose.scheduler.yaml down` stops only this service and preserves `data-scheduler`. After an unclean container stop, a replacement intentionally refuses the old lease until its configured TTL expires (180 seconds by default), then archives that stale lease and resumes; do not delete the lock to bypass this safety window.
 
 Continuous Home scheduling sorts and de-duplicates `channels:active`. On every aligned five-minute boundary it calls `channels.list(part=statistics,contentDetails)` in batches of at most 50 IDs. The current fleet fits in exactly two detector requests per cycle, or 576 general quota units/day. A missing baseline or changed public `videoCount` queues that channel's cached uploads playlist for reconciliation. A one-time migration pass reconciles every established channel even when its newly captured count is unchanged; a count baseline alone cannot hide uploads missed during the prior source outage. After that pass, unchanged channels make no per-cycle playlist request. First-page safety reconciliation defaults to every six hours and is bounded per cycle; if no known ID overlaps, pagination continues only to the configured page bound. Posts still sweep every eligible channel once per hour; aux remains bounded and runs each minute.
 

@@ -4,6 +4,10 @@ param(
     [string]$TaskName = 'TubePulse Home Authority',
 
     [Parameter(ParameterSetName = 'Install')]
+    [ValidatePattern('^[^\\/:*?"<>|]+\\[^\\/:*?"<>|]+$')]
+    [string]$TargetUser,
+
+    [Parameter(ParameterSetName = 'Install')]
     [ValidateRange(0, 3600)]
     [int]$StartupDelaySeconds = 30,
 
@@ -64,7 +68,14 @@ if (-not $DryRun -and -not (Test-Path -LiteralPath $environmentPath -PathType Le
     throw "Required startup file is missing: $environmentPath"
 }
 
-$identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+$identity = if ([string]::IsNullOrWhiteSpace($TargetUser)) {
+    [string](Get-CimInstance Win32_ComputerSystem).UserName
+} else {
+    $TargetUser
+}
+if ([string]::IsNullOrWhiteSpace($identity)) {
+    throw 'No interactive Windows user is signed in; the authority task must target an interactive profile.'
+}
 $argument = '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}"' -f $startupScript
 $plan = [pscustomobject]@{
     TaskName = $TaskName
