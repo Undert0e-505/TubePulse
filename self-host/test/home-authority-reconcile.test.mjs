@@ -77,3 +77,30 @@ test('current local and remote authorities do not perform an expensive snapshot 
   assert.equal(result.reconciled, false);
   assert.equal(snapshots, 0);
 });
+
+test('stale Home drains verified pending canonical deltas before requesting a snapshot', async (t) => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tubepulse-reconcile-pending-'));
+  t.after(() => fs.rm(dataDir, { recursive: true, force: true }));
+  const local = new MemoryAdapter({ old: 'stale' });
+  const canonical = snapshot({ alpha: 'one' });
+  const events = [];
+  let pending = 1;
+  const client = {
+    async status() { return { replication: { status: 'current' }, pendingBackupKeys: pending }; },
+    async flushAllPending() { events.push('drain'); pending = 0; },
+    async snapshotCanonical() { events.push('snapshot'); assert.equal(pending, 0); return canonical; },
+    async activateCanonical() { events.push('activate'); },
+    async releaseReconciliation() {},
+    async markStale() {},
+  };
+  const gate = {
+    async status() { return { replication: { status: 'stale' } }; },
+    async reconcile() { events.push('local-current'); },
+  };
+  const result = await ensureHomeAuthorityCurrent({
+    local, client, gate,
+    syncStateFile: new JsonStateFile(path.join(dataDir, 'sync.json'), {}),
+  });
+  assert.equal(result.reconciled, true);
+  assert.deepEqual(events, ['drain', 'snapshot', 'activate', 'local-current']);
+});

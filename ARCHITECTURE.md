@@ -1,6 +1,6 @@
 # TubePulse — Architecture Specification
 
-**Version:** Current architecture reference for the v3.x app line. See [STATUS.md](STATUS.md) for current checked-in version and operational caveats.
+**Version:** Current architecture reference for the v4.x app line. See [STATUS.md](STATUS.md) for current checked-in version and operational caveats.
 **Date:** 2026-04-19 (initial), updated through the Home Data API and D1 canonical-backup cutovers on 2026-10-05
 **Status:** Architecture reference. Explicitly labelled historical sections retain RSS/WebSub/KV design context; §15.6 and [STATUS.md](STATUS.md) describe current production.
 
@@ -321,7 +321,7 @@ The shards therefore process up to three channels per five-minute tick. For `N` 
 
 **Historical quota cost:** 0 YouTube Data API units.
 
-**KV cost:** 1 read per channel per tick (`channel:{id}:recent`). Writes only when a view count changes or a new video is detected. At 50 channels: ~50-100 writes/day, well under the 1,000/day free tier.
+**Historical KV cost model:** one read per channel per tick (`channel:{id}:recent`), with writes when a view count changed or a new video was detected. This pre-D1 estimate is retained only as design history; the current Home/D1 path uses coordinated changed-key publication and D1 row budgets.
 
 **Historical rationale for RSS:**
 - RSS includes the data we need: videoId, title, publishedAt, thumbnail, link, AND view counts (from `media:statistics/@_views`)

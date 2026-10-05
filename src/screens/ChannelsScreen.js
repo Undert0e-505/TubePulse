@@ -14,6 +14,7 @@ import {
   Switch,
 } from 'react-native';
 import DraggableFlatList, { ScaleDecorator } from 'react-native-draggable-flatlist';
+import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { useFocusEffect } from '@react-navigation/native';
 import { COLORS, PREWARN_OPTIONS, VIDEOS_PER_CHANNEL_OPTIONS } from '../utils/constants';
 import {
@@ -31,6 +32,8 @@ import TimeSpinner from '../components/TimeSpinner';
 import { confirm } from '../components/Confirm';
 import { updateWidget } from '../components/widgetTaskHandler';
 import { orderChannels } from '../utils/channelOrdering.mjs';
+import { prepareChannelNotificationSettings } from '../utils/channelNotificationSettings.mjs';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 // Default per-channel settings (mirrors global defaults)
 const DEFAULT_CHANNEL_NOTIF = {
@@ -49,6 +52,7 @@ const DEFAULT_CHANNEL_NOTIF = {
 };
 
 export default function ChannelsScreen() {
+  const insets = useSafeAreaInsets();
   const [channels, setChannels] = useState([]);
   const [cache, setCache] = useState({});
   const [newHandle, setNewHandle] = useState('');
@@ -60,6 +64,7 @@ export default function ChannelsScreen() {
   const [editingNotif, setEditingNotif] = useState(DEFAULT_CHANNEL_NOTIF);
   const [channelDisplaySettings, setChannelDisplaySettings] = useState({});
   const [appSettings, setAppSettings] = useState(null);
+  const [modalScrollEnabled, setModalScrollEnabled] = useState(true);
   const autoOrderChannels = appSettings?.autoOrderChannels === true;
 
   useFocusEffect(
@@ -93,12 +98,17 @@ export default function ChannelsScreen() {
       ...existing,
       latestVideosPerChannel: existingDisplay.latestVideosPerChannel ?? null,
     });
+    setModalScrollEnabled(true);
     setEditingChannel(handle);
   };
 
   const saveChannelNotif = async () => {
     // Split display fields from notification fields — they're stored in separate keys.
-    const { latestVideosPerChannel: _displayField, ...notifOnly } = editingNotif;
+    const {
+      notificationSettings: notifOnly,
+      latestVideosPerChannel,
+      overridePayload,
+    } = prepareChannelNotificationSettings(editingNotif);
 
     // Save notification settings
     const updatedNotif = { ...channelNotifSettings, [editingChannel]: notifOnly };
@@ -107,8 +117,8 @@ export default function ChannelsScreen() {
 
     // Save display settings (only if overridden)
     const updatedDisplay = { ...channelDisplaySettings };
-    if (editingNotif.latestVideosPerChannel !== null) {
-      updatedDisplay[editingChannel] = { latestVideosPerChannel: editingNotif.latestVideosPerChannel };
+    if (latestVideosPerChannel !== null) {
+      updatedDisplay[editingChannel] = { latestVideosPerChannel };
     } else {
       delete updatedDisplay[editingChannel];
     }
@@ -122,9 +132,6 @@ export default function ChannelsScreen() {
       const deviceId = await getDeviceId();
       const ch = channels.find((c) => c.handle === editingChannel);
       if (ch?.channelId) {
-        const overridePayload = Object.fromEntries(
-          Object.entries(notifOnly).filter(([, v]) => v !== null)
-        );
         await setChannelOverride(deviceId, ch.channelId, overridePayload);
       }
     } catch (e) {
@@ -449,11 +456,15 @@ export default function ChannelsScreen() {
         transparent
         onRequestClose={() => setEditingChannel(null)}
       >
+        <GestureHandlerRootView style={styles.modalGestureRoot}>
         <View style={styles.modalOverlay}>
+          <View style={styles.modalSheet}>
           <ScrollView
-            style={styles.modalSheet}
+            style={styles.modalScroll}
             contentContainerStyle={styles.modalSheetContent}
             keyboardShouldPersistTaps="handled"
+            nestedScrollEnabled
+            scrollEnabled={modalScrollEnabled}
           >
             <Text style={styles.modalTitle}>
               Notifications — @{editingChannel}
@@ -492,14 +503,17 @@ export default function ChannelsScreen() {
                   <TimeSpinner
                     value={editingNotif.dndStart}
                     onChange={(v) => setEditingNotif(n => ({ ...n, dndStart: v }))}
+                    compact
+                    onInteractionChange={(active) => setModalScrollEnabled(!active)}
                   />
                 </View>
-                <Text style={styles.timeSep}>→</Text>
                 <View style={styles.timeField}>
                   <Text style={styles.timeLabel}>Until</Text>
                   <TimeSpinner
                     value={editingNotif.dndEnd}
                     onChange={(v) => setEditingNotif(n => ({ ...n, dndEnd: v }))}
+                    compact
+                    onInteractionChange={(active) => setModalScrollEnabled(!active)}
                   />
                 </View>
               </View>
@@ -528,7 +542,7 @@ export default function ChannelsScreen() {
               })}
             </View>
             <Text style={styles.modalHint}>
-              Global: use the Include community posts setting from Settings. On/Off: override for this channel only.
+              Global uses Settings; On/Off overrides this channel.
             </Text>
 
             <Text style={styles.modalLabel}>Prewarn time</Text>
@@ -560,7 +574,7 @@ export default function ChannelsScreen() {
               </View>
             )}
             <Text style={styles.modalHint}>
-              How early to be notified before a scheduled livestream. Off: use the global setting.
+              Global uses the Settings prewarn time.
             </Text>
 
             {/* Videos shown per channel � display setting (local-only, not synced to server) */}
@@ -585,7 +599,7 @@ export default function ChannelsScreen() {
               })}
             </View>
             <Text style={styles.modalHint}>
-              How many recent videos to show for this channel on the Home screen. Global: use the Settings default.
+              Global uses the Settings video count.
             </Text>
 
             {(channelNotifSettings[editingChannel] || channelDisplaySettings[editingChannel]) && (
@@ -594,7 +608,8 @@ export default function ChannelsScreen() {
               </TouchableOpacity>
             )}
 
-            <View style={styles.modalButtons}>
+          </ScrollView>
+            <View style={[styles.modalButtons, { paddingBottom: Math.max(insets.bottom, 12) }]}>
               <TouchableOpacity style={styles.modalCancel} onPress={() => setEditingChannel(null)}>
                 <Text style={styles.modalCancelText}>Cancel</Text>
               </TouchableOpacity>
@@ -602,8 +617,9 @@ export default function ChannelsScreen() {
                 <Text style={styles.modalSaveText}>Save</Text>
               </TouchableOpacity>
             </View>
-          </ScrollView>
+          </View>
         </View>
+        </GestureHandlerRootView>
       </Modal>
       <View style={styles.autoOrderRow}>
         <View style={styles.autoOrderText}>
@@ -810,6 +826,9 @@ const styles = StyleSheet.create({
   },
 
   // Modal
+  modalGestureRoot: {
+    flex: 1,
+  },
   modalOverlay: {
     flex: 1,
     backgroundColor: 'rgba(0,0,0,0.6)',
@@ -819,17 +838,22 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.surface,
     borderTopLeftRadius: 16,
     borderTopRightRadius: 16,
-    maxHeight: '85%',
+    maxHeight: '96%',
+    overflow: 'hidden',
+  },
+  modalScroll: {
+    flexShrink: 1,
   },
   modalSheetContent: {
-    padding: 24,
-    paddingBottom: 56, // clear Android nav tray
+    paddingHorizontal: 20,
+    paddingTop: 14,
+    paddingBottom: 8,
   },
   modalTitle: {
     color: COLORS.text,
     fontSize: 17,
     fontWeight: '700',
-    marginBottom: 20,
+    marginBottom: 8,
   },
   modalLabel: {
     color: COLORS.textDim,
@@ -837,14 +861,14 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     textTransform: 'uppercase',
     letterSpacing: 0.5,
-    marginBottom: 10,
-    marginTop: 16,
+    marginBottom: 5,
+    marginTop: 8,
   },
   modalHint: {
     color: COLORS.textDim,
-    fontSize: 12,
-    lineHeight: 16,
-    marginTop: 6,
+    fontSize: 11,
+    lineHeight: 14,
+    marginTop: 3,
   },
   optionGroup: {
     flexDirection: 'row',
@@ -852,7 +876,8 @@ const styles = StyleSheet.create({
   },
   option: {
     flex: 1,
-    paddingVertical: 12,
+    minHeight: 44,
+    paddingVertical: 10,
     borderRadius: 8,
     backgroundColor: COLORS.bg,
     borderWidth: 1,
@@ -876,7 +901,8 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    paddingVertical: 8,
+    minHeight: 44,
+    paddingVertical: 2,
   },
   dndLabel: {
     color: COLORS.text,
@@ -885,25 +911,24 @@ const styles = StyleSheet.create({
   timeRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 16,
-    marginTop: 10,
+    justifyContent: 'space-between',
+    flexWrap: 'wrap',
+    gap: 8,
+    marginTop: 4,
   },
   timeField: {
     alignItems: 'center',
+    minWidth: 120,
   },
   timeLabel: {
     color: COLORS.textDim,
     fontSize: 12,
     marginBottom: 6,
   },
-  timeSep: {
-    color: COLORS.textDim,
-    fontSize: 20,
-    marginTop: 20,
-  },
   modalReset: {
-    marginTop: 20,
-    paddingVertical: 10,
+    marginTop: 4,
+    minHeight: 44,
+    justifyContent: 'center',
     alignItems: 'center',
   },
   modalResetText: {
@@ -914,7 +939,11 @@ const styles = StyleSheet.create({
   modalButtons: {
     flexDirection: 'row',
     gap: 12,
-    marginTop: 12,
+    paddingHorizontal: 20,
+    paddingTop: 8,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: COLORS.border,
+    backgroundColor: COLORS.surface,
   },
   modalCancel: {
     flex: 1,

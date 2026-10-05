@@ -8,10 +8,11 @@ import Animated, {
   withSpring,
 } from 'react-native-reanimated';
 import { COLORS } from '../utils/constants';
+import { stepTime } from '../utils/timeSpinner.mjs';
 
 const STEP_HEIGHT = 40; // px per unit of change
 
-function SpinnerColumn({ value, min, max, step, onCommit, label }) {
+function SpinnerColumn({ value, onCommit, label, compact, onInteractionChange }) {
   const offset = useSharedValue(0);
 
   // Use a ref so the gesture always has the latest commit function
@@ -22,7 +23,17 @@ function SpinnerColumn({ value, min, max, step, onCommit, label }) {
     commitRef.current(delta);
   }, []);
 
+  const interactionRef = useRef(onInteractionChange);
+  interactionRef.current = onInteractionChange;
+
+  const setInteracting = useCallback((active) => {
+    interactionRef.current?.(active);
+  }, []);
+
   const gesture = Gesture.Pan()
+    .onBegin(() => {
+      runOnJS(setInteracting)(true);
+    })
     .onUpdate((e) => {
       offset.value = e.translationY * 0.25;
     })
@@ -31,6 +42,11 @@ function SpinnerColumn({ value, min, max, step, onCommit, label }) {
       offset.value = withSpring(0, { damping: 20, stiffness: 400 });
       if (steps !== 0) runOnJS(doCommit)(steps);
     })
+    .onFinalize(() => {
+      runOnJS(setInteracting)(false);
+    })
+    .activeOffsetY([-4, 4])
+    .failOffsetX([-24, 24])
     .minDistance(5);
 
   const animStyle = useAnimatedStyle(() => ({
@@ -39,50 +55,43 @@ function SpinnerColumn({ value, min, max, step, onCommit, label }) {
 
   return (
     <GestureDetector gesture={gesture}>
-      <View style={styles.column}>
-        <Animated.Text style={[styles.digit, animStyle]}>
+      <View style={[styles.column, compact && styles.columnCompact]}>
+        <Animated.Text maxFontSizeMultiplier={1.2} style={[styles.digit, compact && styles.digitCompact, animStyle]}>
           {String(value).padStart(2, '0')}
         </Animated.Text>
-        <Text style={styles.hint}>{label}</Text>
+        <Text maxFontSizeMultiplier={1.3} style={styles.hint}>{label}</Text>
       </View>
     </GestureDetector>
   );
 }
 
-export default function TimeSpinner({ value, onChange }) {
+export default function TimeSpinner({ value, onChange, compact = false, onInteractionChange }) {
   const [h, m] = value.split(':').map(Number);
-  const pad = (n) => String(n).padStart(2, '0');
 
   const commitHour = useCallback((delta) => {
-    const newH = ((h + delta) % 24 + 24) % 24;
-    onChange(`${pad(newH)}:${pad(m)}`);
-  }, [h, m, onChange]);
+    onChange(stepTime(value, 'hour', delta));
+  }, [value, onChange]);
 
   const commitMinute = useCallback((delta) => {
-    const totalMins = h * 60 + m + delta * 15;
-    const newH = ((Math.floor(totalMins / 60)) % 24 + 24) % 24;
-    const newM = ((totalMins % 60) + 60) % 60;
-    onChange(`${pad(newH)}:${pad(newM)}`);
-  }, [h, m, onChange]);
+    onChange(stepTime(value, 'minute', delta));
+  }, [value, onChange]);
 
   return (
-    <View style={styles.container}>
+    <View style={[styles.container, compact && styles.containerCompact]}>
       <SpinnerColumn
         value={h}
-        min={0}
-        max={23}
-        step={1}
         onCommit={commitHour}
         label="hr"
+        compact={compact}
+        onInteractionChange={onInteractionChange}
       />
-      <Text style={styles.colon}>:</Text>
+      <Text maxFontSizeMultiplier={1.2} style={[styles.colon, compact && styles.colonCompact]}>:</Text>
       <SpinnerColumn
         value={m}
-        min={0}
-        max={45}
-        step={15}
         onCommit={commitMinute}
         label="min"
+        compact={compact}
+        onInteractionChange={onInteractionChange}
       />
     </View>
   );
@@ -100,6 +109,11 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
     gap: 4,
   },
+  containerCompact: {
+    paddingHorizontal: 6,
+    paddingVertical: 4,
+    gap: 2,
+  },
   column: {
     alignItems: 'center',
     width: 52,
@@ -107,17 +121,29 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     overflow: 'hidden',
   },
+  columnCompact: {
+    width: 44,
+    height: 52,
+  },
   digit: {
     color: COLORS.text,
     fontSize: 32,
     fontWeight: '700',
     lineHeight: 40,
   },
+  digitCompact: {
+    fontSize: 28,
+    lineHeight: 34,
+  },
   colon: {
     color: COLORS.text,
     fontSize: 32,
     fontWeight: '700',
     marginBottom: 14,
+  },
+  colonCompact: {
+    fontSize: 27,
+    marginBottom: 12,
   },
   hint: {
     color: COLORS.textDim,

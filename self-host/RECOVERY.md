@@ -207,7 +207,13 @@ It outputs only redacted replication, lease, transaction, pending-key, backend, 
 
 The reconciliation snapshot route automatically attempts stored transaction recovery first. Pending entries are different: they are not yet in D1, so snapshot deliberately returns `409` until they drain. Normal active Home publication drains them, but an empty unreconciled Home cannot be activated merely to do so.
 
-The coordinator implements signed all-pending flush semantics, but the repository currently has no reviewed administrative CLI wrapper for total-loss recovery. If pending keys survive, **stop**. Add a narrow authenticated recovery command around the existing coordinator flush path, review/test its quota, hash-baseline, transaction, and generation behavior, deploy through the normal Worker process, drain, and re-read status. Never delete DO storage, pending records, baselines, or snapshot D1 around the queue. This explicit tooling gap is safer than an invented command.
+If verified pending entries remain while Home is stopped, use the reviewed signed drain wrapper:
+
+```powershell
+docker compose --env-file .env.authority -f compose.authority.yaml run --rm --no-deps home-authority node src/home-authority-cli.mjs drain-pending
+```
+
+The command acquires the coordinator's API lease with `flushAllPending`, applies the exact hash-guarded journal through the configured D1 generation and releases the lease. It does not delete or bypass pending records. Require `pendingAfter: 0`, then re-run signed status and require no lease/transaction before reconciliation. A baseline, quota, generation, or publication failure must remain fail-closed for diagnosis; never delete DO storage, pending records, baselines, or snapshot D1 around the queue.
 
 Expected: transaction recovery complete, lease free, pending exactly zero.
 
@@ -282,7 +288,7 @@ Only after application recovery succeeds, dry-run and install the per-user Start
 | Public Worker unavailable | Restore existing version/bindings from Cloudflare/GitHub records; do not create a new endpoint. |
 | D1 generation/schema missing | Stop; never initialize empty production over it. Verify existing database/migration/binding. |
 | DO transaction present | Let checked recovery finish it; preserve journal/deltas if it fails. |
-| Pending backup keys present | Do not reconcile/clear. Implement the reviewed signed drain wrapper described above. |
+| Pending backup keys present | Stop Home, use the signed `drain-pending` command, and verify idle/pending-zero status before reconcile. Never clear the journal directly. |
 | Manifest mismatch | Stay standby, preserve evidence, diagnose, then repeat exact import. |
 | Trigger list nonempty | Stay standby; disable/drain legacy schedules first. Prefer a gap to overlap. |
 | YouTube quota day uncertain | Stay standby through a confirmed Pacific reset. |
@@ -307,4 +313,4 @@ Only after application recovery succeeds, dry-run and install the per-user Start
 
 ## Remaining hardening
 
-The repository now contains bounded host startup supervision, signed status, and exact D1-to-local reconstruction. It still cannot recover lost notification-intent history or YouTube request counters, and it lacks the reviewed all-pending recovery CLI described above. Future work should add that command, always-verify startup manifests, and checksummed/fsynced local state generations. These limitations must fail closed rather than being hidden by retries.
+The repository now contains bounded host startup supervision, signed status, a hash-guarded pending-drain command, and exact D1-to-local reconstruction. It still cannot recover lost notification-intent history or YouTube request counters. Future work should add always-verify startup manifests and checksummed/fsynced local state generations. These limitations must fail closed rather than being hidden by retries.

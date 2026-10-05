@@ -2,8 +2,8 @@
 
 **Last updated:** 2026-10-05
 **Current repo branch:** `master`
-**Current app version in repo:** `3.5.2`
-**Android versionCode/versionName in repo:** `352` / `3.5.2`
+**Current app version in repo:** `4.0.0`
+**Android versionCode/versionName in repo:** `400` / `4.0.0`
 **Repo:** [Undert0e-505/TubePulse](https://github.com/Undert0e-505/TubePulse)
 **Platform:** Android only (React Native + Expo)
 
@@ -17,8 +17,8 @@ Repo evidence as of this document update:
 
 | Area | Current evidence |
 |---|---|
-| App version | `app.json` has `expo.version = 3.5.2` |
-| Android version | `android/app/build.gradle` has `versionCode 352`, `versionName "3.5.2"` |
+| App version | `app.json` has `expo.version = 4.0.0` |
+| Android version | `android/app/build.gradle` has `versionCode 400`, `versionName "4.0.0"` |
 | API base URL | `src/utils/api.js` uses `EXPO_PUBLIC_TUBEPULSE_API_URL` when built with one and otherwise preserves `https://tubepulse-api.jimothyoakley55.workers.dev`; optional fallback is disabled unless separately configured |
 | Release script | `build-and-release.ps1` is the current local release path |
 | API worker config | `worker/tubepulse-api/wrangler.toml` defines worker `tubepulse-api`, active D1 binding/generation, Durable Object coordinator, VPC Service binding `TUBEPULSE_HOME_VPC`, and frozen legacy KV binding; the live `workers.dev` endpoint remains enabled without a committed custom route |
@@ -46,7 +46,7 @@ The scheduled Worker deployments below are retained rollback/history assets. The
 | `tubepulse-api` | Serves the unchanged app URL. Every authenticated feed uses the unified Home store over VPC while current, with D1 fallback; authenticated mutations are Home-first with deferred atomic D1 backup. See the production D1 cutover section for the currently verified deployment. |
 | `worker/archive/tubepulse-resolver` | Not deployed; archive remains reference-only. |
 
-The checked-in app version is `3.5.2` with Android `versionCode 352`. Worker deployment is separate from app APK release; community-post rollout required both worker deployment and app release.
+The checked-in app version is `4.0.0` with Android `versionCode 400`. Worker deployment is separate from app APK release; this release does not imply a Worker deployment.
 
 v3.3.1 is an app-only widget parity patch. It aligns the Android widget with HomeScreen feed selection so old community posts do not override newer videos in the widget.
 
@@ -86,7 +86,7 @@ Safe read-only checks showed:
 
 Keep these version labels distinct:
 
-- App/release version evidence in this repo is `3.5.2` with Android `versionCode 352`.
+- App/release version evidence in this repo is `4.0.0` with Android `versionCode 400`.
 - API worker health response reports `version: "3.0.0"`; this appears to be a stale or independently versioned health label, not the app release version.
 
 `worker/tubepulse-api/wrangler.toml` intentionally commits no custom route. The live `workers.dev` endpoint remains enabled and unchanged; route ownership is separate from the app release version.
@@ -180,9 +180,15 @@ Core application recovery exists: the authority Compose stack uses `restart: unl
 
 The repository now includes a bounded Windows authority startup supervisor plus a non-administrator per-user Startup installer. The production auto-login profile has the verified shortcut installed. A safe live invocation completed with local authority ready/current, the signed D1 coordinator ready/current with no pending transaction, scheduler progress fresh, and the already-healthy container identity/start time unchanged. The supervisor starts Docker Desktop minimized when needed, waits for `docker info`, applies the authority Compose stack, and distinguishes liveness, readiness, pending/transaction faults, dependency outage, and progress. A real sign-out/reboot test remains outstanding. The optional elevated Scheduled Task path encountered a cross-account UAC ACL trap; an administrator may later remove a possibly retained task, while the supervisor lock makes duplicate launch harmless.
 
-The production Home/Worker implementation audited before this uncommitted app/startup work was based on repository commit `1390053`. Recovery must verify that marker against Cloudflare deployment records and GitHub history rather than assuming the newest `master` is deployed; update the marker after the next backend deployment.
+The production Home image was rebuilt from the release worktree containing the authority conflict-recovery changes documented below. The public Worker remains a separately versioned deployment and is not redeployed by an Android release. Recovery must verify the Home image/source marker and Cloudflare deployment record independently rather than assuming every component runs the newest `master`.
 
-Startup currently reconciles only when local or coordinator status is stale; two `current` markers skip a full manifest proof. Reconciliation refuses pending backup keys, and no reviewed all-pending disaster-recovery CLI exists, so total-loss recovery fails closed at that condition rather than discarding journal work. Host JSON also lacks fsynced checksummed generations. The runbook now documents a zero-local-backup reconstruction from GitHub, active D1/DO state, and existing cloud projects, including mandatory secret rotation, exact manifest reconcile, conservative YouTube quota wait, notification-intent ambiguity, and activation gates. This is a manual disk-replacement procedure, not automatic failover. See [`self-host/RECOVERY.md`](self-host/RECOVERY.md).
+Startup currently reconciles only when local or coordinator status is stale; two `current` markers skip a full manifest proof. Recovery now drains verified pending coordinator deltas through a signed, hash-guarded API lease before requesting the exact D1 snapshot, and publication/snapshot lease conflicts use bounded retry. It never clears unverified pending state. Host JSON still lacks fsynced checksummed generations. The runbook documents a zero-local-backup reconstruction from GitHub, active D1/DO state, and existing cloud projects, including mandatory secret rotation, exact manifest reconcile, conservative YouTube quota wait, notification-intent ambiguity, and activation gates. This is a manual disk-replacement procedure, not automatic failover. See [`self-host/RECOVERY.md`](self-host/RECOVERY.md).
+
+### 2026-10-05 authority lease-race recovery
+
+A legitimate Home-primary app mutation queued one verified canonical delta while an aligned scheduler publication was changing from its local polling lease to the global coordinator lease. The scheduler's first global acquire received a transient busy response after it had released the local lease. The old error path conservatively marked local authority stale, then its automatic snapshot recovery was correctly rejected because the verified pending delta had not yet reached D1. Reads continued through canonical fallback while authenticated mutations failed closed.
+
+Recovery stopped only the Home service, allowed the local lease TTL to expire, applied the exact pending delta through the signed coordinator drain, reconciled the D1 manifest into the preserved local store, and restarted the rebuilt Home image. The coordinator returned current and idle with no pending transaction. The fix retries transient acquire conflicts and drains a verified pending journal before snapshot recovery, preventing the same stale/pending deadlock without weakening ordering or deleting state.
 
 ---
 

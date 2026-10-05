@@ -17,6 +17,7 @@ export default function SettingsScreen() {
   const navigation = useNavigation();
   const insets = useSafeAreaInsets();
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
+  const [scrollEnabled, setScrollEnabled] = useState(true);
 
   useFocusEffect(
     useCallback(() => {
@@ -42,7 +43,12 @@ export default function SettingsScreen() {
 
   return (
     <View style={styles.container}>
-      <ScrollView style={styles.scroll} contentContainerStyle={styles.content}>
+      <ScrollView
+        style={styles.scroll}
+        contentContainerStyle={styles.content}
+        nestedScrollEnabled
+        scrollEnabled={scrollEnabled}
+      >
 
       {/* Tap Action */}
       <Text style={[styles.sectionTitle, styles.sectionTitleFirst]}>On tap, open:</Text>
@@ -141,6 +147,7 @@ export default function SettingsScreen() {
               <TimeSpinner
                 value={settings.dndStart || '22:00'}
                 onChange={(v) => updateSetting('dndStart', v)}
+                onInteractionChange={(active) => setScrollEnabled(!active)}
               />
             </View>
             <Text style={styles.timeSep}>→</Text>
@@ -149,6 +156,7 @@ export default function SettingsScreen() {
               <TimeSpinner
                 value={settings.dndEnd || '07:00'}
                 onChange={(v) => updateSetting('dndEnd', v)}
+                onInteractionChange={(active) => setScrollEnabled(!active)}
               />
             </View>
           </View>

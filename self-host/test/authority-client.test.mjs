@@ -72,3 +72,61 @@ test('authority client classifies retryable coordinator failures without leaking
     return true;
   });
 });
+
+test('publication acquisition retries a transient coordinator lease conflict', async () => {
+  let calls = 0;
+  const waits = [];
+  const client = new AuthorityClient({
+    baseUrl: 'https://api.example.test', secret: SECRET,
+    sleep: async (ms) => { waits.push(ms); },
+    fetchImpl: async () => {
+      calls++;
+      if (calls === 1) return Response.json({ error: 'Authority lease busy' }, { status: 409 });
+      return Response.json({ ok: true });
+    },
+  });
+  const acquired = await client.acquirePublication();
+  assert.match(acquired.leaseId, /^home-/);
+  assert.equal(calls, 2);
+  assert.deepEqual(waits, [50]);
+});
+
+test('pending drain uses an API lease, flushes all pending, and releases it', async () => {
+  const calls = [];
+  let acquireAttempts = 0;
+  const client = new AuthorityClient({
+    baseUrl: 'https://api.example.test', secret: SECRET,
+    sleep: async () => {},
+    fetchImpl: async (url, init) => {
+      const body = JSON.parse(init.body);
+      calls.push({ path: new URL(url).pathname, body });
+      if (new URL(url).pathname.endsWith('/acquire') && acquireAttempts++ === 0) {
+        return Response.json({ error: 'Authority lease busy' }, { status: 409 });
+      }
+      return Response.json({ ok: true, pendingBackupKeys: 0 });
+    },
+  });
+  await client.flushAllPending();
+  assert.equal(calls.length, 3);
+  assert.equal(calls[0].body.kind, 'api');
+  assert.equal(calls[0].body.flushAllPending, true);
+  assert.equal(calls[1].body.leaseId, calls[0].body.leaseId);
+  assert.equal(calls[2].body.leaseId, calls[0].body.leaseId);
+});
+
+test('snapshot retries a transient active API lease with the same reconciliation identity', async () => {
+  const bodies = [];
+  const client = new AuthorityClient({
+    baseUrl: 'https://api.example.test', secret: SECRET, sleep: async () => {},
+    fetchImpl: async (_url, init) => {
+      const body = JSON.parse(init.body);
+      bodies.push(body);
+      if (bodies.length === 1) return Response.json({ error: 'Authority lease busy' }, { status: 409 });
+      return Response.json({ ok: true, manifestHash: 'a'.repeat(64), recordCount: 0 });
+    },
+  });
+  const result = await client.snapshotCanonical({ includeValues: true });
+  assert.equal(bodies.length, 2);
+  assert.equal(bodies[0].leaseId, bodies[1].leaseId);
+  assert.equal(result.leaseId, bodies[0].leaseId);
+});

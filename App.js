@@ -32,6 +32,10 @@ import {
   notificationTapDedupeKey,
   notificationTapPlan,
 } from './src/utils/notificationTap.mjs';
+import {
+  enqueueSeenMutation,
+  flushSeenMutationQueue,
+} from './src/utils/seenPersistence.mjs';
 
 // Configure expo-notifications to show notifications while the app is
 // in the foreground. Without this, scheduleNotificationAsync calls
@@ -56,7 +60,7 @@ const Stack = createNativeStackNavigator();
 const screenOptions = {
   headerStyle: { backgroundColor: COLORS.bg },
   headerTintColor: COLORS.text,
-  headerTitleStyle: { fontWeight: '600', fontSize: 17 },
+  headerTitleStyle: { fontWeight: '600', fontSize: 18 },
   contentStyle: { backgroundColor: COLORS.bg },
 };
 
@@ -70,7 +74,7 @@ function HeaderButton({ title, children, onPress, style, textStyle, accessibilit
       accessibilityHint={accessibilityHint}
     >
       {children || (
-        <Text style={[{ color: COLORS.accent, fontSize: 14, fontWeight: '500' }, textStyle]}>
+        <Text style={[{ color: COLORS.accent, fontSize: 18, fontWeight: '500' }, textStyle]}>
           {title}
         </Text>
       )}
@@ -181,6 +185,15 @@ function TubePulseApplication() {
         } catch (e) {
           console.warn('Device register failed:', e);
         }
+
+        // Retry exact, durable seen intents from prior offline/backend
+        // failures. This never contains clearAll, so delayed delivery cannot
+        // consume content that arrived after the original tap.
+        flushSeenMutationQueue({
+          storage: AsyncStorage,
+          deviceId,
+          persist: markSeen,
+        }).catch(() => console.warn('[seen] startup retry remains pending'));
 
         if (fcmToken) {
           fcmTokenRef.current = fcmToken;
@@ -457,6 +470,7 @@ function TubePulseApplication() {
       }
 
       if (plan.kind !== 'prewarn') {
+        let exactSeenIds = plan.contentIds;
         try {
           const [cache, lastSeen] = await Promise.all([getChannelCache(), getLastSeen()]);
           const optimistic = applyOptimisticNotificationSeen({
@@ -468,6 +482,7 @@ function TubePulseApplication() {
             clearAll: plan.clearAll,
           });
           if (optimistic.handle) {
+            exactSeenIds = optimistic.seenIds;
             await Promise.all([
               saveLastSeen(optimistic.lastSeen),
               saveChannelCache(optimistic.cache),
@@ -479,9 +494,17 @@ function TubePulseApplication() {
 
         try { await updateWidget('notif-tap'); } catch {}
 
-        if (deviceId && data.channelId) {
-          markSeen(deviceId, data.channelId, plan.contentIds, plan.clearAll).catch((error) => {
-            console.warn('Notification remote seen update failed:', error);
+        if (data.channelId && exactSeenIds.length) {
+          enqueueSeenMutation({
+            storage: AsyncStorage,
+            channelId: data.channelId,
+            contentIds: exactSeenIds,
+          }).then(() => flushSeenMutationQueue({
+            storage: AsyncStorage,
+            deviceId,
+            persist: markSeen,
+          })).catch(() => {
+            console.warn('[seen] notification retry remains pending');
           });
         }
       }

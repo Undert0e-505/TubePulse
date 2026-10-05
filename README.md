@@ -64,9 +64,9 @@ YouTube's in-app notifications can be inconsistent, especially for community pos
 
 ## Project Status
 
-**Active early release / personal-public project.**
+**Active personal-public project.**
 
-- **v3.3.2** includes reliable multi-device subscription reconciliation.
+- **v4.0.0** combines the Home-hosted, batched YouTube Data API/D1 backend with durable seen retries, corrected notification taps, automatic newest-first channel ordering, and responsive per-channel notification controls.
 - Community post support exists but depends on unofficial YouTube web data structures, so it may need maintenance if YouTube changes.
 - The app is Android-only. No iOS support is planned.
 - A separate [self-host preview](self-host/README.md) can run the Worker sources locally for development without replacing the production Home authority or public API.
@@ -91,7 +91,7 @@ Start with the [self-host guide](self-host/README.md) for setup and operation. T
 > App release process and cleanup plan: see [RELEASE.md](RELEASE.md). Worker deployments are separate from app APK releases.
 
 ### Current App Line
-The current checked-in app version is `3.5.2`. The v3.1 feature line below is retained as a historical feature summary; see [STATUS.md](STATUS.md) for current repo status and caveats.
+The current checked-in app version is `4.0.0`. The v3.1 feature line below is retained as a historical feature summary; see [STATUS.md](STATUS.md) for current repo status and caveats.
 
 Community posts in v3.3.0 are enabled for active subscribed channels when the global worker feature gate is on. Newly added channels are silently seeded before future community-post notifications, so old posts are not pushed as new.
 
@@ -162,7 +162,7 @@ When you tap a notification or a video in the feed:
 - **Channel tap** — opens the channel page in YouTube, marks **all** unwatched videos and posts from that channel as watched (bundle clear)
 - **Batch notification tap** — always opens the channel and marks the exact bundled video/post IDs as watched. Older notifications without exact IDs retain the safe clear-all fallback.
 
-Notification taps update the local feed immediately and persist the same seen operation remotely. Background/cold FCM notifications and foreground notifications shown by the app share the same routing path; a persistence failure cannot prevent the YouTube destination from opening.
+Notification taps update the local feed immediately and durably queue the exact content IDs for remote persistence. Background/cold FCM notifications and foreground notifications shown by the app share the same routing path; a backend/network failure never restores the blue dot or blocks YouTube. Pending exact-ID intents retry on later startup/focus/refresh opportunities with bounded backoff, and no delayed `clearAll` can consume content that arrived after the tap.
 
 This is the key interaction: video tap for "I've seen this one", channel tap for "I'm going to their channel and clearing my backlog".
 
@@ -228,7 +228,7 @@ The central Cloudflare Worker. Handles:
 | `/register` | POST | Register/update device profile. `fcmToken` is optional (null accepted so a user who denied notification permission can still subscribe channels and use the app). Idempotent — safe to call on every launch and on FCM token refresh. |
 | `/subscribe-channel` | POST | Add a channel to this device. Triggers a cached Data API avatar lookup and structural uploads-playlist bootstrap when needed. |
 | `/unsubscribe` | POST | Remove a channel from this device. Removes the device from the channel's subscriber list; if the subscriber list goes empty, the channel is removed from the `channels:active` index. |
-| `/seen` | POST | Mark videos/posts as watched. `{ channelId, ids: [videoId, "post:activityId", ...] }` for taps, `{ channelId, clearAll: true }` for channel-tap. Post IDs are namespaced with `post:` so they share the `deviceState.unwatched` array with videos without collision. |
+| `/seen` | POST | Mark videos/posts as watched. App taps send `{ channelId, ids: [videoId, "post:activityId", ...] }`, including the exact IDs represented by a channel tap. The server retains `clearAll` for bounded administrative/bootstrap compatibility, but the app never queues a delayed unbounded clear. Post IDs are namespaced with `post:` so they share the `deviceState.unwatched` array with videos without collision. |
 | `/feed` | GET | Fetch current video + post data for all tracked channels. Production serves authenticated feeds from the unified Home store over VPC while current, with D1 fallback. Each post carries an `unwatched` flag mirroring the video pattern. |
 | `/resolve` | GET | Resolve `@handle` → channelId + name + avatar (YouTube Data API, key stays server-side). Result cached 7 days in `handle:{lowercase}`. |
 | `/bootstrap` | POST | Fetch channel metadata and recent uploads through the Data API structural path. |
@@ -294,8 +294,8 @@ Home publishes changed keys to `TUBEPULSE_D1` as a bounded backup while the publ
 5. **On per-channel override**: `POST /channel-override` with channelId + override (or empty to clear). Supports `prewarnMinutes` and `includeCommunityPosts` overrides in v3.1, both tri-state (null = inherit, value = override)
 6. **On notification tap**:
    - Video tap → `POST /seen { channelId, ids: [id] }`
-   - Channel tap → `POST /seen { channelId, clearAll: true }`
-   - Batch tap → `POST /seen { channelId, ids: [exact bundled IDs] }`; legacy batches without IDs use `clearAll`
+   - Channel tap → optimistic local update plus durable exact represented IDs; retry never uses delayed `clearAll`
+   - Batch tap → `POST /seen { channelId, ids: [exact bundled IDs] }`; a legacy batch without IDs snapshots exact cached IDs locally
    - Post tap (v3.1) → `POST /seen { channelId, ids: ["post:activityId"] }`, then open the channel's community tab
    - Prewarn tap (v3.1) → open the YouTube watch URL for the scheduled video. The video is NOT marked as seen on tap (the prewarn is a reminder; the live-time push will still fire later)
 7. **On feed refresh**: `GET /feed` → returns cached data from Home while authority is current, otherwise from D1, merged with per-device state to compute `unwatched` flags on both videos and posts

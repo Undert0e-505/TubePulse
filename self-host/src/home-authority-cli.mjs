@@ -67,6 +67,27 @@ async function status(config) {
   }));
 }
 
+async function drainPending(config) {
+  const client = new AuthorityClient({
+    baseUrl: config.authority.apiUrl,
+    secret: config.authority.secret,
+    timeoutMs: config.authority.timeoutMs,
+  });
+  const before = await client.status();
+  if (Number(before?.pendingBackupKeys || 0) > 0) await client.flushAllPending();
+  const after = await client.status();
+  if (Number(after?.pendingBackupKeys || 0) !== 0 || after?.transaction || after?.lease) {
+    throw new Error('Canonical pending queue did not reach an idle state');
+  }
+  console.log(JSON.stringify({
+    ok: true,
+    pendingBefore: Number(before?.pendingBackupKeys || 0),
+    pendingAfter: Number(after?.pendingBackupKeys || 0),
+    backend: after?.backend?.selected || null,
+    replication: after?.replication?.status || null,
+  }));
+}
+
 async function migrateD1(config) {
   const lease = new FileLease({ dataDir: config.dataDir, ttlMs: config.leaseTtlMs });
   await lease.acquire();
@@ -127,9 +148,10 @@ async function main() {
   const [command = 'run'] = process.argv.slice(2);
   const config = readHomeSchedulerConfig();
   if (command === 'status') return await status(config);
+  if (command === 'drain-pending') return await drainPending(config);
   if (command === 'reconcile') return await reconcile(config);
   if (command === 'migrate-d1') return await migrateD1(config);
-  if (command !== 'run') throw new Error('Usage: node src/home-authority-cli.mjs run|status|reconcile|migrate-d1');
+  if (command !== 'run') throw new Error('Usage: node src/home-authority-cli.mjs run|status|drain-pending|reconcile|migrate-d1');
   const service = await createUnifiedHomeAuthorityService(config);
   let closing = false;
   const close = async () => {

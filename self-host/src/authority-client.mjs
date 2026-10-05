@@ -9,6 +9,8 @@ async function fetchWithTimeout(fetchImpl, url, init, timeoutMs) {
   finally { clearTimeout(timer); }
 }
 
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 export class AuthorityClientError extends Error {
   constructor(message, { status = null, operation = null, retryable = false, details = null } = {}) {
     super(message);
@@ -36,13 +38,14 @@ const ROUTES = Object.freeze({
 });
 
 export class AuthorityClient {
-  constructor({ baseUrl, secret, timeoutMs = 10_000, fetchImpl = globalThis.fetch }) {
+  constructor({ baseUrl, secret, timeoutMs = 10_000, fetchImpl = globalThis.fetch, sleep = delay }) {
     if (!baseUrl || new URL(baseUrl).protocol !== 'https:') throw new Error('Authority API URL must use HTTPS');
     if (!secret || secret.length < 32) throw new Error('Authority secret must contain at least 32 characters');
     this.baseUrl = String(baseUrl).replace(/\/$/, '');
     this.secret = secret;
     this.timeoutMs = timeoutMs;
     this.fetchImpl = fetchImpl;
+    this.sleep = sleep;
     this.operations = { requests: 0, failures: 0 };
   }
 
@@ -83,25 +86,75 @@ export class AuthorityClient {
   }
 
   async status() { return await this.request('status'); }
-  async acquirePublication({ ttlMs = 120_000 } = {}) {
+  async acquirePublication({ ttlMs = 120_000, retryWindowMs = 5_000 } = {}) {
     const leaseId = `home-${crypto.randomUUID()}`;
-    const result = await this.request('acquire', { leaseId, kind: 'publication', ttlMs });
-    return { leaseId, result };
+    const deadline = Date.now() + Math.max(0, retryWindowMs);
+    let attempt = 0;
+    while (true) {
+      try {
+        const result = await this.request('acquire', { leaseId, kind: 'publication', ttlMs });
+        return { leaseId, result };
+      } catch (error) {
+        const leaseBusy = error instanceof AuthorityClientError
+          && error.status === 409
+          && error.details?.error === 'Authority lease busy';
+        if (!leaseBusy || Date.now() >= deadline) throw error;
+        await this.sleep(Math.min(800, 50 * (2 ** Math.min(attempt++, 4))));
+      }
+    }
   }
   async commitPublication(leaseId, deltas, { retainLease = false } = {}) {
     return await this.request('commit', { leaseId, deltas, retainLease });
   }
   async releasePublication(leaseId) { return await this.request('release', { leaseId }); }
+  async flushAllPending({ ttlMs = 30_000, retryWindowMs = 5_000 } = {}) {
+    const leaseId = `recovery-${crypto.randomUUID()}`;
+    const deadline = Date.now() + Math.max(0, retryWindowMs);
+    let attempt = 0;
+    let result;
+    while (true) {
+      try {
+        result = await this.request('acquire', {
+          leaseId, kind: 'api', ttlMs, flushAllPending: true,
+        });
+        break;
+      } catch (error) {
+        const leaseBusy = error instanceof AuthorityClientError
+          && error.status === 409
+          && error.details?.error === 'Authority lease busy';
+        if (!leaseBusy || Date.now() >= deadline) throw error;
+        await this.sleep(Math.min(800, 50 * (2 ** Math.min(attempt++, 4))));
+      }
+    }
+    try {
+      return { leaseId, ...result };
+    } finally {
+      await this.request('release', { leaseId }).catch(() => {});
+    }
+  }
   async markStale(reason, { clearSeeded = false } = {}) {
     return await this.request('stale', { reason, ...(clearSeeded ? { clearSeeded: true } : {}) });
   }
   async probeRss(activeChannelId = undefined) {
     return await this.request('rssProbe', activeChannelId ? { activeChannelId } : {});
   }
-  async snapshotCanonical({ includeValues = false } = {}) {
+  async snapshotCanonical({ includeValues = false, retryWindowMs = 5_000 } = {}) {
     const leaseId = `reconcile-${crypto.randomUUID()}`;
-    const result = await this.request('snapshot', { leaseId, ...(includeValues ? { includeValues: true } : {}) });
-    return { ...result, leaseId };
+    const deadline = Date.now() + Math.max(0, retryWindowMs);
+    let attempt = 0;
+    while (true) {
+      try {
+        const result = await this.request('snapshot', { leaseId, ...(includeValues ? { includeValues: true } : {}) });
+        return { ...result, leaseId };
+      } catch (error) {
+        const blocked = error instanceof AuthorityClientError
+          && error.status === 409
+          && ['Authority lease busy', 'Canonical backup queue must drain before reconciliation']
+            .includes(error.details?.error);
+        if (!blocked || Date.now() >= deadline) throw error;
+        await this.sleep(Math.min(800, 50 * (2 ** Math.min(attempt++, 4))));
+      }
+    }
   }
   async activateCanonical(manifest) {
     return await this.request('activate', {

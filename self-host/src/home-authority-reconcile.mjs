@@ -63,11 +63,24 @@ export async function reconcileHomeAuthority({ local, client, gate, syncStateFil
 }
 
 export async function ensureHomeAuthorityCurrent({ local, client, gate, syncStateFile, now = Date.now }) {
-  const [localStatus, remoteStatus] = await Promise.all([gate.status(), client.status()]);
+  const [localStatus, initialRemoteStatus] = await Promise.all([gate.status(), client.status()]);
+  let remoteStatus = initialRemoteStatus;
   const localCurrent = localStatus.replication?.status === 'current';
   const remoteCurrent = remoteStatus.replication?.status === 'current';
   if (localCurrent && remoteCurrent) {
     return { reconciled: false, localStatus, remoteStatus };
+  }
+  // A Home-primary API mutation can have a verified delta queued in the
+  // coordinator when a scheduler publication loses a short lease race. A
+  // reconciliation snapshot deliberately refuses to run over pending data,
+  // so drain that exact journal through the coordinator before taking the
+  // snapshot. This applies the verified delta; it never clears pending state.
+  if (Number(remoteStatus.pendingBackupKeys || 0) > 0) {
+    await client.flushAllPending();
+    remoteStatus = await client.status();
+    if (Number(remoteStatus.pendingBackupKeys || 0) > 0) {
+      throw new Error('Canonical backup queue did not drain before reconciliation');
+    }
   }
   const result = await reconcileHomeAuthority({ local, client, gate, syncStateFile, now });
   return { reconciled: true, localStatus, remoteStatus, result };

@@ -35,7 +35,11 @@ import {
   getPreviewHomeConnectionPhase,
   waitForCurrentInitialization,
 } from '../utils/appInitialization.mjs';
-import { runSeenMutation } from '../utils/seenPersistence.mjs';
+import {
+  enqueueSeenMutation,
+  flushSeenMutationQueue,
+  readSeenMutationQueue,
+} from '../utils/seenPersistence.mjs';
 import { orderChannels } from '../utils/channelOrdering.mjs';
 
 const THUMB_UP_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#666666" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
@@ -59,7 +63,6 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
   const [refreshing, setRefreshing] = useState(false);
   const [loading, setLoading] = useState(true);
   const [previewConnectionError, setPreviewConnectionError] = useState(null);
-  const [seenPersistenceError, setSeenPersistenceError] = useState(null);
   const [previewInitializationPending, setPreviewInitializationPending] = useState(IS_TUBEPULSE_PREVIEW);
   const [nowMs, setNowMs] = useState(Date.now());
   // Hold the latest cache in a ref so refresh() can be stable
@@ -105,13 +108,25 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
     // unwatched:true (markSeen still in-flight) are kept for the next
     // cycle. This prevents recentlySeenRef from accumulating stale IDs
     // that suppress blue dots on unrelated refreshes (e.g. mode switch).
+    // Rehydrate the optimistic race guard from durable pending intents so a
+    // restart while offline cannot bring blue dots back before retry succeeds.
+    try {
+      const queued = await readSeenMutationQueue(AsyncStorage);
+      for (const intent of queued.intents) {
+        for (const id of intent.contentIds) recentlySeenRef.current.add(id);
+      }
+    } catch { /* local cache below remains the fallback */ }
     const seenSnapshot = new Set(recentlySeenRef.current);
     try {
       const deviceId = await getDeviceId();
       if (deviceId) {
+        flushSeenMutationQueue({
+          storage: AsyncStorage,
+          deviceId,
+          persist: markSeen,
+        }).catch(() => console.warn('[seen] queued retry remains pending'));
         const result = await fetchFeed(deviceId);
         if (result.ok && result.channels) {
-          setSeenPersistenceError(null);
           if (IS_TUBEPULSE_PREVIEW) setPreviewConnectionError(null);
           // v3 /feed returns { channels: [{ channelId, meta, videos, unwatchedCount }] }
           const [localChannels] = await Promise.all([getChannels()]);
@@ -427,21 +442,15 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
   // - Computes the canonical seen ID
   // - Adds to recentlySeenRef so refresh() doesn't reintroduce it
   // - Optimistically updates local cache (cacheRef + setCache + saveChannelCache)
-  // - Awaits markSeen before returning (so caller can open URL after server confirms)
+  // - Durably queues exact IDs before an opportunistic, non-blocking retry
   const markItemSeen = async ({ handle, channelId, item, type }) => {
     const seenId = type === 'post' ? getPostSeenId(item) : item?.videoId;
     if (!seenId) return false;
-    const previousCacheEntry = cacheRef.current[handle];
-    const wasAlreadyPending = recentlySeenRef.current.has(seenId);
-
     // 1. Add to recentlySeenRef (guard against refresh overwrite)
     recentlySeenRef.current.add(seenId);
 
     // 2. Update lastSeen
     const ls = await getLastSeen();
-    const previousLastSeenEntry = ls[handle]
-      ? { ...ls[handle], seenIds: [...(ls[handle].seenIds || [])] }
-      : null;
     if (!ls[handle]) ls[handle] = { seenIds: [] };
     if (!ls[handle].seenIds.includes(seenId)) {
       ls[handle] = { seenIds: [...ls[handle].seenIds, seenId] };
@@ -466,6 +475,9 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
           videos: cached.videos.map((v) =>
             v.videoId === seenId ? { ...v, unwatched: false } : v
           ),
+          latestVideo: cached.latestVideo?.videoId === seenId
+            ? { ...cached.latestVideo, unwatched: false }
+            : cached.latestVideo,
         };
       }
       cacheRef.current = updatedCache;
@@ -473,62 +485,35 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
       try { await saveChannelCache(updatedCache); } catch {}
     }
 
-    // 4. Await markSeen on the server
+    // 4. Durably queue exact persistence. Network failure never rolls back
+    // the optimistic state and never blocks opening YouTube.
     const deviceId = await getDeviceId();
-    const result = await runSeenMutation({
-      persist: () => markSeen(deviceId, channelId, [seenId]),
-      rollback: async () => {
-        if (!wasAlreadyPending) recentlySeenRef.current.delete(seenId);
-        const restoredLastSeen = await getLastSeen();
-        if (previousLastSeenEntry) restoredLastSeen[handle] = previousLastSeenEntry;
-        else delete restoredLastSeen[handle];
-        await saveLastSeen(restoredLastSeen);
-        setLastSeen(restoredLastSeen);
-        if (previousCacheEntry) {
-          const restoredCache = { ...cacheRef.current, [handle]: previousCacheEntry };
-          cacheRef.current = restoredCache;
-          setCache(restoredCache);
-          try { await saveChannelCache(restoredCache); } catch {}
-        }
-      },
-    });
-    if (result.ok) {
-      setSeenPersistenceError(null);
-      return true;
-    }
-    setSeenPersistenceError('Couldn’t save seen status. Pull to refresh and try again.');
-    console.warn('[seen] markSeen failed', seenId, result.error);
-    return false;
+    await enqueueSeenMutation({ storage: AsyncStorage, channelId, contentIds: [seenId] });
+    flushSeenMutationQueue({ storage: AsyncStorage, deviceId, persist: markSeen })
+      .catch(() => console.warn('[seen] queued retry remains pending'));
+    return true;
   };
 
-  // Central helper: mark ALL items for a channel as seen (clearAll).
-  // Used by channel-mode taps where we wipe everything and open the channel page.
+  // Central helper: mark all items currently represented for a channel seen.
+  // The remote intent contains those exact IDs rather than a delayed clearAll.
   const markAllSeen = async ({ handle, channelId }) => {
-    const previousCacheEntry = cacheRef.current[handle];
-    const newlyPendingIds = [];
-
     // Add all current video/post IDs to recentlySeenRef
     const allVideos = getVideos(handle);
     const allPosts = getPosts(handle);
     for (const v of allVideos) {
       if (v.videoId) {
-        if (!recentlySeenRef.current.has(v.videoId)) newlyPendingIds.push(v.videoId);
         recentlySeenRef.current.add(v.videoId);
       }
     }
     for (const p of allPosts) {
       const pid = getPostSeenId(p);
       if (pid) {
-        if (!recentlySeenRef.current.has(pid)) newlyPendingIds.push(pid);
         recentlySeenRef.current.add(pid);
       }
     }
 
     // Update lastSeen
     const ls = await getLastSeen();
-    const previousLastSeenEntry = ls[handle]
-      ? { ...ls[handle], seenIds: [...(ls[handle].seenIds || [])] }
-      : null;
     if (!ls[handle]) ls[handle] = { seenIds: [] };
     const allIds = [
       ...allVideos.map(v => v.videoId).filter(Boolean),
@@ -547,6 +532,7 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
         updatedCache[handle] = {
           ...updatedCache[handle],
           videos: cached.videos.map((v) => ({ ...v, unwatched: false })),
+          latestVideo: cached.latestVideo ? { ...cached.latestVideo, unwatched: false } : cached.latestVideo,
         };
         changed = true;
       }
@@ -564,40 +550,19 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
       }
     }
 
-    // Await markSeen clearAll on server
+    // Persist the IDs visible at tap time. Never defer an unbounded clearAll,
+    // which could incorrectly consume content that arrives after this tap.
     const deviceId = await getDeviceId();
-    const result = await runSeenMutation({
-      persist: () => markSeen(deviceId, channelId, [], true),
-      rollback: async () => {
-        for (const id of newlyPendingIds) recentlySeenRef.current.delete(id);
-        const restoredLastSeen = await getLastSeen();
-        if (previousLastSeenEntry) restoredLastSeen[handle] = previousLastSeenEntry;
-        else delete restoredLastSeen[handle];
-        await saveLastSeen(restoredLastSeen);
-        setLastSeen(restoredLastSeen);
-        if (previousCacheEntry) {
-          const restoredCache = { ...cacheRef.current, [handle]: previousCacheEntry };
-          cacheRef.current = restoredCache;
-          setCache(restoredCache);
-          try { await saveChannelCache(restoredCache); } catch {}
-        }
-      },
-    });
-    if (result.ok) {
-      setSeenPersistenceError(null);
-      return true;
-    }
-    setSeenPersistenceError('Couldn’t save seen status. Pull to refresh and try again.');
-    console.warn('[seen] markSeen clearAll failed', channelId, result.error);
-    return false;
+    await enqueueSeenMutation({ storage: AsyncStorage, channelId, contentIds: allIds });
+    flushSeenMutationQueue({ storage: AsyncStorage, deviceId, persist: markSeen })
+      .catch(() => console.warn('[seen] queued retry remains pending'));
+    return true;
   };
 
   const handleChannelOpen = async (channel) => {
 
-    // Mark all items seen (local + server) BEFORE opening YouTube.
-    // Awaiting ensures the server has processed clearAll before the
-    // app backgrounds and refresh() fires on return.
-    await markAllSeen({ handle: channel.handle, channelId: channel.channelId });
+    await markAllSeen({ handle: channel.handle, channelId: channel.channelId })
+      .catch(() => console.warn('[seen] local channel update could not be completed'));
 
     try { await updateWidget('channel-open'); } catch {}
 
@@ -607,11 +572,13 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
   const handleTap = async (channel) => {
 
     if (settings.tapAction === 'channel') {
-      await markAllSeen({ handle: channel.handle, channelId: channel.channelId });
+      await markAllSeen({ handle: channel.handle, channelId: channel.channelId })
+        .catch(() => console.warn('[seen] local channel update could not be completed'));
     } else {
       const video = getCurrentVideo(channel.handle);
       if (video) {
-        await markItemSeen({ handle: channel.handle, channelId: channel.channelId, item: video, type: 'video' });
+        await markItemSeen({ handle: channel.handle, channelId: channel.channelId, item: video, type: 'video' })
+          .catch(() => console.warn('[seen] local item update could not be completed'));
       }
     }
 
@@ -632,7 +599,8 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
       return;
     }
 
-    await markItemSeen({ handle: channel.handle, channelId: channel.channelId, item: video, type: 'video' });
+    await markItemSeen({ handle: channel.handle, channelId: channel.channelId, item: video, type: 'video' })
+      .catch(() => console.warn('[seen] local item update could not be completed'));
 
     try { await updateWidget('video-tap'); } catch {}
 
@@ -649,7 +617,8 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
 
     if (!postKey) return;
 
-    await markItemSeen({ handle: channel.handle, channelId: channel.channelId, item: post, type: 'post' });
+    await markItemSeen({ handle: channel.handle, channelId: channel.channelId, item: post, type: 'post' })
+      .catch(() => console.warn('[seen] local item update could not be completed'));
 
     try { await updateWidget('post-tap'); } catch {}
 
@@ -864,12 +833,7 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
             colors={[COLORS.accent]}
           />
         }
-        ListHeaderComponent={seenPersistenceError ? (
-          <View style={styles.previewError}>
-            <Text style={styles.previewErrorTitle}>Seen status wasn’t saved</Text>
-            <Text style={styles.previewErrorText}>{seenPersistenceError}</Text>
-          </View>
-        ) : IS_TUBEPULSE_PREVIEW && previewConnectionPhase === 'connecting' ? (
+        ListHeaderComponent={IS_TUBEPULSE_PREVIEW && previewConnectionPhase === 'connecting' ? (
           <View style={styles.previewConnecting}>
             <ActivityIndicator color={COLORS.accent} size="small" />
             <Text style={styles.previewConnectingText}>Connecting to Preview server…</Text>

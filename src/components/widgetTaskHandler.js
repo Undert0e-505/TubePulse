@@ -1,5 +1,6 @@
 ﻿import React from 'react';
 import { Linking } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { TubePulseWidget } from './TubePulseWidget';
 import { getChannels, getSettings, getLastSeen, saveLastSeen, getChannelCache, saveChannelCache } from '../utils/storage';
 import { fetchFeed, getDeviceId, markSeen } from '../utils/api';
@@ -12,6 +13,7 @@ import {
   sortVideosNewestFirst,
 } from '../utils/feedPresentation';
 import { orderChannels } from '../utils/channelOrdering.mjs';
+import { enqueueSeenMutation, flushSeenMutationQueue } from '../utils/seenPersistence.mjs';
 const nameToWidget = {
   TubePulseWidget: TubePulseWidget,
 };
@@ -245,8 +247,11 @@ async function markAllSeen(handle) {
 
   const channelId = getChannelId(handle, channels, cache);
   const deviceId = await getDeviceId();
-  if (deviceId && channelId) {
-    markSeen(deviceId, channelId, [], true).catch(() => {});
+  if (channelId && [...videoIds, ...postIds].length) {
+    await enqueueSeenMutation({
+      storage: AsyncStorage, channelId, contentIds: [...videoIds, ...postIds],
+    });
+    flushSeenMutationQueue({ storage: AsyncStorage, deviceId, persist: markSeen }).catch(() => {});
   }
 }
 
@@ -269,8 +274,9 @@ async function markWidgetVideoSeen(handle, videoId) {
 
   const channelId = getChannelId(handle, channels, cache);
   const deviceId = await getDeviceId();
-  if (deviceId && channelId) {
-    markSeen(deviceId, channelId, [videoId]).catch(() => {});
+  if (channelId) {
+    await enqueueSeenMutation({ storage: AsyncStorage, channelId, contentIds: [videoId] });
+    flushSeenMutationQueue({ storage: AsyncStorage, deviceId, persist: markSeen }).catch(() => {});
   }
 }
 
@@ -294,8 +300,9 @@ async function markWidgetPostSeen(handle, postId) {
 
   const channelId = getChannelId(handle, channels, cache);
   const deviceId = await getDeviceId();
-  if (deviceId && channelId) {
-    markSeen(deviceId, channelId, [postKey]).catch(() => {});
+  if (channelId) {
+    await enqueueSeenMutation({ storage: AsyncStorage, channelId, contentIds: [postKey] });
+    flushSeenMutationQueue({ storage: AsyncStorage, deviceId, persist: markSeen }).catch(() => {});
   }
 }
 
