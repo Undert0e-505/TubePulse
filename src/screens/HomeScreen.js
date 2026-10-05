@@ -36,6 +36,7 @@ import {
   waitForCurrentInitialization,
 } from '../utils/appInitialization.mjs';
 import { runSeenMutation } from '../utils/seenPersistence.mjs';
+import { orderChannels } from '../utils/channelOrdering.mjs';
 
 const THUMB_UP_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#666666" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
   <path d="M7 22V11" />
@@ -53,7 +54,7 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
   const [channels, setChannels] = useState([]);
   const [cache, setCache] = useState({});
   const [lastSeen, setLastSeen] = useState({});
-  const [settings, setSettings] = useState({ tapAction: 'video' });
+  const [settings, setSettings] = useState({ tapAction: 'video', autoOrderChannels: false });
   const [channelDisplaySettings, setChannelDisplaySettings] = useState({});
   const [refreshing, setRefreshing] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -847,11 +848,12 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
     initializationPending: previewInitializationPending,
     connectionError: previewConnectionError,
   });
+  const displayedChannels = orderChannels(channels, cache, settings.autoOrderChannels === true);
 
   return (
     <View style={styles.container}>
       <FlatList
-        data={channels}
+        data={displayedChannels}
         keyExtractor={(item) => item.handle}
         renderItem={renderChannel}
         refreshControl={

@@ -81,7 +81,7 @@ The additive [`self-host/`](self-host/) package runs the existing API and schedu
 
 Production uses the **unified Home authority**: one process/store owns signed all-device mutation execution and the consolidated scheduler, polls community posts hourly, and runs aux work each minute. Video detection uses the YouTube Data API; every aligned five-minute cycle batches active channels into at most 50 IDs per `channels.list` request, then reconciles uploads playlists only for migration/change/safety-due channels and batches video statistics. The unchanged public Worker URL serves every authenticated `/feed` from Home over Workers VPC while authority is current, with Cloudflare D1 fallback. Authenticated app mutations also run on Home through signed VPC ingress while a Durable Object provides global ordering. Successful exact deltas are durably coalesced for D1 backup, so `/seen` and the other app writes do not depend on a cloud canonical read at request time. Home publishes only changed keys through an atomic, hash-guarded D1 batch; the coordinator conservatively budgets 45,000 estimated scheduler rows and 50,000 total estimated rows per UTC day, leaving 5,000 rows for app mutations against D1's 100,000-row free allowance. D1 batch operations improve atomicity and latency but still bill every affected row. Deferred backup changes are coalesced, and notification intents are suppressed while their backup publication is deferred. The old Workers KV namespace is a frozen point-in-time snapshot and is never an automatic fallback. No periodic namespace pull runs after the one-time signed snapshot. The RSS, posts, and aux Cloudflare Cron Triggers are disabled; their Worker deployments require an explicit frozen-KV rollback latch and remain historical rollback tools. There is no automatic RSS fallback.
 
-Start with the [self-host guide](self-host/README.md) for its preview limitations, five-minute setup, synchronization safety model, Cloudflare Tunnel guidance, backups, and recovery procedure.
+Start with the [self-host guide](self-host/README.md) for setup and operation. The [production recovery runbook](self-host/RECOVERY.md) covers both the checked-in hidden Windows startup supervisor and a complete zero-local-backup rebuild from GitHub, active D1/Durable Object state, and the existing cloud projects. The task installer is not assumed to be installed until the host is explicitly configured and reboot-tested.
 
 ---
 
@@ -160,11 +160,15 @@ When you tap a notification or a video in the feed:
 
 - **Video tap** — opens that specific video in YouTube, marks only that video as watched
 - **Channel tap** — opens the channel page in YouTube, marks **all** unwatched videos and posts from that channel as watched (bundle clear)
+- **Batch notification tap** — always opens the channel and marks the exact bundled video/post IDs as watched. Older notifications without exact IDs retain the safe clear-all fallback.
+
+Notification taps update the local feed immediately and persist the same seen operation remotely. Background/cold FCM notifications and foreground notifications shown by the app share the same routing path; a persistence failure cannot prevent the YouTube destination from opening.
 
 This is the key interaction: video tap for "I've seen this one", channel tap for "I'm going to their channel and clearing my backlog".
 
 ### 🏠 Home Feed
 - All new videos and community posts from tracked channels, newest first
+- Optional **Auto-order channels** display preference orders channel sections by their newest cached video on Home, Channels, and the widget. Community posts do not affect this order; disabling it restores the saved manual order.
 - Unseen videos and posts highlighted with a blue dot
 - Video rows: thumbnail, title, channel avatar, meta row (age · likes · dislikes · views)
 - Post rows: thumbnail OR speech-bubble placeholder (greyscale shrunk channel avatar inside a rounded-rect bubble with a small triangular tail), header ("Posted" / "Posted an image" / "Posted a poll"), truncated body (3 lines)
@@ -291,6 +295,7 @@ Home publishes changed keys to `TUBEPULSE_D1` as a bounded backup while the publ
 6. **On notification tap**:
    - Video tap → `POST /seen { channelId, ids: [id] }`
    - Channel tap → `POST /seen { channelId, clearAll: true }`
+   - Batch tap → `POST /seen { channelId, ids: [exact bundled IDs] }`; legacy batches without IDs use `clearAll`
    - Post tap (v3.1) → `POST /seen { channelId, ids: ["post:activityId"] }`, then open the channel's community tab
    - Prewarn tap (v3.1) → open the YouTube watch URL for the scheduled video. The video is NOT marked as seen on tap (the prewarn is a reminder; the live-time push will still fire later)
 7. **On feed refresh**: `GET /feed` → returns cached data from Home while authority is current, otherwise from D1, merged with per-device state to compute `unwatched` flags on both videos and posts
@@ -350,7 +355,7 @@ TubePulse/
 ├── src/
 │   ├── screens/
 │   │   ├── HomeScreen.js          # Main feed — new videos and posts from all channels
-│   │   ├── ChannelsScreen.js      # Add/remove/reorder channels, per-channel settings
+│   │   ├── ChannelsScreen.js      # Add/remove/manual-or-auto ordering, per-channel settings
 │   │   └── SettingsScreen.js      # Nag interval, mode, DND, prewarn, posts toggle, tap action
 │   ├── components/
 │   │   ├── TubePulseWidget.js     # Android home screen widget
@@ -363,6 +368,8 @@ TubePulse/
 │   │   ├── apiEndpointPolicy.mjs  # Build-time primary/fallback and sticky retry policy
 │   │   ├── notifications.js       # Android notification channels
 │   │   ├── fcm.js                 # Firebase Cloud Messaging setup + handlers
+│   │   ├── channelOrdering.mjs    # Stable manual/automatic channel display ordering
+│   │   ├── notificationTap.mjs    # Notification route, batch-ID, and optimistic-seen policy
 │   │   ├── storage.js             # AsyncStorage wrapper
 │   │   └── constants.js           # Colours, defaults, nag intervals, prewarn options, storage keys, preseeded channels
 │   └── App.js                     # Navigation, FCM setup, notification tap handling, init
@@ -408,7 +415,8 @@ TubePulse/
 
 | Setting | Values | Default | Description |
 |---------|--------|---------|-------------|
-| `tapAction` | `video` / `channel` | `video` | `video` = tap video opens video, tap pfp opens channel. `channel` = everything opens the channel. Applies to notifications, app feed, and widget. Posts always open community tab regardless. |
+| `tapAction` | `video` / `channel` | `video` | `video` = a single-video tap opens that video; `channel` = it opens the channel and clears that channel's backlog. Batch notifications always open the channel. Applies to notifications, app feed, and widget. Posts always open the community tab. |
+| `autoOrderChannels` | boolean | false | Locally display channel sections newest-video-first on Home, Channels, and the widget without overwriting the saved manual order. |
 | `notificationMode` | `chill` / `relentless` | `chill` | Chill = nudge every 4h; Relentless = re-nag every interval |
 | `nagInterval` | 5 / 15 / 30 / 60 / 120 | 15 | Minutes between nag attempts for unwatched videos |
 | `dndEnabled` | boolean | false | Block all notifications during DND hours |

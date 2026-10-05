@@ -535,6 +535,16 @@ When an FCM push arrives:
 
 ## 10. Failure modes and recovery
 
+### 10.0 Current unified Home recovery boundary
+
+The production authority is local-first with coordinated D1 backup, not the historical Worker/KV-only design described in the subsections below. Feed reads can fall back to D1 when Home is unavailable, while authenticated mutations fail closed whenever the Home/coordinator/VPC ordering contract cannot be guaranteed. Exact cloud recovery uses the active D1 generation plus the Durable Object baseline, transaction, and pending journal; frozen Workers KV is never an automatic source.
+
+Current startup performs exact reconciliation when either the local or coordinator status is stale, including after an expired unclean-stop lease makes Home stale. It does not yet prove a full local-versus-D1 manifest when both persisted markers say `current`. Reconciliation also refuses while coordinator backup work is pending, so proposed always-verify startup must drain/retry that work within bounds before taking a recovery snapshot. It must never clear an unverified journal.
+
+D1 covers the coordinated canonical key space, not host-only scheduler/quota JSON, notification-intent history, credentials, runtime configuration, or Windows startup policy. Notification delivery intentionally uses at-most-once behavior at an ambiguous FCM `sending` boundary: pending work can recover, but one push can be lost rather than duplicated after a crash. Upstream/network failure is a dependency outage, not permission for destructive restart or state reset.
+
+The authoritative current-state audit, checked-in Windows startup supervisor, zero-local-backup reconstruction procedure, credential-rotation matrix, exact D1 reconcile sequence, failure branches, and safe activation checks are in [`self-host/RECOVERY.md`](self-host/RECOVERY.md). Sections 10.1–10.5 below document historical Worker-era failure assumptions and must not override that runbook.
+
 ### 10.1 WebSub subscription expires without renewal
 
 Symptoms: stop receiving pushes for a channel.
@@ -762,6 +772,8 @@ Configuration and traffic activation are separate latches. Production initially 
 Community-post cache comparisons discard rotating YouTube thumbnail delivery parameters when the stable image origin/path is unchanged, and ignore relative-age label churn when the cached post has the same valid `publishedAt`. Structural post changes remain immediate. Engagement observations hydrate missing values, persist any normalized known numeric change at most once per UTC hour, and force a refresh after 24 hours, using `fetchedAt` as the persisted observation clock.
 
 The final subscriber leaving removes the channel from `channels:active`, which stops video and post polling. Display/subscriber caches are cleaned through the coordinated backup journal, while `channel:{id}:known:videos` remains durable so a later resubscribe cannot replay historical uploads.
+
+Host availability and disaster recovery are deliberately separate from this data-plane design. Compose health proves only HTTP liveness/service identity—not authority readiness/current state or scheduler progress. The checked-in Windows supervisor starts Docker minimized, applies Compose idempotently, and separately evaluates signed coordinator/D1 readiness and scheduler progress without clearing stale/pending state or restarting for dependency outages. Its Scheduled Task still must be installed/reboot-tested on the host. After total disk loss, GitHub plus active D1/DO and the existing cloud projects reconstruct canonical service; secrets rotate and host-only scheduler/quota/notification state follows conservative loss rules. See [`self-host/RECOVERY.md`](self-host/RECOVERY.md).
 
 ---
 

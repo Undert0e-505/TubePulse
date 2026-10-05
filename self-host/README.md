@@ -153,13 +153,22 @@ Stop it without deleting persistent state with `docker compose down`. To return 
 
 ## Windows always-on operation
 
-Install dependencies once with `npm install`, configure `.env`, and test `npm start` interactively. `windows/Start-TubePulse.ps1` provides a simple restart loop:
+`windows/Start-TubePulse.ps1` remains the simple foreground restart loop for the standalone Preview runtime. Production unified Home uses the narrower Docker supervisor and Scheduled Task installer:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\windows\Start-TubePulse.ps1
+.\windows\Start-HomeAuthority.ps1 -DryRun -InitialDelaySeconds 0
+.\windows\Install-HomeAuthorityStartupTask.ps1 -DryRun
 ```
 
-Run that script from Task Scheduler at system startup (or use a service wrapper such as WinSW/NSSM) under a dedicated, low-privilege account. Set the working directory to `self-host`, enable restart on failure, and grant that account access only to the self-host data and secret files. Test a reboot before relying on it. The repository does not automatically install or modify a Windows service.
+After manual authority recovery/readiness is proven, run the installer from an elevated PowerShell session. It registers one hidden at-logon task for the current interactive identity, with a startup delay, bounded retry, and `IgnoreNew` overlap policy:
+
+```powershell
+.\windows\Install-HomeAuthorityStartupTask.ps1
+```
+
+The startup script resolves absolute repo paths safely, starts Docker Desktop minimized only when necessary, waits for `docker info`, applies `compose.authority.yaml` idempotently, and checks local readiness, signed coordinator/D1 state, pending/transaction state, and scheduler heartbeat/progress. It does not clear or activate stale state and does not restart containers merely because an upstream dependency is unavailable. Logs rotate under ignored `data-authority` and never contain raw status or credentials. Disable/remove instructions, dry-run validation, expected recovery bands, and Docker Desktop UI limitations are in [`RECOVERY.md`](RECOVERY.md).
+
+The latest host audit found no matching task installed and Docker Desktop autostart disabled. The code is implemented in the repository, but unattended recovery is not a host guarantee until the installer is deliberately run and reboot-tested. Docker Desktop needs an interactive sign-in; the task cannot provide pre-login service semantics.
 
 ## Home scheduler consolidation and production authority
 
@@ -228,9 +237,11 @@ The command requires Home's local gate to be current, exports the authoritative 
 
 The coordinator budgets three estimated rows per logical key mutation and enforces 45,000 scheduler / 50,000 total estimated rows per UTC day, leaving 5,000 for app mutations against the 100,000-row D1 free allowance. D1 batching is atomic and reduces round trips, but does not reduce billed rows.
 
-The live authority uses ignored `data-authority`, `secrets/authority-secret.txt`, and `.env.authority`; it does not share writable storage with Preview, the old gateway mirror, or the shadow scheduler. `docker compose --env-file .env.authority -f compose.authority.yaml ps` and loopback `GET /_tubepulse/status` are the primary host checks. Do not run the one-shot reconciliation CLI while the service owns its file lease. On rollback, stop/drain Home before restoring any trigger.
+The live authority uses ignored `data-authority`, secret-file mounts, and its authority environment; it does not share writable storage with Preview, the old gateway mirror, or the shadow scheduler. `docker compose --env-file .env.authority -f compose.authority.yaml ps` and loopback `GET /_tubepulse/status` are the primary host checks. Do not run the one-shot reconciliation CLI while the service owns its file lease. On rollback, stop/drain Home before restoring any trigger.
 
-Active startup verifies both the local authority and the signed Cloudflare coordinator before arming the scheduler. If either side is stale, Home acquires its single-process lease, imports an exact canonical snapshot, verifies the manifest, and reactivates both sides before accepting traffic. D1 recovery exports visible canonical rows with a bounded set-based read rather than one query per key, preserving null expiration as non-expiring and staying below per-invocation query limits. A publication/timer failure is contained rather than becoming an unhandled process rejection: the interrupted cohort is recorded in `scheduler.lastError`, Home attempts the same exact reconciliation, and the minute timer continues. If reconciliation replaced local state after a cohort began, that cohort is marked failed rather than resuming progress against replaced state; the deterministic cycle resumes safely from current canonical data. An unclean process stop still leaves the file lease protected until its TTL expires; a clean shutdown waits for the active tick, releases the lease before disposing workerd, and permits an immediate restart.
+`node src/home-authority-cli.mjs status` is a read-only signed coordinator check that emits only replication, lease, transaction, pending-key, backend, and quota status. The Windows startup supervisor runs it in an ephemeral Compose container so Docker liveness is never mistaken for D1/authority readiness.
+
+Active startup reads both the local authority and signed Cloudflare coordinator status before arming the scheduler. If either side is stale, Home acquires its single-process lease, imports an exact canonical snapshot, verifies the manifest, and reactivates both sides before accepting traffic. If both persisted status markers say `current`, startup currently skips a full local-versus-D1 manifest verification. Reconciliation also refuses to begin while coordinator backup keys remain pending, so an always-verify startup design must first add a bounded pending-drain/retry path rather than looping indefinitely or clearing unverified work. D1 recovery exports visible canonical rows with a bounded set-based read rather than one query per key, preserving null expiration as non-expiring and staying below per-invocation query limits. A publication/timer failure is contained rather than becoming an unhandled process rejection: the interrupted cohort is recorded in `scheduler.lastError`, Home attempts the same exact reconciliation, and the minute timer continues. If reconciliation replaced local state after a cohort began, that cohort is marked failed rather than resuming progress against replaced state; the deterministic cycle resumes safely from current canonical data. An unclean process stop still leaves the file lease protected until its TTL expires; a clean shutdown waits for the active tick, releases the lease before disposing workerd, and permits an immediate restart. The complete current recovery procedure and remaining hardening gaps are in [`RECOVERY.md`](RECOVERY.md).
 
 ### Historical incident: YouTube RSS 404 diagnosis (2026-10-05)
 
@@ -424,7 +435,7 @@ The profile also sets `TUBEPULSE_PILOT=true`, standalone mode, and disables auto
 For Docker, initialize the ignored local configuration if needed, then always start this pilot from `self-host` with the pilot environment file:
 
 ```powershell
-cd D:\dev\TubePulse\self-host
+cd self-host
 .\windows\Initialize-LocalTest.ps1 -PublishAddress 0.0.0.0
 docker compose --env-file compose.pilot.env up --build -d
 docker compose --env-file compose.pilot.env ps
@@ -506,13 +517,15 @@ If you intentionally bind to `0.0.0.0`, use host firewall rules and never expose
 
 ## Backup and restore
 
-The safest backup is offline:
+The following generic procedure applies to the standalone/legacy mirror tooling. It is not sufficient by itself for the unified production authority:
 
 1. In mirror mode, issue standby. In standalone mode, stop the process.
 2. Copy the entire configured data directory, including `kv`, `sync-state.json`, and `runtime-state.json`.
 3. Restart and check both health endpoints.
 
 Restore by stopping the service, moving the current data directory aside, copying the complete backup into place, verifying restrictive permissions, and starting again. Never copy only the KV database without its sync baseline when using mirror mode. Test restores periodically.
+
+Production does not assume an independent local/off-host file backup. If the Home disk is lost, GitHub restores source/runbooks, active D1 restores canonical application state, and the Durable Object preserves backend/baseline/transaction/pending/quota coordination. Local secret values, scheduler/quota JSON, notification-intent history, Miniflare bytes, and Windows/Docker setup are lost and must be rotated or conservatively reconstructed. Frozen Workers KV is not a recovery source. The agent-executable account-control-plane rebuild, credential matrix, exact D1 reconciliation command, quota wait, activation gates, and failure branches are in [`RECOVERY.md`](RECOVERY.md).
 
 ## Consistency and safety limits
 

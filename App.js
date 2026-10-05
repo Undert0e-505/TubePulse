@@ -9,7 +9,7 @@ import ChannelsScreen from './src/screens/ChannelsScreen';
 import SettingsScreen from './src/screens/SettingsScreen';
 import PreviewServerScreen from './src/screens/PreviewServerScreen';
 import { COLORS } from './src/utils/constants';
-import { getSettings, getLastSeen, saveLastSeen, getChannelCache, saveChannelCache } from './src/utils/storage';
+import { getChannels, getSettings, getLastSeen, saveLastSeen, getChannelCache, saveChannelCache } from './src/utils/storage';
 import { requestPermissionAndGetToken, onTokenRefresh, onForegroundMessage, onNotificationOpenedApp, getInitialNotification, setBackgroundMessageHandler } from './src/utils/fcm';
 import { registerDevice, markSeen, getDeviceId, subscribeChannel, updateSettings, bootstrapChannel } from './src/utils/api';
 import { setupNotificationChannel } from './src/utils/notifications';
@@ -26,6 +26,11 @@ import {
   APP_INITIALIZATION_STORAGE_KEY,
   createAppInitializationMarker,
 } from './src/utils/appInitialization.mjs';
+import {
+  applyOptimisticNotificationSeen,
+  notificationTapDedupeKey,
+  notificationTapPlan,
+} from './src/utils/notificationTap.mjs';
 
 // Configure expo-notifications to show notifications while the app is
 // in the foreground. Without this, scheduleNotificationAsync calls
@@ -54,10 +59,16 @@ const screenOptions = {
   contentStyle: { backgroundColor: COLORS.bg },
 };
 
-function HeaderButton({ title, onPress, style }) {
+function HeaderButton({ title, onPress, style, textStyle, accessibilityLabel, accessibilityHint }) {
   return (
-    <TouchableOpacity onPress={onPress} style={style}>
-      <Text style={{ color: COLORS.accent, fontSize: 14, fontWeight: '500' }}>
+    <TouchableOpacity
+      onPress={onPress}
+      style={[{ minHeight: 44, minWidth: 44, alignItems: 'center', justifyContent: 'center' }, style]}
+      accessibilityRole="button"
+      accessibilityLabel={accessibilityLabel || title}
+      accessibilityHint={accessibilityHint}
+    >
+      <Text style={[{ color: COLORS.accent, fontSize: 14, fontWeight: '500' }, textStyle]}>
         {title}
       </Text>
     </TouchableOpacity>
@@ -144,6 +155,7 @@ function TubePulseApplication() {
   const fcmTokenRef = useRef(null);
   const deviceIdRef = useRef(null);
   const [initializationMarker] = useState(() => createAppInitializationMarker());
+  const processedTapKeysRef = useRef(new Map());
 
   useEffect(() => {
     (async () => {
@@ -398,138 +410,77 @@ function TubePulseApplication() {
       }
     }) : () => {};
 
-    // Handle notification tap (app opened from notification)
-    const handleNotificationTap = async (remoteMessage) => {
-      const data = remoteMessage?.data;
+    // Firebase-delivered notifications and foreground notifications re-published
+    // through expo-notifications both enter this one path.
+    const handleNotificationTap = async (messageOrResponse) => {
+      const data = messageOrResponse?.data
+        || messageOrResponse?.notification?.request?.content?.data
+        || null;
       if (!data?.videoId && !data?.channelId && !data?.activityId) return;
 
+      const dedupeKey = notificationTapDedupeKey(data);
+      const now = Date.now();
+      for (const [key, at] of processedTapKeysRef.current) {
+        if (now - at > 30_000) processedTapKeysRef.current.delete(key);
+      }
+      if (now - (processedTapKeysRef.current.get(dedupeKey) || 0) < 10_000) return;
+      processedTapKeysRef.current.set(dedupeKey, now);
+
+      let plan;
+      let deviceId;
+      let channels = [];
       try {
-        const settings = await getSettings();
-        const deviceId = deviceIdRef.current || await getDeviceId();
-        const isPost = (data.type === 'post' || (data.type === 'nag' && data.activityId)) && data.activityId;
-        const isPrewarn = data.type === 'prewarn' && data.videoId;
+        const [settings, localChannels, resolvedDeviceId] = await Promise.all([
+          getSettings(),
+          getChannels(),
+          deviceIdRef.current ? Promise.resolve(deviceIdRef.current) : getDeviceId(),
+        ]);
+        channels = localChannels;
+        deviceId = resolvedDeviceId;
+        const handle = localChannels.find((channel) => channel.channelId === data.channelId)?.handle || null;
+        plan = notificationTapPlan(data, { localTapAction: settings.tapAction, handle });
+      } catch (error) {
+        console.warn('Notification tap setup failed:', error);
+        plan = notificationTapPlan(data, { localTapAction: 'video', handle: null });
+      }
+      if (!plan) return;
 
-        if (isPost) {
-          // Post taps always mark the post as seen and open the
-          // community tab. The user's tapAction preference doesn't
-          // change post behaviour — there's no per-post tapAction to
-          // apply (videos and posts share the same screen).
-          const postKey = `post:${data.activityId}`;
-          await markSeen(deviceId, data.channelId, [postKey]);
+      // Opening the destination is the primary action. Start it before any
+      // network persistence and do not allow local/remote failures to block it.
+      if (plan.url) {
+        Linking.openURL(plan.url).catch((error) => {
+          console.warn('Notification destination could not be opened:', error);
+        });
+      }
 
-          const { getChannels } = require('./src/utils/storage');
-          const channels = await getChannels();
-          const ch = channels.find((c) => c.channelId === data.channelId);
-          const handle = ch?.handle;
-
-          if (handle) {
-            const lastSeen = await getLastSeen();
-            if (!lastSeen[handle]) lastSeen[handle] = { seenIds: [] };
-            const seenIds = lastSeen[handle].seenIds || [];
-            if (!seenIds.includes(postKey)) {
-              lastSeen[handle].seenIds = [...seenIds, postKey];
-              await saveLastSeen(lastSeen);
-            }
-
-            const cache = await getChannelCache();
-            const cached = cache[handle];
-            if (cached?.posts?.some((p) => p.activityId === data.activityId && p.unwatched)) {
-              const updatedCache = {
-                ...cache,
-                [handle]: {
-                  ...cached,
-                  posts: cached.posts.map((p) =>
-                    p.activityId === data.activityId ? { ...p, unwatched: false } : p
-                  ),
-                },
-              };
-              await saveChannelCache(updatedCache);
-            }
+      if (plan.kind !== 'prewarn') {
+        try {
+          const [cache, lastSeen] = await Promise.all([getChannelCache(), getLastSeen()]);
+          const optimistic = applyOptimisticNotificationSeen({
+            channels,
+            cache,
+            lastSeen,
+            channelId: data.channelId,
+            contentIds: plan.contentIds,
+            clearAll: plan.clearAll,
+          });
+          if (optimistic.handle) {
+            await Promise.all([
+              saveLastSeen(optimistic.lastSeen),
+              saveChannelCache(optimistic.cache),
+            ]);
           }
-
-          if (data.postLink) {
-            Linking.openURL(data.postLink);
-          } else {
-            Linking.openURL(`https://www.youtube.com/channel/${data.channelId}/community`);
-          }
-        } else if (isPrewarn) {
-          // Prewarn taps open the scheduled video's watch URL. We do
-          // NOT mark it as seen — the user is just being reminded it
-          // exists; the "live now" push will fire later and the nag
-          // cycle should still prompt if they ignore it.
-          Linking.openURL(`https://www.youtube.com/watch?v=${data.videoId}`);
-        } else if (data.type === 'batch' || settings.tapAction === 'channel') {
-          // Channel tap or batch — mark all unwatched for this channel
-          await markSeen(deviceId, data.channelId, [], true);
-
-          // Update local state
-          const lastSeen = await getLastSeen();
-          const { getChannels, getChannelCache } = require('./src/utils/storage');
-          const channels = await getChannels();
-          const ch = channels.find((c) => c.channelId === data.channelId);
-          const handle = ch?.handle;
-
-          if (handle) {
-            if (!lastSeen[handle]) lastSeen[handle] = { seenIds: [] };
-            const cache = await getChannelCache();
-            const cached = cache[handle] || {};
-            const channelVideos = cached.videos || [];
-            const channelPosts = cached.posts || [];
-            const existing = new Set(lastSeen[handle].seenIds || []);
-            for (const v of channelVideos) {
-              if (v.videoId) existing.add(v.videoId);
-            }
-            for (const p of channelPosts) {
-              if (p.activityId) existing.add(`post:${p.activityId}`);
-            }
-            lastSeen[handle].seenIds = [...existing];
-            await saveLastSeen(lastSeen);
-
-            if (channelVideos.some((v) => v.unwatched) || channelPosts.some((p) => p.unwatched)) {
-              await saveChannelCache({
-                ...cache,
-                [handle]: {
-                  ...cached,
-                  videos: channelVideos.map((v) => ({ ...v, unwatched: false })),
-                  posts: channelPosts.map((p) => ({ ...p, unwatched: false })),
-                },
-              });
-            }
-          }
-
-          // Open channel page
-          if (handle) {
-            Linking.openURL(`https://www.youtube.com/@${handle}`);
-          }
-        } else {
-          // Video tap — mark single video
-          await markSeen(deviceId, data.channelId, [data.videoId]);
-
-          // Update local state
-          const lastSeen = await getLastSeen();
-          const { getChannels } = require('./src/utils/storage');
-          const channels = await getChannels();
-          const ch = channels.find((c) => c.channelId === data.channelId);
-          const handle = ch?.handle;
-
-          if (handle) {
-            if (!lastSeen[handle]) lastSeen[handle] = { seenIds: [] };
-            const seenIds = lastSeen[handle].seenIds || [];
-            if (!seenIds.includes(data.videoId)) {
-              lastSeen[handle].seenIds = [...seenIds, data.videoId];
-              await saveLastSeen(lastSeen);
-            }
-          }
-
-          // Open video
-          if (data.videoLink) {
-            Linking.openURL(data.videoLink);
-          }
+        } catch (error) {
+          console.warn('Notification local seen update failed:', error);
         }
 
         try { await updateWidget('notif-tap'); } catch {}
-      } catch (e) {
-        console.warn('Notification tap error:', e);
+
+        if (deviceId && data.channelId) {
+          markSeen(deviceId, data.channelId, plan.contentIds, plan.clearAll).catch((error) => {
+            console.warn('Notification remote seen update failed:', error);
+          });
+        }
       }
     };
 
@@ -542,6 +493,21 @@ function TubePulseApplication() {
       });
     }
 
+    let expoTapSubscription;
+    try {
+      const Notifications = require('expo-notifications');
+      expoTapSubscription = Notifications.addNotificationResponseReceivedListener(handleNotificationTap);
+      Notifications.getLastNotificationResponseAsync?.().then(async (response) => {
+        if (!response) return;
+        try { await Notifications.clearLastNotificationResponseAsync?.(); } catch {}
+        const responseDate = Number(response?.notification?.date);
+        if (Number.isFinite(responseDate) && Date.now() - responseDate > 5 * 60_000) return;
+        await handleNotificationTap(response);
+      }).catch((error) => console.warn('Cold notification response check failed:', error));
+    } catch (error) {
+      console.warn('Expo notification tap listener unavailable:', error);
+    }
+
     // Listen for notification taps (warm start)
     const tapUnsubscribe = PREVIEW_PUSH_ENABLED
       ? onNotificationOpenedApp(handleNotificationTap)
@@ -551,6 +517,7 @@ function TubePulseApplication() {
       tokenUnsubscribe();
       foregroundUnsubscribe();
       tapUnsubscribe();
+      expoTapSubscription?.remove?.();
     };
   }, []);
 
@@ -580,7 +547,14 @@ function TubePulseApplication() {
               headerRight: () => (
                 <>
                   <HeaderButton title="Channels" onPress={() => navigation.navigate('Channels')} />
-                  <HeaderButton title="Settings" onPress={() => navigation.navigate('Settings')} style={{ marginLeft: 14 }} />
+                  <HeaderButton
+                    title="⚙"
+                    onPress={() => navigation.navigate('Settings')}
+                    style={{ marginLeft: 6 }}
+                    textStyle={{ fontSize: 22 }}
+                    accessibilityLabel="Settings"
+                    accessibilityHint="Opens TubePulse settings"
+                  />
                 </>
               ),
             })}

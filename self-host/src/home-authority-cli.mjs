@@ -49,6 +49,24 @@ async function reconcile(config) {
   }
 }
 
+async function status(config) {
+  const client = new AuthorityClient({
+    baseUrl: config.authority.apiUrl,
+    secret: config.authority.secret,
+    timeoutMs: config.authority.timeoutMs,
+  });
+  const remote = await client.status();
+  console.log(JSON.stringify({
+    ok: remote?.ok === true,
+    replication: remote?.replication || null,
+    lease: remote?.lease || null,
+    transaction: remote?.transaction || null,
+    pendingBackupKeys: Number(remote?.pendingBackupKeys || 0),
+    backend: remote?.backend || null,
+    quota: remote?.quota || null,
+  }));
+}
+
 async function migrateD1(config) {
   const lease = new FileLease({ dataDir: config.dataDir, ttlMs: config.leaseTtlMs });
   await lease.acquire();
@@ -108,9 +126,10 @@ async function migrateD1(config) {
 async function main() {
   const [command = 'run'] = process.argv.slice(2);
   const config = readHomeSchedulerConfig();
+  if (command === 'status') return await status(config);
   if (command === 'reconcile') return await reconcile(config);
   if (command === 'migrate-d1') return await migrateD1(config);
-  if (command !== 'run') throw new Error('Usage: node src/home-authority-cli.mjs run|reconcile|migrate-d1');
+  if (command !== 'run') throw new Error('Usage: node src/home-authority-cli.mjs run|status|reconcile|migrate-d1');
   const service = await createUnifiedHomeAuthorityService(config);
   let closing = false;
   const close = async () => {

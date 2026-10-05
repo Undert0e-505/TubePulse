@@ -522,6 +522,8 @@ Never reuse a generation for a different snapshot. The old KV namespace is not d
 
 Authority recovery uses a set-based D1 snapshot query for all visible rows, then verifies the exact Home manifest before reactivation. It does not issue one D1 query per key, and a SQL `NULL` expiration is preserved as non-expiring. This keeps recovery below D1's per-invocation query limit while retaining the existing 10 MiB snapshot-export bound.
 
+For complete host reconstruction, credential rotation, signed coordinator inspection, pending-journal constraints, quota safety, activation gates, and Windows unattended startup, follow [`self-host/RECOVERY.md`](../self-host/RECOVERY.md). Cloudflare account access cannot reveal existing Worker secret values; lost values must be rotated.
+
 ### 8.3 Deploying rollback Workers
 
 The active scheduler is the Home authority and is deployed with `self-host/compose.authority.yaml`. The following loop only updates the triggerless Cloudflare rollback artifacts; it does not make them active and must not be paired with Cron Triggers while Home owns scheduling.

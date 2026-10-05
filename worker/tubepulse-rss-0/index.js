@@ -219,14 +219,21 @@ export async function processChannelUploads(env, ctx, channelId, source, options
         notifPayload = {
           title: `${channelName} uploaded`,
           body: v.title,
-          data: { videoId: v.videoId, channelId, channelName, videoLink: v.link, type: v.type },
+          data: {
+            videoId: v.videoId, channelId, channelName, videoLink: v.link,
+            type: v.type, tapAction: String(effective.tapAction),
+          },
           tag: `video-${v.videoId}`,
         };
       } else {
         notifPayload = {
           title: `${channelName} - ${notifyEntries.length} new videos`,
           body: notifyEntries.map((v) => v.title).join('\n'),
-          data: { type: 'batch', count: String(notifyEntries.length), channelId },
+          data: {
+            type: 'batch', count: String(notifyEntries.length), channelId,
+            contentIds: JSON.stringify(notifyEntries.map((v) => v.videoId)),
+            tapAction: String(effective.tapAction),
+          },
           tag: 'tubepulse-batch',
         };
       }

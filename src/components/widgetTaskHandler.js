@@ -11,6 +11,7 @@ import {
   sortPostsNewestFirst,
   sortVideosNewestFirst,
 } from '../utils/feedPresentation';
+import { orderChannels } from '../utils/channelOrdering.mjs';
 const nameToWidget = {
   TubePulseWidget: TubePulseWidget,
 };
@@ -151,7 +152,8 @@ async function buildWidgetData(fetchFresh = false) {
     }
 
     // Build widget channel data with videos and posts
-    const widgetChannels = channels.map((ch) => {
+    const displayedChannels = orderChannels(channels, activeCache, settings.autoOrderChannels === true);
+    const widgetChannels = displayedChannels.map((ch) => {
       const cached = activeCache[ch.handle];
       const seenIds = lastSeen[ch.handle]?.seenIds || [];
 

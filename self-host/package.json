@@ -12,6 +12,7 @@
     "scheduler": "node src/home-scheduler-cli.mjs run",
     "scheduler:once": "node src/home-scheduler-cli.mjs once",
     "authority": "node src/home-authority-cli.mjs run",
+    "authority:status": "node src/home-authority-cli.mjs status",
     "authority:reconcile": "node src/home-authority-cli.mjs reconcile",
     "authority:migrate-d1": "node src/home-authority-cli.mjs migrate-d1",
     "sync:pull": "node src/cli.mjs sync pull",

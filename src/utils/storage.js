@@ -49,10 +49,10 @@ export async function getSettings() {
       delete settings.pollInterval;
       await saveSettings(settings);
     }
-    return settings;
+    return { ...DEFAULT_SETTINGS, ...settings };
   }
   await saveSettings(DEFAULT_SETTINGS);
-  return DEFAULT_SETTINGS;
+  return { ...DEFAULT_SETTINGS };
 }
 
 export async function saveSettings(settings) {

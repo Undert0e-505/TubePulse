@@ -174,6 +174,16 @@ The D1 coordinator uses one atomic four-query `batch()` for a complete logical t
 
 Restart validation exposed and corrected a recovery-only query-shape defect: D1 canonical snapshots now read visible rows in one bounded set query instead of issuing one query per key, and SQL `NULL` expiration remains non-expiring rather than becoming zero. Home completed an exact automatic reconciliation after the fix; the coordinator returned to current with no transaction or pending backup.
 
+### 2026-10-05 production resilience and recovery tooling
+
+Core application recovery exists: the authority Compose stack uses `restart: unless-stopped`, a 45-second shutdown grace period, persistent `data-authority` storage, a reconnecting tunnel, and an HTTP/service-identity health check. That health check is liveness-only: Docker can report healthy while authority is stale/not ready or scheduler progress is stuck. If an unclean-stop lease expires and Home becomes stale, startup can restore the exact canonical state from the active D1 generation plus the Durable Object journal. A live status audit has demonstrated automatic stale-authority reconciliation. Feed reads fall back to D1 during Home/tunnel failure; ordered authenticated mutations fail closed. Frozen Workers KV is never a cloud recovery source.
+
+The repository now includes a bounded Windows authority startup supervisor and an idempotent Scheduled Task installer. The supervisor starts Docker Desktop minimized when needed, waits for `docker info`, applies the authority Compose stack, uses the signed coordinator status command, and distinguishes container liveness, authority/D1 readiness, pending/transaction faults, dependency outage, and scheduler progress. It never clears/activates stale state and performs at most one bounded restart for a proven liveness-health failure. The current machine audit still found Docker Desktop autostart disabled and no matching task; no host setting was changed during implementation. Unattended recovery is not operational until the installer is explicitly run and reboot-tested.
+
+The production Home/Worker implementation audited before this uncommitted app/startup work was based on repository commit `1390053`. Recovery must verify that marker against Cloudflare deployment records and GitHub history rather than assuming the newest `master` is deployed; update the marker after the next backend deployment.
+
+Startup currently reconciles only when local or coordinator status is stale; two `current` markers skip a full manifest proof. Reconciliation refuses pending backup keys, and no reviewed all-pending disaster-recovery CLI exists, so total-loss recovery fails closed at that condition rather than discarding journal work. Host JSON also lacks fsynced checksummed generations. The runbook now documents a zero-local-backup reconstruction from GitHub, active D1/DO state, and existing cloud projects, including mandatory secret rotation, exact manifest reconcile, conservative YouTube quota wait, notification-intent ambiguity, and activation gates. This is a manual disk-replacement procedure, not automatic failover. See [`self-host/RECOVERY.md`](self-host/RECOVERY.md).
+
 ---
 
 ## Documentation Authority
@@ -188,6 +198,7 @@ Use these docs this way:
 | `ARCHITECTURE.md` | Architecture reference; may still contain historical diagrams/sections |
 | `worker/README.md` | Backend/worker reference; route claims require live verification where noted |
 | `self-host/README.md` | Preview standalone/mirror setup, sync safety, takeover, backups and recovery |
+| `self-host/RECOVERY.md` | Windows startup supervisor plus zero-local-backup unified-authority recovery runbook |
 | `MIGRATION_PLAN.md` | Historical migration record |
 | `PLAN_v3.1.md` | Historical v3.1 planning/release record |
 

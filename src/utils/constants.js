@@ -33,6 +33,7 @@ export const NAG_INTERVALS = [
 
 export const DEFAULT_SETTINGS = {
   tapAction: 'video',              // 'video' or 'channel'
+  autoOrderChannels: false,        // display channels newest-video-first without changing manual order
   notificationMode: 'chill',        // 'relentless' | 'chill'
   nagInterval: 15,                 // minutes between nag attempts (5, 15, 30, 60, 120)
   includeCommunityPosts: false,    // placeholder — not detectable via RSS/WebSub

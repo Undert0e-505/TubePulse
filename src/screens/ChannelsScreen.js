@@ -20,7 +20,7 @@ import {
   getChannels, saveChannels,
   getChannelCache, saveChannelCache,
   getLastSeen, saveLastSeen,
-  getSettings,
+  getSettings, saveSettings,
   getChannelNotifSettings, saveChannelNotifSettings,
   getChannelDisplaySettings, saveChannelDisplaySettings,
 } from '../utils/storage';
@@ -30,6 +30,7 @@ import { PREVIEW_PUSH_ENABLED } from '../utils/apiEndpointConfig';
 import TimeSpinner from '../components/TimeSpinner';
 import { confirm } from '../components/Confirm';
 import { updateWidget } from '../components/widgetTaskHandler';
+import { orderChannels } from '../utils/channelOrdering.mjs';
 
 // Default per-channel settings (mirrors global defaults)
 const DEFAULT_CHANNEL_NOTIF = {
@@ -58,6 +59,8 @@ export default function ChannelsScreen() {
   const [editingChannel, setEditingChannel] = useState(null); // handle of channel being edited
   const [editingNotif, setEditingNotif] = useState(DEFAULT_CHANNEL_NOTIF);
   const [channelDisplaySettings, setChannelDisplaySettings] = useState({});
+  const [appSettings, setAppSettings] = useState(null);
+  const autoOrderChannels = appSettings?.autoOrderChannels === true;
 
   useFocusEffect(
     useCallback(() => {
@@ -66,12 +69,21 @@ export default function ChannelsScreen() {
           setChannels(chs);
           setCache(ca);
           setPerChannelEnabled(settings.perChannelNotifications || false);
+          setAppSettings(settings);
           setChannelNotifSettings(notifSettings);
           setChannelDisplaySettings(displaySettings);
         }
       );
     }, [])
   );
+
+  const setAutoOrder = async (enabled) => {
+    const current = appSettings || await getSettings();
+    const updated = { ...current, autoOrderChannels: enabled };
+    setAppSettings(updated);
+    await saveSettings(updated);
+    try { await updateWidget('channel-order-setting'); } catch {}
+  };
 
   const openChannelNotifSettings = (handle) => {
     const existing = channelNotifSettings[handle] || DEFAULT_CHANNEL_NOTIF;
@@ -354,10 +366,13 @@ export default function ChannelsScreen() {
   };
 
   const onDragEnd = async ({ data }) => {
+    if (autoOrderChannels) return;
     setChannels(data);
     await saveChannels(data);
     // Channel order is a local preference — no server sync needed
   };
+
+  const displayedChannels = orderChannels(channels, cache, autoOrderChannels);
 
   const renderItem = ({ item, drag, isActive }) => {
     const cached = cache[item.handle];
@@ -377,14 +392,16 @@ export default function ChannelsScreen() {
           style={[styles.channelRow, isActive && styles.channelRowActive]}
           activeOpacity={1}
         >
-          {/* Drag handle — always triggers drag on long press */}
+          {/* Manual ordering is preserved while automatic display ordering is active. */}
           <TouchableOpacity
-            onLongPress={drag}
+            onLongPress={autoOrderChannels ? undefined : drag}
             delayLongPress={150}
             style={styles.dragHandleWrap}
             activeOpacity={1}
+            disabled={autoOrderChannels}
+            accessibilityLabel={autoOrderChannels ? 'Channel order is automatic' : 'Drag to reorder channel'}
           >
-            <Text style={styles.dragHandle}>☰</Text>
+            <Text style={[styles.dragHandle, autoOrderChannels && styles.dragHandleDisabled]}>☰</Text>
           </TouchableOpacity>
 
           {/* Avatar */}
@@ -588,6 +605,20 @@ export default function ChannelsScreen() {
           </ScrollView>
         </View>
       </Modal>
+      <View style={styles.autoOrderRow}>
+        <View style={styles.autoOrderText}>
+          <Text style={styles.autoOrderTitle}>Auto-order channels</Text>
+          <Text style={styles.autoOrderHint}>Newest video first</Text>
+        </View>
+        <Switch
+          value={autoOrderChannels}
+          onValueChange={setAutoOrder}
+          trackColor={{ false: COLORS.border, true: COLORS.accent }}
+          thumbColor={autoOrderChannels ? COLORS.bg : COLORS.textDim}
+          accessibilityLabel="Auto-order channels"
+          accessibilityHint="Orders channels by newest cached video without changing your manual order"
+        />
+      </View>
       {/* Add row */}
       <View style={styles.addSection}>
         <View style={styles.addRow}>
@@ -617,7 +648,7 @@ export default function ChannelsScreen() {
       )}
 
       <DraggableFlatList
-        data={channels}
+        data={displayedChannels}
         keyExtractor={(item) => item.handle}
         renderItem={renderItem}
         onDragEnd={onDragEnd}
@@ -634,6 +665,30 @@ const styles = StyleSheet.create({
   addSection: {
     padding: 16,
     paddingBottom: 8,
+  },
+  autoOrderRow: {
+    alignItems: 'center',
+    borderBottomColor: COLORS.border,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    minHeight: 64,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+  },
+  autoOrderText: {
+    flex: 1,
+    paddingRight: 16,
+  },
+  autoOrderTitle: {
+    color: COLORS.text,
+    fontSize: 15,
+    fontWeight: '600',
+  },
+  autoOrderHint: {
+    color: COLORS.textDim,
+    fontSize: 12,
+    marginTop: 2,
   },
   addRow: {
     flexDirection: 'row',
@@ -688,8 +743,11 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   dragHandle: {
-    color: COLORS.textDim,
+    color: COLORS.accent,
     fontSize: 18,
+  },
+  dragHandleDisabled: {
+    color: COLORS.textDim,
     opacity: 0.5,
   },
   avatarWrap: {

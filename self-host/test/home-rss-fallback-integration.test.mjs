@@ -113,6 +113,46 @@ test('API fallback and recovered RSS share one watermark so the same upload cann
   assert.deepEqual(state.unwatched, ['newvideo001']);
 });
 
+test('video batch notification carries exact string content IDs and effective tap action', async () => {
+  const channelId = 'UC0000000000000000000000';
+  const kv = new MemoryKv({
+    [`channel:${channelId}:known:videos`]: JSON.stringify({
+      ids: ['oldvideo001'], highWatermarkAt: '2026-10-05T00:00:00.000Z',
+      highWatermarkIds: ['oldvideo001'], seededAt: '2026-10-05T00:00:00.000Z', updatedAt: '2026-10-05T00:00:00.000Z',
+    }),
+    [`channel:${channelId}:recent`]: JSON.stringify([upload('oldvideo001', '2026-10-05T00:00:00.000Z')]),
+    [`channel:${channelId}:subscribers`]: JSON.stringify(['device-one']),
+    'device:device-one:profile': JSON.stringify({ fcmToken: 'synthetic-token' }),
+    'device:device-one:settings': JSON.stringify({ mode: 'chill', tapAction: 'channel' }),
+    [`device:device-one:state:${channelId}`]: JSON.stringify({ unwatched: [], lastNagAt: null, nagCount: 0 }),
+  });
+  const notifications = [];
+  const env = {
+    TUBEPULSE_KV: kv,
+    TUBEPULSE_NOTIFICATION_MODE: 'shadow',
+    TUBEPULSE_NOTIFICATION_DEFERRED: true,
+    FIREBASE_SERVICE_ACCOUNT: '{"project_id":"test"}',
+    TUBEPULSE_SHADOW_NOTIFICATION_OBSERVER: async (intent) => notifications.push(intent),
+  };
+
+  await processChannelUploads(env, new Context(), channelId, {
+    channelName: 'Synthetic',
+    uploads: [
+      upload('newvideo002', '2026-10-05T02:00:00.000Z'),
+      upload('newvideo001', '2026-10-05T01:00:00.000Z'),
+      upload('oldvideo001', '2026-10-05T00:00:00.000Z'),
+    ],
+  }, { now: Date.parse('2026-10-05T02:01:00.000Z') });
+
+  assert.equal(notifications.length, 1);
+  const data = notifications[0].payload.data;
+  assert.equal(data.type, 'batch');
+  assert.equal(data.count, '2');
+  assert.equal(data.tapAction, 'channel');
+  assert.equal(typeof data.contentIds, 'string');
+  assert.deepEqual(JSON.parse(data.contentIds), ['newvideo002', 'newvideo001']);
+});
+
 test('new upload preserves complete channel metadata instead of rewriting lastVideoId', async () => {
   const channelId = 'UC0000000000000000000000';
   const knownKey = `channel:${channelId}:known:videos`;

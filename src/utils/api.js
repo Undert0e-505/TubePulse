@@ -194,7 +194,7 @@ export function getLocalTimezone() {
  */
 function toServerSettings(local) {
   if (!local) return local;
-  const { notificationMode, ...rest } = local;
+  const { notificationMode, autoOrderChannels: _localDisplayOrder, ...rest } = local;
   return {
     ...rest,
     mode: notificationMode ?? 'chill',

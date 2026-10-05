@@ -1706,6 +1706,7 @@ async function handleWebSubPush(request, env, ctx) {
               channelName: channelName || channelId,
               videoLink: entry.link,
               type: entry.type,
+              tapAction: String(effective.tapAction),
             },
             tag: `video-${entry.videoId}`,
           };
@@ -1718,6 +1719,8 @@ async function handleWebSubPush(request, env, ctx) {
               type: 'batch',
               count: String(notifyEntries.length),
               channelId,
+              contentIds: JSON.stringify(notifyEntries.map((entry) => entry.videoId)),
+              tapAction: String(effective.tapAction),
             },
             tag: 'tubepulse-batch',
           };

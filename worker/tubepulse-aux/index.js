@@ -123,6 +123,7 @@ async function runNag(env, ctx, now) {
       dndTimezone: settings?.dndTimezone || 'UTC',
       dndBypass: override?.dndBypass || false,
       muted: override?.muted || false,
+      tapAction: settings?.tapAction || 'video',
     };
 
     if (effective.muted) continue;
@@ -191,6 +192,7 @@ async function runNag(env, ctx, now) {
             videoId: itemId, channelId, channelName,
             videoLink: video?.link || `https://www.youtube.com/watch?v=${itemId}`,
             type: 'nag', notificationTag: `video-${itemId}`,
+            tapAction: String(effective.tapAction),
           },
           tag: `video-${itemId}`,
         };
@@ -207,7 +209,11 @@ async function runNag(env, ctx, now) {
       notifPayload = {
         title: `${channelName} - ${stillUnwatched.length} unread`,
         body,
-        data: { type: 'batch', count: String(stillUnwatched.length), channelId, channelName },
+        data: {
+          type: 'batch', count: String(stillUnwatched.length), channelId, channelName,
+          contentIds: JSON.stringify(stillUnwatched),
+          tapAction: String(effective.tapAction),
+        },
         tag: `tubepulse-nag-${channelId}`,
       };
     }
