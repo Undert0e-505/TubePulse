@@ -13,7 +13,7 @@ import {
   isDndActive, getCachedFcmAccessToken, sendFCMPush, cleanupDeadDevice,
   addToNagActive, removeFromNagActive,
   getCommunityPostSeenId, getCachedCommunityPostIds,
-  preserveCachedCommunityPostPublishedAt, shouldRefreshCachedCommunityPost,
+  preserveCachedCommunityPostPublishedAt, mergeCachedCommunityPostForPersistence,
   formatCommunityPostNotificationTitle,
   normalizeKnownCommunityPostIds, addKnownCommunityPostId,
   removeCachedPostIdsFromSubscriberState,
@@ -110,8 +110,9 @@ export async function pollSingleCommunityChannel(env, ctx, channelId, debugEnabl
       knownPostIds = addKnownCommunityPostId(knownPostIds, latestPostId);
       await putKVIfChanged(kv, key.channelKnownPosts(channelId), knownPostIds);
     }
-    if (shouldRefreshCachedCommunityPost(latestPost, prevRecent)) {
-      await putKVIfChanged(kv, key.channelRecentPosts(channelId), [latestPost], prevRecent);
+    const persistedPost = mergeCachedCommunityPostForPersistence(latestPost, prevRecent);
+    if (persistedPost !== prevRecent[0]) {
+      await putKVIfChanged(kv, key.channelRecentPosts(channelId), [persistedPost], prevRecent);
       const stalePostIds = new Set([...cachedPostIds].filter((id) => id !== latestPostId));
       const removed = await removeCachedPostIdsFromSubscriberState(env, channelId, stalePostIds);
       console.log(`[Posts] ${channelId}: unchanged ${latestPost.activityId}, compacted, removed=${removed}`);

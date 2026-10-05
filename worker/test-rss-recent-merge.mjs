@@ -104,10 +104,13 @@ function makeCached(upload, overrides = {}) {
   assert.deepEqual(merged, [cached]);
 }
 
-// RSS movement on older cached entries never refreshes their persisted metrics.
+// The app-visible top three may refresh metrics; entries outside the visible
+// set retain their persisted metrics even when an upstream count changes.
 {
   const latestUpload = makeUpload('latest');
   const olderUpload = makeUpload('older', { views: '9000', likes: '900', dislikes: '90' });
+  const thirdUpload = makeUpload('third', { views: '8000', likes: '800', dislikes: '80' });
+  const hiddenUpload = makeUpload('hidden', { views: '7000', likes: '700', dislikes: '70' });
   const latestCached = makeCached(latestUpload);
   const olderCached = makeCached(olderUpload, {
     views: '50',
@@ -116,12 +119,22 @@ function makeCached(upload, overrides = {}) {
     viewsLastCheckedHour: CURRENT_HOUR - 48,
     likesLastCheckedHour: CURRENT_HOUR - 48,
   });
+  const thirdCached = makeCached(thirdUpload, {
+    views: '40', likes: '4', dislikes: '1',
+    viewsLastCheckedHour: CURRENT_HOUR - 48, likesLastCheckedHour: CURRENT_HOUR - 48,
+  });
+  const hiddenCached = makeCached(hiddenUpload, {
+    views: '30', likes: '3', dislikes: '1',
+    viewsLastCheckedHour: CURRENT_HOUR - 48, likesLastCheckedHour: CURRENT_HOUR - 48,
+  });
   const merged = mergeRssUploadsIntoRecentVideos(
-    [latestCached, olderCached],
-    [latestUpload, olderUpload],
+    [latestCached, olderCached, thirdCached, hiddenCached],
+    [latestUpload, olderUpload, thirdUpload, hiddenUpload],
     NOW_MS,
   );
-  assert.deepEqual(merged[1], olderCached);
+  assert.equal(merged[1].views, '9000');
+  assert.equal(merged[2].views, '8000');
+  assert.deepEqual(merged[3], hiddenCached);
 }
 
 // A newly observed entry seeds every RSS metric and both persistence clocks.
@@ -148,6 +161,37 @@ function makeCached(upload, overrides = {}) {
   assert.equal(seeded.likes, null);
   assert.equal(seeded.dislikes, null);
   assert.equal(seeded.likesLastCheckedHour, CURRENT_HOUR);
+}
+
+// Data API discovery writes structure first and enriches statistics in the
+// same cycle. A known value must hydrate a cached null once without waiting
+// until the next UTC hour.
+{
+  const discovered = makeUpload('same-hour-hydration', {
+    views: null,
+    likes: null,
+    dislikes: null,
+    comments: null,
+  });
+  const [cached] = mergeRssUploadsIntoRecentVideos([], [discovered], NOW_MS);
+  const enriched = makeUpload('same-hour-hydration', {
+    views: '42',
+    likes: '7',
+    dislikes: null,
+    comments: '3',
+  });
+  const [hydrated] = mergeRssUploadsIntoRecentVideos([cached], [enriched], NOW_MS);
+  assert.equal(hydrated.views, '42');
+  assert.equal(hydrated.likes, '7');
+  assert.equal(hydrated.dislikes, null);
+  assert.equal(hydrated.comments, '3');
+  assert.equal(hydrated.viewsLastCheckedHour, CURRENT_HOUR);
+  assert.equal(hydrated.likesLastCheckedHour, CURRENT_HOUR);
+  assert.equal(hydrated.commentsLastCheckedHour, CURRENT_HOUR);
+  assert.deepEqual(
+    mergeRssUploadsIntoRecentVideos([hydrated], [enriched], NOW_MS),
+    [hydrated],
+  );
 }
 
 // A legacy API bootstrap zero without a metric clock is ambiguous. Its first

@@ -30,13 +30,13 @@ export default {
 };
 
 export async function pollSingleRssChannel(env, ctx, channelId, options = {}) {
-  const kv = env.TUBEPULSE_KV;
-  const now = Date.now();
-  const nowIso = new Date(now).toISOString();
-
-  const feed = await fetchChannelRSS(channelId);
+  const feed = await fetchChannelRSS(channelId, {
+    throwOnError: options.failOnFetchError,
+    fetchImpl: options.fetchImpl,
+    timeoutMs: options.timeoutMs,
+    quiet: options.quiet,
+  });
   if (!feed) {
-    if (options.failOnFetchError) throw new Error(`RSS fetch failed for ${channelId}`);
     return { outcome: 'fetch-failed' };
   }
   if (feed.entries.length === 0) return { outcome: 'empty-feed' };
@@ -52,6 +52,21 @@ export async function pollSingleRssChannel(env, ctx, channelId, options = {}) {
     likes: e.likes,
     dislikes: e.dislikes,
   }));
+
+  return await processChannelUploads(env, ctx, channelId, {
+    channelName: feed.channelName,
+    uploads,
+  }, options);
+}
+
+export async function processChannelUploads(env, ctx, channelId, source, options = {}) {
+  const kv = env.TUBEPULSE_KV;
+  const now = options.now ?? Date.now();
+  const nowIso = new Date(now).toISOString();
+  const uploads = Array.isArray(source?.uploads) ? source.uploads : [];
+  const channelName = source?.channelName || null;
+  const logPrefix = String(options.logPrefix || 'RSS').replace(/[^A-Za-z0-9 -]/g, '').slice(0, 32) || 'RSS';
+  if (uploads.length === 0) return { outcome: 'empty-feed' };
 
   // Read display cache and durable known/watermark state.
   const prevRecent = await getKV(kv, key.channelRecent(channelId)) || [];
@@ -70,14 +85,14 @@ export async function pollSingleRssChannel(env, ctx, channelId, options = {}) {
 
     const meta = await getKV(kv, key.channelMeta(channelId)) || {};
     let metaChanged = false;
-    if (!meta.name && feed.channelName) { meta.name = feed.channelName; metaChanged = true; }
+    if (!meta.name && channelName) { meta.name = channelName; metaChanged = true; }
     if (seededRecent.length > 0 && meta.lastVideoId !== seededRecent[0].videoId) {
       meta.lastVideoId = seededRecent[0].videoId;
       metaChanged = true;
     }
     if (metaChanged) await putKVIfChanged(kv, key.channelMeta(channelId), meta);
 
-    console.log(`[RSS] ${channelId}: first-run seed — ${seededKnown.ids.length} known IDs, highWatermarkAt=${seededKnown.highWatermarkAt}, subs=${subs.length}, no notifications`);
+    console.log(`[${logPrefix}] ${channelId}: first-run seed — ${seededKnown.ids.length} known IDs, highWatermarkAt=${seededKnown.highWatermarkAt}, subs=${subs.length}, no notifications`);
     return { outcome: 'seeded', entryCount: uploads.length };
   }
 
@@ -98,18 +113,17 @@ export async function pollSingleRssChannel(env, ctx, channelId, options = {}) {
   }
 
   if (suppressed.length > 0) {
-    console.log(`[RSS] ${channelId}: suppressed ${suppressed.length} videos (known or below watermark)`);
+    console.log(`[${logPrefix}] ${channelId}: suppressed ${suppressed.length} videos (known or below watermark)`);
   }
 
   if (newVideos.length === 0) return { outcome: 'unchanged', entryCount: uploads.length };
 
-  console.log(`[RSS] ${channelId}: ${newVideos.length} genuinely new videos above watermark`);
+  console.log(`[${logPrefix}] ${channelId}: ${newVideos.length} genuinely new videos above watermark`);
 
   // Update channel meta
   const meta = await getKV(kv, key.channelMeta(channelId)) || {};
   let metaChanged = false;
-  if (!meta.name && feed.channelName) { meta.name = feed.channelName; metaChanged = true; }
-  if (meta.lastVideoId !== newVideos[0].videoId) { meta.lastVideoId = newVideos[0].videoId; metaChanged = true; }
+  if (!meta.name && channelName) { meta.name = channelName; metaChanged = true; }
   if (metaChanged) await putKVIfChanged(kv, key.channelMeta(channelId), meta);
 
   // Get subscribers
@@ -121,7 +135,7 @@ export async function pollSingleRssChannel(env, ctx, channelId, options = {}) {
   try {
     accessToken = await getCachedFcmAccessToken(env);
   } catch (err) {
-    console.error(`[RSS] FCM token error:`, err.message);
+    console.error(`[${logPrefix}] FCM token error:`, err.message);
     return;
   }
   const sa = JSON.parse(env.FIREBASE_SERVICE_ACCOUNT);
@@ -247,7 +261,7 @@ export async function pollSingleRssChannel(env, ctx, channelId, options = {}) {
   }
 
   for (const deviceId of [...new Set(deadDevices)]) {
-    console.log(`[RSS] Pruning dead device: ${deviceId}`);
+    console.log(`[${logPrefix}] Pruning dead device: ${deviceId}`);
     ctx.waitUntil(cleanupDeadDevice(deviceId, env, 'fcm_unregistered'));
   }
   return { outcome: 'new-content', entryCount: uploads.length, newVideoCount: newVideos.length };

@@ -24,6 +24,7 @@
     "test:channel-bootstrap": "node --test test/channel-bootstrap.test.mjs",
     "test:app-initialization": "node --test test/app-initialization.test.mjs",
     "test:video-metrics": "node --test test/video-metrics.test.mjs",
+    "test:seen-persistence": "node --test test/seen-persistence.test.mjs",
     "check:self-host": "npm --prefix self-host run check",
     "build:android:selfhost": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/Build-SelfHostApk.ps1"
   },

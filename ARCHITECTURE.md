@@ -1,8 +1,8 @@
 # TubePulse — Architecture Specification
 
 **Version:** Current architecture reference for the v3.x app line. See [STATUS.md](STATUS.md) for current checked-in version and operational caveats.
-**Date:** 2026-04-19 (initial), updated through the unified Home production cutover on 2026-10-04
-**Status:** Architecture reference. Some historical diagrams/sections remain; [STATUS.md](STATUS.md) is authoritative for current version, release path, and verified deployment caveats.
+**Date:** 2026-04-19 (initial), updated through the Home Data API production cutover on 2026-10-05
+**Status:** Architecture reference. Sections before §15 retain historical RSS/WebSub design context; §15.6 and [STATUS.md](STATUS.md) describe the current production video path.
 
 ---
 
@@ -50,7 +50,7 @@ Beyond this scale, paid tier ($5/mo) is acceptable. The architecture should not 
 - iOS support (different push infrastructure)
 - Multi-region failover (Cloudflare handles this)
 - Real-time chat or comments
-- Polling YouTube Data API for new videos (doesn't scale, costs quota)
+- Per-device or one-request-per-channel Data API polling; production instead uses fleet-wide batching and structural uploads playlists
 - Detecting deleted videos (don't care about stale entries)
 
 ---
@@ -120,7 +120,8 @@ The architectural difference is roughly 100x at this scale, and it widens as you
 | Component | Role | Triggered by |
 |-----------|------|--------------|
 | `tubepulse-api` | Current live app-facing REST API + WebSub callback (dormant) | HTTP requests; `workers.dev` route verified reachable on 2026-06-25 |
-| 	ubepulse-cron | Four scheduled jobs (see §6) — YouTube Data API polling is the active detection path | Cron schedules |
+| Unified Home authority | Production app mutation/feed authority plus Data API video, InnerTube post, and aux scheduling | Local Docker timer + signed VPC ingress |
+| Retained scheduled Workers | Triggerless RSS/posts/aux rollback and historical code | No active Cron Triggers |
 
 Live route note: `GET /` at `https://tubepulse-api.jimothyoakley55.workers.dev` returned `200 OK` from Cloudflare on 2026-06-25 with health JSON identifying `worker: "tubepulse-api"`, `architecture: "channel-first"`, and `version: "3.0.0"`. That health version is not the app release version (`3.2.4` in the repo).
 | Cloudflare KV | Single namespace, all persistent state | Workers |
@@ -132,20 +133,20 @@ Live route note: `GET /` at `https://tubepulse-api.jimothyoakley55.workers.dev` 
 - No database (KV only — see §5.1 for why)
 - No queue (KV operations are fast enough)
 - No separate cache layer (KV is already edge-cached)
-- No separate always-on cloud server — **three scheduled Cloudflare Workers poll YouTube RSS**, one selected channel per active shard per tick
+- No public Home ingress — the local authority is reached only through the Cloudflare Worker/VPC path
 
-### 4.3 Active detection path (updated 2026-09-21)
+### 4.3 Historical RSS detection path (superseded 2026-10-05)
 
 Google's `pubsubhubbub.appspot.com` hub was **shut down in 2024**. The WebSub handler remains in both workers for:
 - Manual testing
 - Compatibility with any future YouTube-compatible hub
 - As a clean integration point for self-hosted hubs
 
-The **active video detection path** is three rotating **YouTube RSS feed** shard Workers running every five minutes. Each active shard selects one channel from `channels:active` using a five-minute epoch tick, fetches `https://www.youtube.com/feeds/videos.xml?channel_id=...`, and reconciles it against the recent cache plus the durable known-video watermark. New videos are treated identically to WebSub pushes from the API worker's perspective.
+This was the active video detection path before the Data API cutover. Three rotating **YouTube RSS feed** shard Workers ran on five-minute Cron Triggers, selected channels from `channels:active`, fetched the public Atom feed, and reconciled it against the recent cache plus durable known-video watermark. Their triggers are now disabled; the code is retained only for explicit rollback/history.
 
-**Cost:** zero YouTube Data API units. RSS is a free, public feed. The only outbound calls are to YouTube's RSS server and to Cloudflare KV.
+**Historical cost:** zero YouTube Data API units. The operational failure history and replacement are recorded in `STATUS.md`.
 
-**The YouTube Data API is used only at subscribe time** by the API worker for handle→channelId resolve (1 unit, cached 7 days) and avatar fetch (1 unit per new channel, cached forever in `channel:{id}:meta`). After subscribe, the channel meta is cached in KV and the cron never touches the Data API again.
+Current production uses the YouTube Data API for video discovery, uploads reconciliation, metadata, and metrics as well as subscribe/bootstrap work. There is no automatic RSS fallback.
 
 ---
 
@@ -315,13 +316,13 @@ Reads the `upcoming:` bucket key for the current 5-minute window. For each entry
 
 Cost per tick: 1 read minimum, 2 reads + 2 writes per event firing. Most ticks have nothing in the bucket.
 
-### 6.2 RSS shard crons — every five minutes  ⚠️ ACTIVE DETECTION PATH
+### 6.2 RSS shard crons — historical rollback path
 
 ```
 */5 * * * *
 ```
 
-This is the **primary** new-video detection path (since WebSub hub shutdown in 2024, and the YouTube Data API quota approach was abandoned in v3.0.18 because RSS provides the same data at zero quota cost).
+This section documents the pre-cutover RSS implementation. Its Cron Triggers are disabled and it is not an automatic fallback.
 
 1. Read `channels:active` index from KV and derive the active shard count
 2. In each active shard, select one channelId from the sorted shard slice for the current five-minute epoch tick:
@@ -333,16 +334,16 @@ This is the **primary** new-video detection path (since WebSub hub shutdown in 2
 
 The shards therefore process up to three channels per five-minute tick. For `N` active channels, the selector activates `S = min(3, max(1, ceil(N / 5)))` shards and assigns the stable sorted list round-robin, so each shard contains either `floor(N / S)` or `ceil(N / S)` channels. A shard's full rotation is `5 minutes × its channel count`; expected detection is approximately half a rotation. `channels:active` is the source of truth for the current count, so time-stamped operational status should be used instead of embedding a changing production count here. Rotation coverage is tested for every active-channel count from 1 through 100.
 
-**Quota cost:** 0 YouTube Data API units. The only network calls are to YouTube's public RSS feed (free, no auth) and to KV (free tier).
+**Historical quota cost:** 0 YouTube Data API units.
 
 **KV cost:** 1 read per channel per tick (`channel:{id}:recent`). Writes only when a view count changes or a new video is detected. At 50 channels: ~50-100 writes/day, well under the 1,000/day free tier.
 
-**Why RSS, not the YouTube Data API:**
+**Historical rationale for RSS:**
 - RSS includes the data we need: videoId, title, publishedAt, thumbnail, link, AND view counts (from `media:statistics/@_views`)
 - Zero YouTube Data API quota cost
 - Less brittle than depending on the API staying within quota
 - The same detection contract (new video → fan out to subscribers → FCM push) works identically
-- The YouTube Data API is reserved for one-time, on-subscribe operations: handle→channelId resolve + avatar fetch (1-2 units per new channel)
+- This rationale was superseded when production adopted batched `channels.list`, uploads-playlist reconciliation, and separate batched statistics.
 
 ### 6.3 Nag cron — every 15 minutes
 
@@ -635,7 +636,7 @@ Workers update this key in batches (e.g. flushed every 5 minutes from worker mem
 - Code style or language choices within Workers
 - Specific FCM payload structure (implementation detail)
 - App UI layout or navigation (separate concern)
-- YouTube Data API quota management (only used in /resolve, low volume)
+- YouTube Data API implementation details beyond the persisted detector/statistics budgets documented in §15.6
 - Logging format (be consistent, but use whatever)
 
 These can vary with implementation and will appear in the codebase as they're built.
@@ -759,7 +760,9 @@ The temporary local-package `google-services.json` exists only to satisfy the Gr
 
 ### 15.6 Unified Home production authority
 
-The scheduled-worker replacement is a separate process from both the app gateway origin and the standalone Preview pilot. In shadow it refreshes isolated `data-scheduler` from canonical Cloudflare state, then invokes the existing RSS poller once for every sorted unique active channel with bounded concurrency. It reuses the existing post poller for an all-eligible-channel hourly sweep and the existing aux routine each minute. The Cloudflare three-shard split is deliberately absent because Home is not constrained by the per-invocation Worker CPU budget. The public API and its canonical KV schema do not change. Configurable post cadence carries an explicit daily-quota projection and guard; the production candidate defaults to 60 minutes, while five-minute posts require a separate quota flag/latch and sufficient live calculated budget plus reserve.
+The scheduled-worker replacement is a separate process from both the app gateway origin and the standalone Preview pilot. Video discovery is Data API-only in active mode: every aligned five-minute cycle batches sorted unique active IDs into `channels.list` groups of at most 50, compares persisted public `videoCount`, and reconciles only changed/missing-baseline uploads playlists. The current fleet fits in two detector requests, costing 576 general units/day. A bounded six-hour first-page safety pass adds at most `active channels × 4` general units/day and catches count-neutral replacement and propagation lag. Playlist/video/statistics results enter the existing canonical KV schema and notification path; there is no parallel notifier and no `search.list` dependency. The scheduler reuses the existing post poller for an all-eligible-channel hourly sweep and the existing aux routine each minute. Configurable post cadence carries an explicit daily-quota projection and guard.
+
+Only each channel's dynamic app-visible top three videos are eligible for statistics polling. Their adaptive cadence remains intact; when a visible item becomes deleted/private, the promoted cached item is immediately due because non-visible poll clocks are pruned. The durable known-video watermark is independent of this optimization, so promotion cannot replay a notification. Community-post structural changes persist immediately, while `fetchedAt`, relative-age labels, rotating delivery signatures, and sub-threshold engagement movement remain no-ops. Missing metrics hydrate once, a strictly greater-than-25% change can persist once per UTC hour, and every metric is forced fresh after 24 hours. The active upload path does not rewrite channel metadata merely to advance compatibility field `lastVideoId`.
 
 Three fail-closed modes exist: shadow measures local mutations and notification decisions with no remote writes or FCM network request; standby does no scheduled work; active requires an independent write flag, notification flag, live-trigger-disable confirmation, Firebase credential, and exact activation latch. A persisted exclusive lease, heartbeat, overlap guard, in-progress channel list, timeout, and retry/backoff make a single runner restartable without knowingly duplicating a completed channel. Shadow publication compares final local state with canonical state and classifies predicted writes by key family/reason, including a distinct metrics-only category.
 
@@ -767,11 +770,13 @@ Moving compute does not eliminate canonical writes. An earlier 2026-10-04 exerci
 
 The implemented successor is one local authority/runtime/store. Signed Cloudflare-first mutations for every authenticated device and scheduled polling share one global Durable Object lease followed by one local lease, so lock order is deterministic. Home polls local KV and publishes an exact changed-key journal. The SQLite-backed coordinator stores conditional baselines and resumable transactions; genuine divergence marks the authority stale. Authenticated `GET /feed` is routed for all devices over the private VPC binding to that same store only while current, with bounded canonical-KV fallback. This strong Home read path—not a fixed propagation sleep—is the notification visibility barrier.
 
-Cloudflare backup publication has two explicit budgets: 650 scheduler writes/day and 950 total coordinated writes/day, reserving 300 for app mutations under the platform's 1,000-write ceiling. At the scheduler cap, the coordinator durably coalesces the latest change per key and retries on later ticks after the UTC reset. An API mutation first flushes any overlapping deferred keys from its reserve before the legacy Cloudflare handler runs, preventing stale-base overwrites such as `/seen` racing a new video. Home polling/feed service continues, but FCM for a batch whose canonical backup is deferred is suppressed: a subsequent VPC outage must not recreate push-with-missing-content on the Cloudflare fallback. WebSub pushes are acknowledged without writes/FCM while Home traffic ownership is active, and verification handshakes persist no lease state.
+Cloudflare backup publication has two explicit budgets: 900 scheduler writes/day and 950 total coordinated writes/day, reserving 50 for app mutations under the platform's 1,000-write ceiling. At the scheduler cap, the coordinator durably coalesces the latest change per key and retries on later ticks after the UTC reset. An API mutation first flushes any overlapping deferred keys from its reserve before the legacy Cloudflare handler runs, preventing stale-base overwrites such as `/seen` racing a new video. Home polling/feed service continues, but FCM for a batch whose canonical backup is deferred is suppressed: a subsequent VPC outage must not recreate push-with-missing-content on the Cloudflare fallback. WebSub pushes are acknowledged without writes/FCM while Home traffic ownership is active, and verification handshakes persist no lease state.
 
-Configuration and traffic activation are separate latches. Production cut over on 2026-10-04 after disabling/draining all five scheduled Workers and importing an exact signed 721-record snapshot through the Worker KV binding. The first active sweep covered all 85 channels in 3.4 seconds with no failures, applied only changed keys, and sent its one natural notification after the public Home-backed feed visibility barrier passed. All known profiles then returned Home-routed feeds through the unchanged API URL. Rollback still stops/drains Home before restoring the saved `*/5` RSS and one-minute posts/aux triggers. An old mirror plus public feeds is never accepted as a replacement for a full canonical snapshot.
+Configuration and traffic activation are separate latches. Production cut over on 2026-10-04 after disabling/draining all scheduled Workers and importing an exact signed 721-record snapshot through the Worker KV binding. The first active sweep covered the complete fleet with no failures, applied only changed keys, and sent its natural notification after the public Home-backed feed visibility barrier passed. All known profiles then returned Home-routed feeds through the unchanged API URL. Rollback still stops/drains Home before restoring the saved RSS and posts/aux triggers. An old mirror plus public feeds is never accepted as a replacement for a full canonical snapshot.
 
-Community-post cache comparisons discard only rotating YouTube thumbnail delivery parameters when the stable image origin/path is unchanged, and they ignore relative-age label churn only when the cached post has the same valid `publishedAt`. This reduces false hourly writes without masking a new image, text, metric, or an authoritative relative label for a post whose absolute timestamp is unavailable.
+Community-post cache comparisons discard rotating YouTube thumbnail delivery parameters when the stable image origin/path is unchanged, and ignore relative-age label churn when the cached post has the same valid `publishedAt`. Structural post changes remain immediate. Engagement observations hydrate missing values, persist a strictly greater-than-25% numeric change at most once per UTC hour, and force a refresh after 24 hours, using `fetchedAt` as the persisted observation clock.
+
+The final subscriber leaving removes the channel from `channels:active`, which stops video and post polling. Display/subscriber caches are cleaned through the coordinated backup journal, while `channel:{id}:known:videos` remains durable so a later resubscribe cannot replay historical uploads.
 
 ---
 

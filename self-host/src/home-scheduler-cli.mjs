@@ -60,6 +60,9 @@ async function main() {
 
   if (command === 'once') {
     try {
+      if (config.mode === 'active') {
+        throw new Error('once is disabled in active mode because a fleet-wide manual sweep would defeat RSS anti-burst protection');
+      }
       const match = option === undefined ? null : /^--sweeps=(\d+)$/.exec(option);
       if (option !== undefined && !match) throw new Error('once accepts only --sweeps=<positive integer>');
       const sweepCount = match ? Number(match[1]) : 1;

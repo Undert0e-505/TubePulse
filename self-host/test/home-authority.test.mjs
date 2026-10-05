@@ -146,6 +146,45 @@ test('route, signature, expiry, replay, body and identity protections fail close
   assert.equal(response.status, 401);
 });
 
+test('signed mutation ingress allows only canonical app mutation routes', async (t) => {
+  const fx = await fixture(t);
+  let calls = 0;
+  const ingress = new HomeAuthorityIngress({
+    secret: SECRET,
+    gate: fx.gate,
+    mutationHandler: async () => { calls++; return { response: { status: 200, headers: {}, body: '{}' }, deltas: [] }; },
+  });
+  const response = await ingress.handle(signedRequest('/_tubepulse/authority/mutation', 'authority-mutation', {
+    leaseId: 'api-forbidden-route-0001',
+    method: 'POST',
+    path: '/websub?unexpected=true',
+    body: '{}',
+    headers: { 'content-type': 'application/json' },
+  }));
+  assert.equal(response.status, 404);
+  assert.equal(calls, 0);
+  assert.equal((await fx.gate.status()).lease, null);
+});
+
+test('Home mutation execution failure releases its local lease without applying state', async (t) => {
+  const fx = await fixture(t, { alpha: 'one' });
+  const ingress = new HomeAuthorityIngress({
+    secret: SECRET,
+    gate: fx.gate,
+    mutationHandler: async () => { throw new Error('synthetic-handler-failure'); },
+  });
+  const response = await ingress.handle(signedRequest('/_tubepulse/authority/mutation', 'authority-mutation', {
+    leaseId: 'api-handler-failure-0001',
+    method: 'POST',
+    path: '/seen',
+    body: JSON.stringify({ channelId: 'UCtest', clearAll: true }),
+    headers: { 'content-type': 'application/json' },
+  }));
+  assert.equal(response.status, 500);
+  assert.equal(fx.adapter.values.get('alpha'), 'one');
+  assert.equal((await fx.gate.status()).lease, null);
+});
+
 test('baseline divergence applies no local deltas and marks Home stale', async (t) => {
   const fx = await fixture(t, { alpha: 'one', beta: 'one' });
   const leaseId = 'api-divergence-lease-01';

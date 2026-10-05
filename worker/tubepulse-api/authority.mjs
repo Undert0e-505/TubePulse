@@ -200,7 +200,7 @@ export class TubePulseAuthorityCoordinator {
     const total = boundedInteger(this.env.TUBEPULSE_AUTHORITY_KV_WRITE_HARD_CAP, 950, 100, 999);
     const publication = boundedInteger(
       this.env.TUBEPULSE_AUTHORITY_KV_PUBLICATION_CAP,
-      650,
+      900,
       0,
       total,
     );
@@ -271,7 +271,7 @@ export class TubePulseAuthorityCoordinator {
     const leaseId = String(payload.leaseId || '');
     const kind = String(payload.kind || '');
     const ttlMs = Math.max(5_000, Math.min(120_000, Number(payload.ttlMs || 30_000)));
-    if (!/^[a-zA-Z0-9_-]{16,128}$/.test(leaseId) || !['api', 'publication', 'reconcile'].includes(kind)) {
+    if (!/^[a-zA-Z0-9_-]{16,128}$/.test(leaseId) || !['api', 'home-api', 'publication', 'reconcile'].includes(kind)) {
       return json({ error: 'Invalid authority lease request' }, 400);
     }
     const existingLease = await this.currentLease();
@@ -279,12 +279,10 @@ export class TubePulseAuthorityCoordinator {
       if (kind !== 'api' || existingLease.kind !== 'reconcile') {
         return json({ error: 'Authority lease busy' }, 409);
       }
-      // An app mutation must remain canonical even if it arrives while Home
-      // is installing a leased snapshot. Invalidate that snapshot before the
-      // mutation is admitted; Home's later /activate then fails closed and a
-      // fresh snapshot must include the mutation. The snapshot itself runs in
-      // a DO concurrency barrier, so its KV read/baseline phase cannot overlap
-      // this transition.
+      // The legacy Cloudflare-first API lease may invalidate an in-flight
+      // snapshot because it can commit independently of Home. Home-primary
+      // mutations instead wait for reconciliation to finish; they must not
+      // run against the store while its snapshot is being replaced.
       await this.state.storage.delete(LEASE_KEY);
       await this.setReplicationState('stale', 'reconciliation-overlapped');
     }
@@ -475,14 +473,14 @@ export class TubePulseAuthorityCoordinator {
   async commit(payload) {
     const lease = await this.currentLease();
     const leaseId = String(payload.leaseId || '');
-    if (!lease || lease.leaseId !== leaseId || !['api', 'publication'].includes(lease.kind)) {
+    if (!lease || lease.leaseId !== leaseId || !['api', 'home-api', 'publication'].includes(lease.kind)) {
       return json({ error: 'Invalid authority lease' }, 409);
     }
     const deltas = Array.isArray(payload.deltas) ? payload.deltas.map(validateDelta) : null;
     if (!deltas || deltas.length > MAX_DELTA_COUNT) return json({ error: 'Invalid authority delta batch' }, 400);
     const replication = await this.replicationState();
     if (replication.seeded !== true) return json({ error: 'Authority baseline is not seeded' }, 409);
-    if (lease.kind === 'publication' && replication.status !== 'current') {
+    if (['home-api', 'publication'].includes(lease.kind) && replication.status !== 'current') {
       return json({ error: 'Home authority is stale' }, 409);
     }
     if (await this.state.storage.get(TX_KEY)) return json({ error: 'Authority recovery is pending' }, 409);
@@ -491,7 +489,7 @@ export class TubePulseAuthorityCoordinator {
 
     let appliedDeltas = deltas;
     let pendingStorageKeys = [];
-    if (lease.kind === 'publication') {
+    if (['home-api', 'publication'].includes(lease.kind)) {
       const before = await this.allPending();
       const pending = new Map(before.map((entry) => [entry.delta.key, entry]));
       try {
@@ -521,6 +519,24 @@ export class TubePulseAuthorityCoordinator {
           await this.state.storage.delete(LEASE_KEY);
           return json({ error: 'Canonical backup baseline diverged', state: 'stale' }, 409);
         }
+      }
+
+      if (lease.kind === 'home-api') {
+        const retained = new Set([...pending.values()].map(({ storageKey }) => storageKey));
+        const removed = before.map(({ storageKey }) => storageKey).filter((key) => !retained.has(key));
+        if (removed.length) await this.state.storage.delete(removed);
+        await this.storePending([...pending.values()]);
+        await this.state.storage.delete(LEASE_KEY);
+        replication.canonicalVersion = Number(replication.canonicalVersion || 0) + 1;
+        await this.state.storage.put(STATE_KEY, replication);
+        return json({
+          ok: true,
+          applied: 0,
+          incoming: deltas.length,
+          deferred: true,
+          reason: 'home-primary',
+          queued: appliedDeltas.length,
+        });
       }
 
       const quota = await this.quotaState();
@@ -776,12 +792,126 @@ const INTERNAL_AUTHORITY_ROUTES = new Map([
   ['POST /_tubepulse/authority/reconcile/activate', { operation: 'authority-reconcile-activate', coordinatorPath: '/activate' }],
   ['POST /_tubepulse/authority/reconcile/release', { operation: 'authority-reconcile-release', coordinatorPath: '/release' }],
   ['POST /_tubepulse/authority/stale', { operation: 'authority-stale', coordinatorPath: '/stale' }],
+  ['POST /_tubepulse/authority/rss-probe', { operation: 'authority-rss-probe', handler: 'rss-probe' }],
 ]);
 
-const HOP_BY_HOP_HEADERS = new Set([
-  'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
-  'te', 'trailer', 'transfer-encoding', 'upgrade',
-]);
+const YOUTUBE_CHANNEL_ID = /^UC[A-Za-z0-9_-]{22}$/;
+const RSS_PROBE_OFFICIAL_CHANNEL_ID = 'UC_x5XG1OV2P6uZZ5FSM9Ttw';
+const RSS_PROBE_MAX_BODY_BYTES = 2 * 1024;
+const RSS_PROBE_MAX_RESPONSE_BYTES = 512 * 1024;
+
+function rssProbeUrl(channelId) {
+  if (!YOUTUBE_CHANNEL_ID.test(channelId)) throw new Error('invalid-channel-id');
+  return `https://www.youtube.com/feeds/videos.xml?channel_id=${channelId}`;
+}
+
+async function readResponseTextLimited(response, maximumBytes) {
+  if (!response.body?.getReader) {
+    const body = await response.arrayBuffer();
+    if (body.byteLength > maximumBytes) throw new Error('response-too-large');
+    return new TextDecoder().decode(body);
+  }
+  const reader = response.body.getReader();
+  const chunks = [];
+  let length = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      length += value.byteLength;
+      if (length > maximumBytes) throw new Error('response-too-large');
+      chunks.push(value);
+    }
+  } catch (error) {
+    await reader.cancel().catch(() => {});
+    throw error;
+  }
+  const joined = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) { joined.set(chunk, offset); offset += chunk.byteLength; }
+  return new TextDecoder().decode(joined);
+}
+
+async function fetchRssProbe(fetchImpl, channelId, label, timeoutMs) {
+  const controller = new AbortController();
+  let timer;
+  const expired = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new DOMException('Probe timed out', 'AbortError'));
+    }, Math.min(5_000, Math.max(500, timeoutMs)));
+  });
+  try {
+    const response = await Promise.race([expired, fetchImpl(rssProbeUrl(channelId), {
+      signal: controller.signal,
+      // Stop at the fixed target. Never follow a Location or forward the
+      // signed endpoint's credentials to a subrequest.
+      redirect: 'manual',
+      headers: { Accept: 'application/atom+xml,application/xml,text/xml' },
+    })]);
+    if (response.status >= 300 && response.status < 400) {
+      await response.body?.cancel().catch(() => {});
+      return { label, status: response.status, validXml: false, classification: 'redirect' };
+    }
+    const contentLength = Number(response.headers.get('Content-Length'));
+    if (Number.isFinite(contentLength) && contentLength > RSS_PROBE_MAX_RESPONSE_BYTES) {
+      return { label, status: response.status, validXml: false, classification: 'response-too-large' };
+    }
+    if (!response.ok) {
+      return { label, status: response.status, validXml: false, classification: `http-${response.status}` };
+    }
+    let xml;
+    try { xml = await Promise.race([expired, readResponseTextLimited(response, RSS_PROBE_MAX_RESPONSE_BYTES)]); }
+    catch (error) {
+      if (error?.message === 'response-too-large') {
+        return { label, status: response.status, validXml: false, classification: 'response-too-large' };
+      }
+      throw error;
+    }
+    const returnedChannelId = xml.match(/<yt:channelId>([^<]+)<\/yt:channelId>/i)?.[1] || '';
+    const validXml = /<feed(?:\s|>)/i.test(xml) && /<\/feed>\s*$/i.test(xml) && returnedChannelId === channelId;
+    return {
+      label,
+      status: response.status,
+      validXml,
+      classification: validXml ? 'valid-feed' : 'invalid-xml',
+    };
+  } catch (error) {
+    return {
+      label,
+      status: null,
+      validXml: false,
+      classification: controller.signal.aborted || error?.name === 'AbortError' ? 'timeout' : 'network',
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function handleRssProbe(body, config, options) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)
+    || Object.keys(body).some((name) => name !== 'activeChannelId')) {
+    return json({ error: 'Invalid RSS probe request' }, 400);
+  }
+  const activeChannelId = body?.activeChannelId;
+  if (activeChannelId !== undefined && !YOUTUBE_CHANNEL_ID.test(String(activeChannelId))) {
+    return json({ error: 'Invalid RSS probe request' }, 400);
+  }
+  const requests = [{ channelId: RSS_PROBE_OFFICIAL_CHANNEL_ID, label: 'official' }];
+  if (activeChannelId && activeChannelId !== RSS_PROBE_OFFICIAL_CHANNEL_ID) {
+    requests.push({ channelId: activeChannelId, label: 'active' });
+  }
+  const fetchImpl = options.rssProbeFetch || globalThis.fetch;
+  const probes = await Promise.all(requests.map((request) => (
+    fetchRssProbe(fetchImpl, request.channelId, request.label, config.timeoutMs)
+  )));
+  const success = probes.some((probe) => probe.validXml);
+  // The signed Worker was reached successfully. Its bounded, fixed-target
+  // subrequest failures are independent-egress inability, including transport
+  // rejection; the Home scheduler separately requires two spaced rounds.
+  const outcome = success ? 'success' : 'failure';
+  return json({ ok: true, outcome, probes });
+}
 
 async function authorityHmacHex(secret, value) {
   const key = await crypto.subtle.importKey(
@@ -812,17 +942,6 @@ function constantTimeHexEqual(left, right) {
   let difference = 0;
   for (let index = 0; index < 64; index++) difference |= left.charCodeAt(index) ^ right.charCodeAt(index);
   return difference === 0;
-}
-
-function safeForwardHeaders(source) {
-  const headers = new Headers();
-  for (const [name, value] of source) {
-    const lower = name.toLowerCase();
-    if (lower === 'host' || lower === 'content-length' || HOP_BY_HOP_HEADERS.has(lower)) continue;
-    if (lower.startsWith('x-tubepulse-authority-')) continue;
-    headers.append(name, value);
-  }
-  return headers;
 }
 
 function readAuthorityConfig(env) {
@@ -955,20 +1074,6 @@ async function verifyAuthorityRequest(config, request, bodyText, expectedOperati
   return true;
 }
 
-class CapturingExecutionContext {
-  constructor(base) { this.base = base; this.promises = []; }
-  waitUntil(promise) { this.promises.push(Promise.resolve(promise)); }
-  passThroughOnException() { this.base?.passThroughOnException?.(); }
-  async flush() {
-    const results = await Promise.allSettled(this.promises);
-    const failures = results.filter((result) => result.status === 'rejected');
-    if (failures.length) throw new AggregateError(
-      failures.map((result) => result.reason),
-      'One or more canonical mutation continuations failed',
-    );
-  }
-}
-
 async function acquireCoordinatorLease(env, leaseId, kind, timeoutMs, options = {}) {
   const deadline = Date.now() + timeoutMs;
   do {
@@ -983,35 +1088,6 @@ async function acquireCoordinatorLease(env, leaseId, kind, timeoutMs, options = 
     await new Promise((resolve) => setTimeout(resolve, 50));
   } while (Date.now() < deadline);
   return { response: new Response(null, { status: 409 }), payload: { error: 'Authority lease busy' } };
-}
-
-function mutationPrerequisites(route, deviceId, body) {
-  const channelId = typeof body?.channelId === 'string' ? body.channelId : null;
-  const device = (suffix) => `device:${deviceId}:${suffix}`;
-  const channel = (suffix) => channelId ? `channel:${channelId}:${suffix}` : null;
-  const commonDevice = [device('profile'), device('channels'), device('settings')];
-  if (route === 'POST /register') return { flushAllPending: true, neededKeys: [] };
-  if (route === 'POST /settings') return { neededKeys: [device('settings')] };
-  if (route === 'POST /channel-override') {
-    return { neededKeys: channelId ? [device(`override:${channelId}`)] : [] };
-  }
-  if (route === 'POST /seen') {
-    return { neededKeys: channelId ? [device(`state:${channelId}`)] : [] };
-  }
-  if (['POST /subscribe-channel', 'POST /unsubscribe', 'POST /bootstrap'].includes(route)) {
-    return {
-      neededKeys: [
-        ...commonDevice,
-        channel('meta'), channel('recent'), channel('recent:posts'),
-        channel('known:videos'), channel('known:posts'), channel('firstPollAt:posts'),
-        channel('subscribers'), channel('websub'),
-        channelId ? device(`state:${channelId}`) : null,
-        channelId ? device(`override:${channelId}`) : null,
-        'channels:active',
-      ].filter(Boolean),
-    };
-  }
-  return { neededKeys: [] };
 }
 
 async function coordinatorReadVersion(env) {
@@ -1078,12 +1154,30 @@ export function createAuthorityWorker(appWorker, options = {}) {
 
       const internal = INTERNAL_AUTHORITY_ROUTES.get(route);
       if (internal) {
-        const bodyText = request.method === 'GET' ? '' : await request.text();
+        if (internal.handler === 'rss-probe') {
+          const declaredLength = Number(request.headers.get('Content-Length'));
+          if (Number.isFinite(declaredLength) && declaredLength > RSS_PROBE_MAX_BODY_BYTES) {
+            return json({ error: 'Request too large' }, 413);
+          }
+        }
+        let bodyText = '';
+        if (request.method !== 'GET') {
+          if (internal.handler === 'rss-probe') {
+            try { bodyText = await readResponseTextLimited(request, RSS_PROBE_MAX_BODY_BYTES); }
+            catch (error) {
+              if (error?.message === 'response-too-large') return json({ error: 'Request too large' }, 413);
+              throw error;
+            }
+          } else {
+            bodyText = await request.text();
+          }
+        }
         if (!(await verifyAuthorityRequest(config, request, bodyText, internal.operation, replay))) {
           return json({ error: 'Invalid authority authentication' }, 401);
         }
         let body;
         try { body = bodyText ? JSON.parse(bodyText) : undefined; } catch { return json({ error: 'Invalid authority request' }, 400); }
+        if (internal.handler === 'rss-probe') return await handleRssProbe(body, config, options);
         const result = await coordinatorRequest(env, internal.coordinatorPath, body, request.method);
         return new Response(result.response.body, {
           status: result.response.status,
@@ -1141,15 +1235,12 @@ export function createAuthorityWorker(appWorker, options = {}) {
       let bodyBuffer;
       try { bodyBuffer = await request.clone().arrayBuffer(); } catch { return json({ error: 'Invalid request body' }, 400); }
       if (bodyBuffer.byteLength > MAX_DELTA_BODY_BYTES) return json({ error: 'Request too large' }, 413);
-      let parsedBody = null;
-      try { parsedBody = JSON.parse(new TextDecoder().decode(bodyBuffer)); } catch { /* handler returns canonical 400 */ }
-      const deviceId = authorization.slice(7).trim();
-      const prerequisites = mutationPrerequisites(route, deviceId, parsedBody);
+      const bodyText = new TextDecoder().decode(bodyBuffer);
 
       const leaseId = crypto.randomUUID();
       let acquired;
       try {
-        acquired = await acquireCoordinatorLease(env, leaseId, 'api', config.timeoutMs, prerequisites);
+        acquired = await acquireCoordinatorLease(env, leaseId, 'home-api', config.timeoutMs);
       } catch {
         // The DO is the only global ordering primitive. Continuing a write
         // while it is unreachable could let Home publish over an unseen app
@@ -1158,95 +1249,61 @@ export function createAuthorityWorker(appWorker, options = {}) {
       }
       if (!acquired.response.ok) return json({ error: 'Canonical mutation coordinator unavailable' }, 503);
 
-      const preflightBody = { leaseId, method: request.method, path: `${url.pathname}${url.search}` };
-      let homeLease = false;
+      let home;
       try {
-        const preflight = await homeAuthorityRequest(config, env, {
-          pathname: '/_tubepulse/authority/preflight',
-          operation: 'authority-preflight',
-          body: preflightBody,
+        home = await homeAuthorityRequest(config, env, {
+          pathname: '/_tubepulse/authority/mutation',
+          operation: 'authority-mutation',
+          body: {
+            leaseId,
+            method: request.method,
+            path: `${url.pathname}${url.search}`,
+            body: bodyText,
+            headers: {
+              ...(request.headers.get('Content-Type') ? { 'content-type': request.headers.get('Content-Type') } : {}),
+              ...(request.headers.get('Accept') ? { accept: request.headers.get('Accept') } : {}),
+            },
+          },
           authorization,
         });
-        homeLease = preflight.response.ok && preflight.payload?.ok === true;
-      } catch { /* canonical mutation still proceeds */ }
-      if (!homeLease) {
-        try {
-          const stale = await coordinatorRequest(env, '/stale', { reason: 'home-preflight-unavailable' });
-          if (!stale.response.ok || stale.payload?.state !== 'stale') throw new Error('stale-marker-rejected');
-        } catch {
-          // Without a durable stale transition, Home could resume publication
-          // over this unseen mutation after a transient coordinator failure.
-          await coordinatorRequest(env, '/release', { leaseId }).catch(() => {});
-          return json({ error: 'Canonical mutation coordinator unavailable' }, 503);
-        }
-      }
-
-      const bufferedKv = new BufferedKvNamespace(env.TUBEPULSE_KV);
-      const capturedCtx = new CapturingExecutionContext(ctx);
-      let response;
-      try {
-        response = await appWorker.fetch(request, {
-          ...env,
-          TUBEPULSE_KV: bufferedKv,
-          TUBEPULSE_DISABLE_WEBSUB: 'true',
-        }, capturedCtx);
-        await capturedCtx.flush();
       } catch {
-        await coordinatorRequest(env, '/release', { leaseId });
-        if (homeLease) {
-          await homeAuthorityRequest(config, env, {
-            pathname: '/_tubepulse/authority/cancel', operation: 'authority-cancel', body: { leaseId }, authorization,
-          }).catch(() => {});
-        }
-        return json({ error: 'Internal server error' }, 500);
+        await coordinatorRequest(env, '/release', { leaseId }).catch(() => {});
+        return json({ error: 'Home authority unavailable' }, 503);
+      }
+      if (!home.response.ok || home.payload?.ok !== true || !home.payload?.response) {
+        await coordinatorRequest(env, '/release', { leaseId }).catch(() => {});
+        return json({ error: 'Home authority rejected the mutation' }, 503);
       }
 
-      // A semantic error is authoritative, but buffered side effects are not.
-      // In particular, never turn an app-visible 4xx/5xx into a hidden KV
-      // mutation merely because a handler wrote before constructing its error.
+      const responseStatus = Number(home.payload.response.status);
+      const responseHeaders = new Headers(home.payload.response.headers || {});
+      const response = new Response(String(home.payload.response.body || ''), {
+        status: Number.isInteger(responseStatus) && responseStatus >= 200 && responseStatus <= 599 ? responseStatus : 500,
+        headers: responseHeaders,
+      });
       if (response.status >= 400) {
         await coordinatorRequest(env, '/release', { leaseId }).catch(() => {});
-        if (homeLease) {
-          await homeAuthorityRequest(config, env, {
-            pathname: '/_tubepulse/authority/cancel', operation: 'authority-cancel', body: { leaseId }, authorization,
-          }).catch(() => {});
-        }
-        return response;
+        return withAuthorityRoute(response, 'home');
       }
 
-      const deltas = await bufferedKv.deltas();
-      const committed = deltas.length
-        ? await coordinatorRequest(env, '/commit', {
-          leaseId,
-          deltas,
-          observedKvReads: bufferedKv.stats().keyReads,
-        })
-        : await coordinatorRequest(env, '/release', { leaseId });
+      const deltas = Array.isArray(home.payload.deltas) ? home.payload.deltas : null;
+      if (!deltas) {
+        await coordinatorRequest(env, '/release', { leaseId }).catch(() => {});
+        return json({ error: 'Home authority returned an invalid mutation result' }, 503);
+      }
+      let committed;
+      try {
+        committed = deltas.length
+          ? await coordinatorRequest(env, '/commit', { leaseId, deltas })
+          : await coordinatorRequest(env, '/release', { leaseId });
+      } catch {
+        await coordinatorRequest(env, '/release', { leaseId }).catch(() => {});
+        return json({ error: 'Canonical mutation backup could not be queued' }, 503);
+      }
       if (!committed.response.ok) {
-        if (homeLease) {
-          await homeAuthorityRequest(config, env, {
-            pathname: '/_tubepulse/authority/cancel', operation: 'authority-cancel', body: { leaseId }, authorization,
-          }).catch(() => {});
-        }
         return json({ error: 'Canonical mutation could not be persisted' }, 503);
       }
-
-      if (homeLease) {
-        try {
-          const replicated = await homeAuthorityRequest(config, env, {
-            pathname: '/_tubepulse/authority/commit',
-            operation: 'authority-commit',
-            body: { leaseId, deltas },
-            authorization,
-          });
-          if (!replicated.response.ok || replicated.payload?.ok !== true) {
-            await coordinatorRequest(env, '/stale', { reason: 'home-commit-rejected' });
-          }
-        } catch {
-          await coordinatorRequest(env, '/stale', { reason: 'home-commit-unavailable' });
-        }
-      }
-      return response;
+      return withAuthorityRoute(response, 'home');
     },
   };
 }
@@ -1260,4 +1317,8 @@ export const authorityTestHelpers = {
   authorityTrafficEnabled,
   validateDelta,
   isAuthorityCanonicalKey,
+  RSS_PROBE_OFFICIAL_CHANNEL_ID,
+  RSS_PROBE_MAX_BODY_BYTES,
+  RSS_PROBE_MAX_RESPONSE_BYTES,
+  rssProbeUrl,
 };

@@ -203,6 +203,17 @@ function metricChangedBeyondThreshold(persistedValue, rssValue) {
 }
 
 function shouldPersistMetricGroup(lastCheckedHour, currentHour, metricPairs) {
+  // Structural discovery can seed a brand-new video with unknown metrics and
+  // then enrich it from the batched statistics endpoint seconds later. Allow
+  // that one-time null -> known hydration even though both operations happen
+  // in the same hour; subsequent known values remain subject to the normal
+  // hourly/threshold write throttle.
+  const hydratesMissingMetric = metricPairs.some(([persistedValue, incomingValue]) => (
+    (persistedValue === undefined || persistedValue === null)
+    && incomingValue !== undefined
+    && incomingValue !== null
+  ));
+  if (hydratesMissingMetric) return true;
   const normalizedLastCheckedHour = Number(lastCheckedHour);
   const missingLastCheckedHour = lastCheckedHour === undefined || lastCheckedHour === null
     || !Number.isFinite(normalizedLastCheckedHour);
@@ -237,7 +248,8 @@ function isAmbiguousLegacyZero(persistedValue, rssValue) {
 
 function copyPersistedMetricFields(target, cached) {
   for (const field of [
-    'views', 'likes', 'dislikes', 'viewsLastCheckedHour', 'likesLastCheckedHour',
+    'views', 'likes', 'comments', 'dislikes', 'viewsLastCheckedHour', 'likesLastCheckedHour',
+    'commentsLastCheckedHour',
   ]) {
     if (Object.prototype.hasOwnProperty.call(cached, field)) target[field] = cached[field];
   }
@@ -245,20 +257,21 @@ function copyPersistedMetricFields(target, cached) {
 
 /**
  * Merge the current RSS ordering/structure with persisted metrics.
- * Only the latest existing entry is eligible for a metric refresh; new entries
- * are seeded from RSS. `nowMs` is explicit so this helper remains deterministic.
+ * Only the three app-visible entries are eligible for a metric refresh; new
+ * entries are seeded from RSS. `nowMs` is explicit so this helper remains deterministic.
  */
 export function mergeRssUploadsIntoRecentVideos(cachedRecent, rssUploads, nowMs) {
   const currentHour = Math.floor(nowMs / 3600000);
   const cachedByVideoId = new Map((cachedRecent || []).map((video) => [video.videoId, video]));
 
   return (rssUploads || []).slice(0, 15).map((upload, index) => {
+    const hasCommentMetric = Object.prototype.hasOwnProperty.call(upload, 'comments');
     const merged = {
       videoId: upload.videoId,
       title: upload.title,
       publishedAt: upload.published,
       thumbnail: upload.thumbnail,
-      type: classifyVideo(upload, nowMs),
+      type: upload.type || classifyVideo(upload, nowMs),
       link: upload.link,
     };
     const cached = cachedByVideoId.get(upload.videoId);
@@ -271,11 +284,15 @@ export function mergeRssUploadsIntoRecentVideos(cachedRecent, rssUploads, nowMs)
         dislikes: currentMetricValue(upload.dislikes),
         viewsLastCheckedHour: currentHour,
         likesLastCheckedHour: currentHour,
+        ...(hasCommentMetric ? {
+          comments: currentMetricValue(upload.comments),
+          commentsLastCheckedHour: currentHour,
+        } : {}),
       };
     }
 
     copyPersistedMetricFields(merged, cached);
-    if (index !== 0) return merged;
+    if (index >= 3) return merged;
 
     if (shouldPersistMetricGroup(cached.viewsLastCheckedHour, currentHour, [
       [cached.views, upload.views],
@@ -308,16 +325,42 @@ export function mergeRssUploadsIntoRecentVideos(cachedRecent, rssUploads, nowMs)
       merged.likesLastCheckedHour = currentHour;
     }
 
+    if ((hasCommentMetric || Object.prototype.hasOwnProperty.call(cached, 'comments'))
+      && shouldPersistMetricGroup(cached.commentsLastCheckedHour, currentHour, [
+      [cached.comments, upload.comments],
+      ])) {
+      merged.comments = currentMetricValue(upload.comments, cached.comments);
+      merged.commentsLastCheckedHour = currentHour;
+    }
+
     return merged;
   });
 }
 
-export async function fetchChannelRSS(channelId) {
+export class RssFetchError extends Error {
+  constructor(message, { category = 'rss-fetch-failed', status = null, retryable = false } = {}) {
+    super(message);
+    this.name = 'RssFetchError';
+    this.category = category;
+    this.status = status;
+    this.retryable = retryable;
+  }
+}
+
+function validYoutubeFeedXml(xmlText) {
+  return typeof xmlText === 'string'
+    && /<feed(?:\s|>)/i.test(xmlText)
+    && /<yt:channelId>[^<]+<\/yt:channelId>/i.test(xmlText);
+}
+
+export async function fetchChannelRSS(channelId, options = {}) {
   const feedUrl = `https://www.youtube.com/feeds/videos.xml?channel_id=${channelId}`;
+  const fetchImpl = options.fetchImpl || globalThis.fetch;
+  const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : 15000;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 15000);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const resp = await fetch(feedUrl, {
+    const resp = await fetchImpl(feedUrl, {
       signal: controller.signal,
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -328,13 +371,32 @@ export async function fetchChannelRSS(channelId) {
       redirect: 'follow',
     });
     if (!resp.ok) {
-      console.warn(`[RSS] HTTP ${resp.status} for ${channelId}`);
-      return null;
+      throw new RssFetchError(`RSS HTTP ${resp.status}`, {
+        category: `http-${resp.status}`,
+        status: resp.status,
+        retryable: resp.status === 408 || resp.status === 429 || resp.status >= 500,
+      });
     }
     const xml = await resp.text();
+    if (!validYoutubeFeedXml(xml)) {
+      throw new RssFetchError('RSS response was not a valid YouTube feed', {
+        category: 'invalid-xml',
+        status: resp.status,
+      });
+    }
     return parseRSSFeed(xml);
   } catch (err) {
-    console.error(`[RSS] fetch error for ${channelId}:`, err.message);
+    const error = err instanceof RssFetchError
+      ? err
+      : new RssFetchError(err?.name === 'AbortError' ? 'RSS request timed out' : 'RSS network request failed', {
+        category: err?.name === 'AbortError' ? 'timeout' : 'network',
+        retryable: true,
+      });
+    if (options.throwOnError) throw error;
+    if (!options.quiet) {
+      if (error.status) console.warn(`[RSS] ${error.message} for ${channelId}`);
+      else console.error(`[RSS] ${error.message} for ${channelId}`);
+    }
     return null;
   } finally {
     clearTimeout(timer);
@@ -736,30 +798,85 @@ function communityThumbnailCacheIdentity(value) {
   }
 }
 
-export function shouldRefreshCachedCommunityPost(latestPost, cachedPosts) {
-  if (!latestPost) return false;
-  if (!Array.isArray(cachedPosts) || cachedPosts.length !== 1) return true;
-  const cached = cachedPosts[0];
-  if ((cached?.activityId || cached?.postId) !== latestPost.activityId) return true;
-  if (!cached.publishedAt && latestPost.publishedAt) return true;
-  if (!cached.fetchedAt && latestPost.fetchedAt) return true;
-  if (!cached.publishedAtSource && latestPost.publishedAtSource) return true;
-  if (communityThumbnailCacheIdentity(cached?.thumbnail)
-    !== communityThumbnailCacheIdentity(latestPost?.thumbnail)) return true;
-  for (const field of ['text', 'likeCount', 'likeText', 'viewCount', 'viewText']) {
-    if ((cached?.[field] ?? null) !== (latestPost?.[field] ?? null)) return true;
+const COMMUNITY_POST_METRIC_FIELDS = ['likeCount', 'likeText', 'viewCount', 'viewText'];
+
+function communityPostWithoutObservationChurn(post) {
+  if (!post || typeof post !== 'object') return post;
+  const result = {};
+  for (const [name, value] of Object.entries(post)) {
+    if (name === 'fetchedAt' || COMMUNITY_POST_METRIC_FIELDS.includes(name)) continue;
+    result[name] = name === 'thumbnail' ? communityThumbnailCacheIdentity(value) : value;
   }
+  return result;
+}
+
+function knownCommunityMetric(value) {
+  return value !== undefined && value !== null && Number.isFinite(Number(value));
+}
+
+function communityMetricChangedBeyondThreshold(cachedValue, latestValue) {
+  if (!knownCommunityMetric(cachedValue) || !knownCommunityMetric(latestValue)) return false;
+  const cached = Number(cachedValue);
+  const latest = Number(latestValue);
+  return Math.abs(latest - cached) / Math.max(Math.abs(cached), 1) > RSS_METRIC_REFRESH_THRESHOLD;
+}
+
+export function mergeCachedCommunityPostForPersistence(latestPost, cachedPosts) {
+  if (!latestPost) return latestPost;
+  if (!Array.isArray(cachedPosts) || cachedPosts.length !== 1) return latestPost;
+  const cached = cachedPosts[0];
+  if ((cached?.activityId || cached?.postId) !== (latestPost.activityId || latestPost.postId)) return latestPost;
+
+  const candidate = { ...latestPost };
+  if (communityThumbnailCacheIdentity(cached?.thumbnail)
+    === communityThumbnailCacheIdentity(candidate?.thumbnail)) candidate.thumbnail = cached.thumbnail;
   const cachedPublishedAt = Date.parse(cached?.publishedAt);
-  const latestPublishedAt = Date.parse(latestPost?.publishedAt);
+  const latestPublishedAt = Date.parse(candidate?.publishedAt);
   const hasStablePublishedAt = Number.isFinite(cachedPublishedAt)
     && Number.isFinite(latestPublishedAt)
     && cachedPublishedAt === latestPublishedAt;
   // Relative labels (for example "12 minutes ago") advance even though the
   // post did not. Clients prefer publishedAt and compute their own age, so a
   // label-only change is useful only when there is no trustworthy timestamp.
-  if (!hasStablePublishedAt
-    && (cached?.publishedText ?? null) !== (latestPost?.publishedText ?? null)) return true;
-  return false;
+  if (hasStablePublishedAt) candidate.publishedText = cached.publishedText;
+
+  if (!jsonEqual(
+    communityPostWithoutObservationChurn(cached),
+    communityPostWithoutObservationChurn(candidate),
+  )) return candidate;
+
+  const latestFetchedAt = Date.parse(candidate.fetchedAt || '');
+  const cachedFetchedAt = Date.parse(cached.fetchedAt || '');
+  const latestHour = Number.isFinite(latestFetchedAt) ? Math.floor(latestFetchedAt / 3_600_000) : null;
+  const cachedHour = Number.isFinite(cachedFetchedAt) ? Math.floor(cachedFetchedAt / 3_600_000) : null;
+  const hydratesClock = !Number.isFinite(cachedFetchedAt) && Number.isFinite(latestFetchedAt);
+  const hydratesMetric = ['likeCount', 'viewCount'].some((field) => (
+    !knownCommunityMetric(cached[field]) && knownCommunityMetric(candidate[field])
+  ));
+  const differentHour = latestHour !== null && (cachedHour === null || latestHour !== cachedHour);
+  const stale = latestHour !== null && (cachedHour === null || latestHour - cachedHour >= RSS_METRIC_FORCE_REFRESH_HOURS);
+  const significant = ['likeCount', 'viewCount'].some((field) => (
+    communityMetricChangedBeyondThreshold(cached[field], candidate[field])
+  ));
+  if (!hydratesClock && !hydratesMetric && !(differentHour && (stale || significant))) return cached;
+
+  const merged = { ...cached };
+  if (candidate.fetchedAt) merged.fetchedAt = candidate.fetchedAt;
+  for (const [countField, textField] of [['likeCount', 'likeText'], ['viewCount', 'viewText']]) {
+    if (!knownCommunityMetric(candidate[countField])) continue;
+    merged[countField] = candidate[countField];
+    merged[textField] = candidate[textField] ?? null;
+  }
+  return merged;
+}
+
+export function shouldRefreshCachedCommunityPost(latestPost, cachedPosts) {
+  if (!latestPost) return false;
+  if (!Array.isArray(cachedPosts) || cachedPosts.length !== 1) return true;
+  return !jsonEqual(
+    mergeCachedCommunityPostForPersistence(latestPost, cachedPosts),
+    cachedPosts[0],
+  );
 }
 
 function cleanCommunityPostDisplayName(value) {

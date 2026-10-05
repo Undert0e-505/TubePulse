@@ -35,6 +35,7 @@ import {
   getPreviewHomeConnectionPhase,
   waitForCurrentInitialization,
 } from '../utils/appInitialization.mjs';
+import { runSeenMutation } from '../utils/seenPersistence.mjs';
 
 const THUMB_UP_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#666666" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
   <path d="M7 22V11" />
@@ -57,6 +58,7 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
   const [refreshing, setRefreshing] = useState(false);
   const [loading, setLoading] = useState(true);
   const [previewConnectionError, setPreviewConnectionError] = useState(null);
+  const [seenPersistenceError, setSeenPersistenceError] = useState(null);
   const [previewInitializationPending, setPreviewInitializationPending] = useState(IS_TUBEPULSE_PREVIEW);
   const [nowMs, setNowMs] = useState(Date.now());
   // Hold the latest cache in a ref so refresh() can be stable
@@ -108,6 +110,7 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
       if (deviceId) {
         const result = await fetchFeed(deviceId);
         if (result.ok && result.channels) {
+          setSeenPersistenceError(null);
           if (IS_TUBEPULSE_PREVIEW) setPreviewConnectionError(null);
           // v3 /feed returns { channels: [{ channelId, meta, videos, unwatchedCount }] }
           const [localChannels] = await Promise.all([getChannels()]);
@@ -426,13 +429,18 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
   // - Awaits markSeen before returning (so caller can open URL after server confirms)
   const markItemSeen = async ({ handle, channelId, item, type }) => {
     const seenId = type === 'post' ? getPostSeenId(item) : item?.videoId;
-    if (!seenId) return;
+    if (!seenId) return false;
+    const previousCacheEntry = cacheRef.current[handle];
+    const wasAlreadyPending = recentlySeenRef.current.has(seenId);
 
     // 1. Add to recentlySeenRef (guard against refresh overwrite)
     recentlySeenRef.current.add(seenId);
 
     // 2. Update lastSeen
     const ls = await getLastSeen();
+    const previousLastSeenEntry = ls[handle]
+      ? { ...ls[handle], seenIds: [...(ls[handle].seenIds || [])] }
+      : null;
     if (!ls[handle]) ls[handle] = { seenIds: [] };
     if (!ls[handle].seenIds.includes(seenId)) {
       ls[handle] = { seenIds: [...ls[handle].seenIds, seenId] };
@@ -466,30 +474,60 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
 
     // 4. Await markSeen on the server
     const deviceId = await getDeviceId();
-    try {
-      await markSeen(deviceId, channelId, [seenId]);
-    } catch (e) {
-      console.warn('[seen] markSeen threw', seenId, e?.message || e);
+    const result = await runSeenMutation({
+      persist: () => markSeen(deviceId, channelId, [seenId]),
+      rollback: async () => {
+        if (!wasAlreadyPending) recentlySeenRef.current.delete(seenId);
+        const restoredLastSeen = await getLastSeen();
+        if (previousLastSeenEntry) restoredLastSeen[handle] = previousLastSeenEntry;
+        else delete restoredLastSeen[handle];
+        await saveLastSeen(restoredLastSeen);
+        setLastSeen(restoredLastSeen);
+        if (previousCacheEntry) {
+          const restoredCache = { ...cacheRef.current, [handle]: previousCacheEntry };
+          cacheRef.current = restoredCache;
+          setCache(restoredCache);
+          try { await saveChannelCache(restoredCache); } catch {}
+        }
+      },
+    });
+    if (result.ok) {
+      setSeenPersistenceError(null);
+      return true;
     }
+    setSeenPersistenceError('Couldn’t save seen status. Pull to refresh and try again.');
+    console.warn('[seen] markSeen failed', seenId, result.error);
+    return false;
   };
 
   // Central helper: mark ALL items for a channel as seen (clearAll).
   // Used by channel-mode taps where we wipe everything and open the channel page.
   const markAllSeen = async ({ handle, channelId }) => {
+    const previousCacheEntry = cacheRef.current[handle];
+    const newlyPendingIds = [];
 
     // Add all current video/post IDs to recentlySeenRef
     const allVideos = getVideos(handle);
     const allPosts = getPosts(handle);
     for (const v of allVideos) {
-      if (v.videoId) recentlySeenRef.current.add(v.videoId);
+      if (v.videoId) {
+        if (!recentlySeenRef.current.has(v.videoId)) newlyPendingIds.push(v.videoId);
+        recentlySeenRef.current.add(v.videoId);
+      }
     }
     for (const p of allPosts) {
       const pid = getPostSeenId(p);
-      if (pid) recentlySeenRef.current.add(pid);
+      if (pid) {
+        if (!recentlySeenRef.current.has(pid)) newlyPendingIds.push(pid);
+        recentlySeenRef.current.add(pid);
+      }
     }
 
     // Update lastSeen
     const ls = await getLastSeen();
+    const previousLastSeenEntry = ls[handle]
+      ? { ...ls[handle], seenIds: [...(ls[handle].seenIds || [])] }
+      : null;
     if (!ls[handle]) ls[handle] = { seenIds: [] };
     const allIds = [
       ...allVideos.map(v => v.videoId).filter(Boolean),
@@ -527,11 +565,30 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
 
     // Await markSeen clearAll on server
     const deviceId = await getDeviceId();
-    try {
-      await markSeen(deviceId, channelId, [], true);
-    } catch (e) {
-      console.warn('[seen] markSeen clearAll threw', channelId, e?.message || e);
+    const result = await runSeenMutation({
+      persist: () => markSeen(deviceId, channelId, [], true),
+      rollback: async () => {
+        for (const id of newlyPendingIds) recentlySeenRef.current.delete(id);
+        const restoredLastSeen = await getLastSeen();
+        if (previousLastSeenEntry) restoredLastSeen[handle] = previousLastSeenEntry;
+        else delete restoredLastSeen[handle];
+        await saveLastSeen(restoredLastSeen);
+        setLastSeen(restoredLastSeen);
+        if (previousCacheEntry) {
+          const restoredCache = { ...cacheRef.current, [handle]: previousCacheEntry };
+          cacheRef.current = restoredCache;
+          setCache(restoredCache);
+          try { await saveChannelCache(restoredCache); } catch {}
+        }
+      },
+    });
+    if (result.ok) {
+      setSeenPersistenceError(null);
+      return true;
     }
+    setSeenPersistenceError('Couldn’t save seen status. Pull to refresh and try again.');
+    console.warn('[seen] markSeen clearAll failed', channelId, result.error);
+    return false;
   };
 
   const handleChannelOpen = async (channel) => {
@@ -805,7 +862,12 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
             colors={[COLORS.accent]}
           />
         }
-        ListHeaderComponent={IS_TUBEPULSE_PREVIEW && previewConnectionPhase === 'connecting' ? (
+        ListHeaderComponent={seenPersistenceError ? (
+          <View style={styles.previewError}>
+            <Text style={styles.previewErrorTitle}>Seen status wasn’t saved</Text>
+            <Text style={styles.previewErrorText}>{seenPersistenceError}</Text>
+          </View>
+        ) : IS_TUBEPULSE_PREVIEW && previewConnectionPhase === 'connecting' ? (
           <View style={styles.previewConnecting}>
             <ActivityIndicator color={COLORS.accent} size="small" />
             <Text style={styles.previewConnectingText}>Connecting to Preview server…</Text>

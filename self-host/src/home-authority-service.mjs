@@ -1,4 +1,6 @@
 import http from 'node:http';
+import { appWorker } from '../../worker/tubepulse-api/index.js';
+import { BufferedKvNamespace } from '../../worker/tubepulse-api/authority.mjs';
 import { AuthorityClient } from './authority-client.mjs';
 import {
   createHomeAuthorityStateFile,
@@ -10,11 +12,38 @@ import {
   createHomeSchedulerSyncStateFile,
   FileLease,
   HomeSchedulerRunner,
+  publicHomeSchedulerState,
 } from './home-scheduler.mjs';
 import { LocalKvAdapter } from './kv-adapters.mjs';
 import { TubePulseRuntime } from './runtime.mjs';
 
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
+const HOP_BY_HOP_HEADERS = new Set([
+  'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
+  'te', 'trailer', 'transfer-encoding', 'upgrade', 'content-length',
+]);
+
+class CapturingExecutionContext {
+  constructor() { this.promises = []; }
+  waitUntil(promise) { this.promises.push(Promise.resolve(promise)); }
+  passThroughOnException() {}
+  async flush() {
+    const results = await Promise.allSettled(this.promises);
+    const failures = results.filter((result) => result.status === 'rejected');
+    if (failures.length) throw new AggregateError(
+      failures.map((result) => result.reason),
+      'One or more Home mutation continuations failed',
+    );
+  }
+}
+
+function responseHeaders(response) {
+  const headers = {};
+  for (const [name, value] of response.headers) {
+    if (!HOP_BY_HOP_HEADERS.has(name.toLowerCase())) headers[name] = value;
+  }
+  return headers;
+}
 
 function sendResponse(response, workerResponse) {
   return workerResponse.arrayBuffer().then((buffer) => {
@@ -74,7 +103,8 @@ export class UnifiedHomeAuthorityService {
         await this.lease.acquire();
       }
       await this.runtime.start();
-      const local = new LocalKvAdapter(await this.runtime.getLocalNamespace());
+      const namespace = await this.runtime.getLocalNamespace();
+      const local = new LocalKvAdapter(namespace);
       this.gate ||= new HomeAuthorityGate({
         adapter: local,
         stateFile: createHomeAuthorityStateFile(this.config.dataDir),
@@ -101,6 +131,30 @@ export class UnifiedHomeAuthorityService {
           method: 'GET',
           headers: { Authorization: request.headers.get('Authorization') || '' },
         }),
+        mutationHandler: async ({ method, path, body, headers, authorization }) => {
+          const buffered = new BufferedKvNamespace(namespace);
+          const context = new CapturingExecutionContext();
+          const forwardedHeaders = new Headers({ Authorization: authorization });
+          for (const name of ['content-type', 'accept']) {
+            if (typeof headers?.[name] === 'string') forwardedHeaders.set(name, headers[name]);
+          }
+          const request = new Request(`http://tubepulse.local${path}`, {
+            method,
+            headers: forwardedHeaders,
+            ...(method === 'GET' || method === 'HEAD' ? {} : { body }),
+          });
+          const response = await appWorker.fetch(request, {
+            ...this.config.workerBindings,
+            TUBEPULSE_KV: buffered,
+            TUBEPULSE_DISABLE_WEBSUB: 'true',
+          }, context);
+          await context.flush();
+          const responseBody = await response.text();
+          return {
+            response: { status: response.status, headers: responseHeaders(response), body: responseBody },
+            deltas: response.status >= 400 ? [] : await buffered.deltas(),
+          };
+        },
       });
       this.runner ||= new HomeSchedulerRunner({
         config: this.config,
@@ -152,9 +206,10 @@ export class UnifiedHomeAuthorityService {
         service: 'unified-home-authority',
         mode: this.config.mode,
         authority,
-        scheduler,
+        scheduler: publicHomeSchedulerState(scheduler),
         configuration: {
           videoCadenceMinutes: 5,
+          videoSourceMode: this.config.videoSourceMode,
           postsCadenceMinutes: this.config.postsCadenceMinutes,
           notificationsEnabled: this.config.notificationsEnabled,
           remoteWriteEnabled: this.config.remoteWriteEnabled,

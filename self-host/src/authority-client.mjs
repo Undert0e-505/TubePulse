@@ -29,6 +29,7 @@ const ROUTES = Object.freeze({
   activate: { method: 'POST', path: '/_tubepulse/authority/reconcile/activate', operation: 'authority-reconcile-activate' },
   reconcileRelease: { method: 'POST', path: '/_tubepulse/authority/reconcile/release', operation: 'authority-reconcile-release' },
   stale: { method: 'POST', path: '/_tubepulse/authority/stale', operation: 'authority-stale' },
+  rssProbe: { method: 'POST', path: '/_tubepulse/authority/rss-probe', operation: 'authority-rss-probe' },
 });
 
 export class AuthorityClient {
@@ -90,6 +91,9 @@ export class AuthorityClient {
   async releasePublication(leaseId) { return await this.request('release', { leaseId }); }
   async markStale(reason, { clearSeeded = false } = {}) {
     return await this.request('stale', { reason, ...(clearSeeded ? { clearSeeded: true } : {}) });
+  }
+  async probeRss(activeChannelId = undefined) {
+    return await this.request('rssProbe', activeChannelId ? { activeChannelId } : {});
   }
   async snapshotCanonical({ includeValues = false } = {}) {
     const leaseId = `reconcile-${crypto.randomUUID()}`;

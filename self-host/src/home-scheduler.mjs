@@ -3,9 +3,9 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { isCommunityPostsEnabled, parseCommunityPostChannelAllowlist } from '../../worker/tubepulse-posts/community-posts.mjs';
 import { isCommunityPostsDebugEnabled, pollSingleCommunityChannel } from '../../worker/tubepulse-posts/index.js';
-import { pollSingleRssChannel } from '../../worker/tubepulse-rss-0/index.js';
+import { pollSingleRssChannel, processChannelUploads } from '../../worker/tubepulse-rss-0/index.js';
 import { runAuxTick } from '../../worker/tubepulse-aux/index.js';
-import { getKV, key, stableJson } from '../../worker/tubepulse-cron/shared.mjs';
+import { getKV, key, mergeRssUploadsIntoRecentVideos, putKVIfChanged, stableJson } from '../../worker/tubepulse-cron/shared.mjs';
 import { isSyncExcluded } from './exclusions.mjs';
 import { JsonStateFile } from './file-state.mjs';
 import {
@@ -20,6 +20,27 @@ import { SyncEngine } from './sync-engine.mjs';
 import { DurableNotificationIntentStore, ProductionNotificationCoordinator } from './home-scheduler-notifications.mjs';
 import { AuthorityClient } from './authority-client.mjs';
 import { createHomeAuthorityStateFile, HomeAuthorityGate } from './home-authority.mjs';
+import {
+  fallbackChannelsForMinute,
+  fallbackQuotaPlan,
+  normalizeRssHealthState,
+  pacificQuotaWindow,
+  rssCohortForMinute,
+  rssNextMinuteSchedule,
+  sameFleetOutage,
+  validateIndependentRssProbe,
+} from './home-rss-policy.mjs';
+import { fetchUploadsPlaylist } from './youtube-api-fallback.mjs';
+import {
+  YouTubeDataApiClient,
+  YouTubeDataApiError,
+  chunked,
+  fetchPlaylistReconciliation,
+  normalizeStatistics,
+  normalizeYoutubeDataApiState,
+  selectDueMetricVideos,
+  pruneMetricPollToVisibleVideos,
+} from './youtube-data-api.mjs';
 
 const FIVE_MINUTES_MS = 5 * 60 * 1000;
 const MINUTE_MS = 60 * 1000;
@@ -46,6 +67,7 @@ function freshSchedulerState(mode = 'shadow') {
     lastError: null,
     nextSweepAt: null,
     overlapSkips: 0,
+    rssHealth: normalizeRssHealthState(null),
   };
 }
 
@@ -61,6 +83,35 @@ export function createHomeSchedulerSyncStateFile(dataDir) {
     lastPull: null,
     lastPush: null,
   });
+}
+
+export function publicHomeSchedulerState(state) {
+  const youtube = state?.youtubeDataApi;
+  const lastSweep = state?.lastSweep?.sourceMode === 'youtube-data-api'
+    ? {
+      ...state.lastSweep,
+      reconcileResults: (state.lastSweep.reconcileResults || []).reduce((summary, entry) => {
+        summary[entry.outcome || 'unknown'] = (summary[entry.outcome || 'unknown'] || 0) + 1;
+        return summary;
+      }, {}),
+    }
+    : state?.lastSweep;
+  return {
+    ...state,
+    lastSweep,
+    ...(youtube ? {
+      youtubeDataApi: {
+        sourceMode: youtube.sourceMode,
+        statsMethod: youtube.statsMethod,
+        quota: youtube.quota,
+        channelStateCount: Object.keys(youtube.channels || {}).length,
+        metricStateCount: Object.keys(youtube.metricPoll || {}).length,
+        lastGoodAt: youtube.lastGoodAt || null,
+        lastError: youtube.lastError || null,
+        lastCycle: youtube.lastCycle || null,
+      },
+    } : {}),
+  };
 }
 
 export function nextFiveMinuteBoundary(now = Date.now()) {
@@ -179,7 +230,7 @@ function stripMetrics(value) {
   if (!value || typeof value !== 'object') return value;
   const result = {};
   for (const [name, child] of Object.entries(value)) {
-    if (['views', 'likes', 'dislikes', 'viewsLastCheckedHour', 'likesLastCheckedHour'].includes(name)) continue;
+    if (['views', 'likes', 'comments', 'dislikes', 'viewsLastCheckedHour', 'likesLastCheckedHour', 'commentsLastCheckedHour'].includes(name)) continue;
     result[name] = stripMetrics(child);
   }
   return result;
@@ -205,6 +256,14 @@ function stripCommunityPostObservationMetadata(value) {
     result[name] = stripCommunityPostObservationMetadata(child);
   }
   return result;
+}
+
+function communityPostMetrics(value) {
+  if (Array.isArray(value)) return value.map(communityPostMetrics);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(['likeCount', 'likeText', 'viewCount', 'viewText']
+    .filter((name) => Object.prototype.hasOwnProperty.call(value, name))
+    .map((name) => [name, value[name]]));
 }
 
 function parseJson(value) {
@@ -248,7 +307,9 @@ export function mutationReason(name, previousValue, nextValue, operation = 'put'
       }
       if (stableJson(stripCommunityPostObservationMetadata(previous))
         === stableJson(stripCommunityPostObservationMetadata(next))) {
-        return 'post-observation-metadata-only';
+        return stableJson(communityPostMetrics(previous)) === stableJson(communityPostMetrics(next))
+          ? 'post-observation-metadata-only'
+          : 'post-metrics-only';
       }
     }
     return 'community-content-cache';
@@ -641,6 +702,8 @@ export class HomeSchedulerRunner {
     now = Date.now,
     sleep = delay,
     rssPoller = pollSingleRssChannel,
+    youtubeApiFetcher = fetchUploadsPlaylist,
+    youtubeDataApiClient = null,
     postPoller = pollSingleCommunityChannel,
     auxRunner = runAuxTick,
     notificationCoordinator = null,
@@ -662,6 +725,8 @@ export class HomeSchedulerRunner {
     this.now = now;
     this.sleep = sleep;
     this.rssPoller = rssPoller;
+    this.youtubeApiFetcher = youtubeApiFetcher;
+    this.youtubeDataApiClient = youtubeDataApiClient;
     this.postPoller = postPoller;
     this.auxRunner = auxRunner;
     this.notificationCoordinator = notificationCoordinator;
@@ -673,6 +738,7 @@ export class HomeSchedulerRunner {
     this.timer = null;
     this.activeTick = null;
     this.stopped = false;
+    this.remoteConfirmationDueAt = null;
     this.kvMutationMutex = new KeyedMutex();
     this.overlapSkips = 0;
   }
@@ -726,6 +792,9 @@ export class HomeSchedulerRunner {
         }
       }
       const state = await this.stateFile.read();
+      state.rssHealth = normalizeRssHealthState(state.rssHealth, this.now());
+      state.youtubeDataApi = normalizeYoutubeDataApiState(state.youtubeDataApi, this.now());
+      this.remoteConfirmationDueAt = state.rssHealth.independentProbe.nextConfirmationAt;
       const reconciledAt = Date.parse(authorityStatus?.manifest?.reconciledAt || '');
       const sweepStartedAt = Date.parse(state.currentSweep?.startedAt || '');
       if (state.currentSweep?.status === 'running'
@@ -798,6 +867,262 @@ export class HomeSchedulerRunner {
     };
   }
 
+  async reserveYoutubeQuota(bucket, units, priority) {
+    const state = await this.stateFile.read();
+    const health = normalizeYoutubeDataApiState(state.youtubeDataApi, this.now());
+    const configured = bucket === 'statistics'
+      ? Number(this.config.youtubeStatisticsDailyQuotaUnits || 10_000)
+      : Number(this.config.youtubeDailyQuotaUnits || 10_000);
+    const reserve = bucket === 'statistics'
+      ? Number(this.config.youtubeStatisticsReserveUnits ?? 1_000)
+      : Number(this.config.youtubeQuotaReserveUnits ?? 1_000);
+    const hardCap = Math.max(0, configured - reserve);
+    if (health.quota[bucket].units + units > hardCap) {
+      throw new YouTubeDataApiError(`YouTube ${bucket} quota safety cap reached`, {
+        category: `${bucket}-quota-cap`, retryable: false,
+      });
+    }
+    health.quota[bucket].units += units;
+    health.quota[bucket].requests++;
+    health.quota[bucket].lastPriority = priority;
+    health.quota[bucket].lastRequestAt = iso(this.now());
+    state.youtubeDataApi = health;
+    await this.stateFile.write(state);
+  }
+
+  dataApiClient() {
+    if (!this.youtubeDataApiClient) {
+      this.youtubeDataApiClient = new YouTubeDataApiClient({
+        apiKey: this.config.workerBindings?.YOUTUBE_API_KEY,
+        timeoutMs: this.config.channelTimeoutMs,
+        reserve: (bucket, units, priority) => this.reserveYoutubeQuota(bucket, units, priority),
+      });
+    }
+    return this.youtubeDataApiClient;
+  }
+
+  async recordYoutubeApiFailure(bucket, error) {
+    const state = await this.stateFile.read();
+    const health = normalizeYoutubeDataApiState(state.youtubeDataApi, this.now());
+    health.quota[bucket].failures++;
+    health.lastError = {
+      at: iso(this.now()),
+      category: String(error?.category || error?.name || 'youtube-api-failed').slice(0, 60),
+    };
+    state.youtubeDataApi = health;
+    await this.stateFile.write(state);
+  }
+
+  async applyStatistics(target, channelRecents, due, statistics) {
+    const dueByChannel = new Map();
+    for (const entry of due) {
+      const metrics = statistics.get(entry.video.videoId);
+      if (!metrics) continue;
+      if (!dueByChannel.has(entry.channelId)) dueByChannel.set(entry.channelId, new Map());
+      dueByChannel.get(entry.channelId).set(entry.video.videoId, metrics);
+    }
+    for (const [channelId, byVideo] of dueByChannel) {
+      const recent = channelRecents.get(channelId) || [];
+      const uploads = recent.map((video) => ({
+        videoId: video.videoId,
+        title: video.title,
+        published: video.publishedAt,
+        publishedAt: video.publishedAt,
+        thumbnail: video.thumbnail,
+        link: video.link || `https://www.youtube.com/watch?v=${video.videoId}`,
+        type: video.type,
+        views: byVideo.has(video.videoId) ? byVideo.get(video.videoId).views : video.views,
+        likes: byVideo.has(video.videoId) ? byVideo.get(video.videoId).likes : video.likes,
+        comments: byVideo.has(video.videoId) ? byVideo.get(video.videoId).comments : video.comments,
+        dislikes: null,
+      }));
+      const merged = mergeRssUploadsIntoRecentVideos(recent, uploads, this.now());
+      await putKVIfChanged(target, key.channelRecent(channelId), merged, recent);
+      channelRecents.set(channelId, merged);
+    }
+  }
+
+  async runYoutubeDataApiCycle(env, target, scheduledTime, { force = false } = {}) {
+    const startedAt = this.now();
+    if (!force && Math.floor(scheduledTime / MINUTE_MS) % 5 !== 0) {
+      return { outcome: 'not-due', sourceMode: 'youtube-data-api', scheduledAt: iso(scheduledTime) };
+    }
+    const active = await getKV(target, key.channelsActive()) || [];
+    const channels = [...new Set(active)].sort();
+    const api = this.dataApiClient();
+    const detectorItems = [];
+    let detectorFailures = 0;
+    for (const ids of chunked(channels, 50)) {
+      try {
+        const payload = await api.listChannels(ids);
+        detectorItems.push(...(payload.items || []));
+      } catch (error) {
+        detectorFailures++;
+        await this.recordYoutubeApiFailure('general', error);
+      }
+    }
+    if (detectorFailures > 0) {
+      return {
+        outcome: detectorItems.length ? 'partial' : 'error', sourceMode: 'youtube-data-api',
+        activeCount: active.length, uniqueActiveCount: channels.length,
+        detectorRequests: Math.ceil(channels.length / 50), detectorFailures,
+        reconciledCount: 0, statisticsRequests: 0,
+      };
+    }
+
+    let state = await this.stateFile.read();
+    let health = normalizeYoutubeDataApiState(state.youtubeDataApi, this.now());
+    const returned = new Map(detectorItems.map((item) => [item.id, item]));
+    const candidates = [];
+    const safetyMs = Number(this.config.youtubeSafetyReconcileHours || 6) * 60 * 60 * 1000;
+    for (const channelId of channels) {
+      const item = returned.get(channelId);
+      if (!item) continue;
+      const previous = health.channels[channelId] || {};
+      const videoCount = Number(item.statistics?.videoCount);
+      const uploadsPlaylistId = item.contentDetails?.relatedPlaylists?.uploads || previous.uploadsPlaylistId || null;
+      const baselineMissing = !Number.isFinite(Number(previous.videoCount));
+      const changed = !baselineMissing && Number(previous.videoCount) !== videoCount;
+      const lastReconciled = Date.parse(previous.lastReconciledAt || '');
+      const safetyDue = !Number.isFinite(lastReconciled) || this.now() - lastReconciled >= safetyMs;
+      health.channels[channelId] = {
+        ...previous,
+        uploadsPlaylistId,
+        videoCount: Number.isFinite(videoCount) ? videoCount : previous.videoCount ?? null,
+        etag: item.etag || null,
+        channelViewCount: item.statistics?.viewCount ?? null,
+        subscriberCount: item.statistics?.subscriberCount ?? null,
+        hiddenSubscriberCount: Boolean(item.statistics?.hiddenSubscriberCount),
+        lastDetectorAt: iso(this.now()),
+      };
+      if (uploadsPlaylistId && (baselineMissing || changed || safetyDue)) {
+        candidates.push({ channelId, baselineMissing, changed, safetyDue, uploadsPlaylistId, lastReconciled });
+      }
+    }
+    candidates.sort((left, right) => (
+      Number(right.changed) - Number(left.changed)
+      || Number(right.baselineMissing) - Number(left.baselineMissing)
+      || (Number.isFinite(left.lastReconciled) ? left.lastReconciled : 0)
+        - (Number.isFinite(right.lastReconciled) ? right.lastReconciled : 0)
+      || left.channelId.localeCompare(right.channelId)
+    ));
+    state.youtubeDataApi = health;
+    await this.stateFile.write(state);
+
+    // A detector baseline alone cannot complete a source migration. Every
+    // established channel must reconcile once against its durable watermark,
+    // otherwise a baseline captured after an outage can hide missed uploads.
+    const migrationPending = candidates.some((entry) => !Number.isFinite(entry.lastReconciled));
+    const reconcileLimit = migrationPending
+      ? Number(this.config.youtubeMaxMigrationReconciliationsPerCycle || 100)
+      : Number(this.config.youtubeMaxReconciliationsPerCycle || 5);
+    const selected = candidates.slice(0, reconcileLimit);
+    const reconcileResults = [];
+    for (const candidate of selected) {
+      try {
+        const known = await getKV(target, key.channelKnownVideos(candidate.channelId));
+        const result = await fetchPlaylistReconciliation({
+          api,
+          playlistId: candidate.uploadsPlaylistId,
+          knownIds: known?.ids || [],
+          maximumPages: Number(this.config.youtubeMaxPlaylistPages || 3),
+        });
+        const ctx = new WaitUntilContext();
+        const processed = await processChannelUploads(env, ctx, candidate.channelId, {
+          channelName: result.uploads[0]?.channelTitle || null,
+          uploads: result.uploads,
+        }, { now: this.now(), logPrefix: 'YouTube API' });
+        await ctx.flush();
+        state = await this.stateFile.read();
+        health = normalizeYoutubeDataApiState(state.youtubeDataApi, this.now());
+        health.channels[candidate.channelId] = {
+          ...health.channels[candidate.channelId],
+          lastReconciledAt: iso(this.now()),
+          lastReconcileOutcome: processed?.outcome || 'ok',
+          lastPageCount: result.pageCount,
+          paginationBoundReached: result.truncatedWithoutOverlap,
+        };
+        state.youtubeDataApi = health;
+        await this.stateFile.write(state);
+        reconcileResults.push({ channelId: candidate.channelId, outcome: 'ok', pageCount: result.pageCount, processed: processed?.outcome });
+      } catch (error) {
+        await this.recordYoutubeApiFailure('general', error);
+        reconcileResults.push({
+          channelId: candidate.channelId, outcome: 'error',
+          errorCategory: String(error?.category || error?.name || 'reconcile-failed').slice(0, 60),
+        });
+      }
+    }
+
+    const channelRecents = new Map();
+    for (const channelId of channels) channelRecents.set(channelId, await getKV(target, key.channelRecent(channelId)) || []);
+    state = await this.stateFile.read();
+    health = normalizeYoutubeDataApiState(state.youtubeDataApi, this.now());
+    const newestOnly = health.statsMethod === 'videos.list';
+    const due = selectDueMetricVideos(channelRecents, health.metricPoll, scheduledTime, { newestOnly });
+    let statsMethod = health.statsMethod;
+    let statisticsRequests = 0;
+    const allStatistics = new Map();
+    for (const entries of chunked(due, 50)) {
+      try {
+        let payload;
+        try {
+          payload = await api.batchGetStats(entries.map((entry) => entry.video.videoId), statsMethod);
+        } catch (error) {
+          if (statsMethod === 'batchGetStats' && ['not-found', 'http-400'].includes(error?.category)) {
+            await this.recordYoutubeApiFailure('statistics', error);
+            statsMethod = 'videos.list';
+            payload = await api.batchGetStats(entries.map((entry) => entry.video.videoId), 'videos.list');
+          } else throw error;
+        }
+        statisticsRequests++;
+        for (const [videoId, metrics] of normalizeStatistics(payload)) allStatistics.set(videoId, metrics);
+      } catch (error) {
+        await this.recordYoutubeApiFailure(statsMethod === 'batchGetStats' ? 'statistics' : 'general', error);
+        break;
+      }
+    }
+    await this.applyStatistics(target, channelRecents, due, allStatistics);
+    state = await this.stateFile.read();
+    health = normalizeYoutubeDataApiState(state.youtubeDataApi, this.now());
+    health.statsMethod = statsMethod;
+    for (const entry of due) {
+      const metrics = allStatistics.get(entry.video.videoId);
+      if (!metrics) continue;
+      const signature = stableJson(metrics);
+      const previous = health.metricPoll[entry.video.videoId] || {};
+      health.metricPoll[entry.video.videoId] = {
+        lastPolledAt: iso(scheduledTime),
+        lastObserved: signature,
+        staticStreak: previous.lastObserved === signature ? Number(previous.staticStreak || 0) + 1 : 0,
+      };
+    }
+    health.metricPoll = pruneMetricPollToVisibleVideos(health.metricPoll, channelRecents);
+    health.lastGoodAt = iso(this.now());
+    health.lastError = null;
+    health.lastCycle = {
+      scheduledAt: iso(scheduledTime), finishedAt: iso(this.now()), detectorRequests: Math.ceil(channels.length / 50),
+      activeCount: active.length, uniqueActiveCount: channels.length,
+      changedCount: candidates.filter((entry) => entry.changed).length,
+      reconciliationDueCount: candidates.length, reconciledCount: reconcileResults.filter((entry) => entry.outcome === 'ok').length,
+      reconciliationDeferredCount: Math.max(0, candidates.length - selected.length),
+      statisticsVideoCount: allStatistics.size, statisticsRequests,
+    };
+    state.youtubeDataApi = health;
+    await this.stateFile.write(state);
+    return {
+      id: `youtube-${Math.floor(scheduledTime / FIVE_MINUTES_MS)}`,
+      outcome: reconcileResults.some((entry) => entry.outcome === 'error') ? 'partial' : 'ok',
+      sourceMode: 'youtube-data-api', startedAt: iso(startedAt), finishedAt: iso(this.now()),
+      durationMs: this.now() - startedAt, activeCount: active.length, uniqueActiveCount: channels.length,
+      detectorRequests: Math.ceil(channels.length / 50), detectorFailures: 0,
+      changedCount: candidates.filter((entry) => entry.changed).length,
+      reconciliationDueCount: candidates.length, reconciledCount: reconcileResults.filter((entry) => entry.outcome === 'ok').length,
+      reconciliationDeferredCount: Math.max(0, candidates.length - selected.length),
+      reconcileResults, statisticsVideoCount: allStatistics.size, statisticsRequests, statsMethod: health.statsMethod,
+    };
+  }
+
   async pollChannelWithRetry(env, ctx, channelId) {
     const errors = [];
     for (let attempt = 0; attempt <= this.config.retryCount; attempt++) {
@@ -816,6 +1141,402 @@ export class HomeSchedulerRunner {
       }
     }
     return { channelId, outcome: 'error', attempts: errors.length, errorCategory: 'poll-failed' };
+  }
+
+  async pollRssChannelOnce(env, channelId) {
+    const ctx = new WaitUntilContext();
+    const timeoutMs = this.config.rssChannelTimeoutMs ?? this.config.channelTimeoutMs;
+    try {
+      const result = await withTimeout(
+        Promise.resolve(this.rssPoller(env, ctx, channelId, {
+          failOnFetchError: true,
+          timeoutMs,
+          quiet: this.config.quiet,
+        })),
+        timeoutMs,
+        'RSS channel request',
+      );
+      await ctx.flush();
+      return { outcome: 'ok', attempts: 1, pollOutcome: result?.outcome || 'ok' };
+    } catch (error) {
+      await ctx.flush();
+      return {
+        outcome: 'error',
+        attempts: 1,
+        errorCategory: String(error?.category || (String(error?.message || '').includes('timed out') ? 'timeout' : 'poll-failed')),
+      };
+    }
+  }
+
+  async independentRssProbe(activeChannelId) {
+    if (!this.authorityClient?.probeRss) {
+      return { outcome: 'inconclusive', probes: [], errorCategory: 'authority-client-unavailable' };
+    }
+    try {
+      const result = await this.authorityClient.probeRss(activeChannelId);
+      return validateIndependentRssProbe(result, activeChannelId);
+    } catch (error) {
+      return {
+        outcome: 'inconclusive',
+        probes: [],
+        errorCategory: String(error?.operation || error?.name || 'probe-unavailable').slice(0, 40),
+      };
+    }
+  }
+
+  fallbackPlan(channelCount) {
+    return fallbackQuotaPlan({
+      channelCount,
+      dailyQuotaUnits: this.config.youtubeDailyQuotaUnits,
+      reserveUnits: this.config.youtubeQuotaReserveUnits,
+      postsCadenceMinutes: this.config.postsCadenceMinutes,
+      explicitDailyCap: this.config.youtubeApiFallback?.dailyCap ?? null,
+    });
+  }
+
+  refreshFallbackQuota(health, channelCount, nowMs) {
+    const window = pacificQuotaWindow(nowMs);
+    if (health.fallback.quotaDay !== window.day) {
+      health.fallback.quotaDay = window.day;
+      health.fallback.quotaUsed = 0;
+      health.fallback.quotaUnitsUsed = 0;
+      health.fallback.requests = 0;
+      health.fallback.failures = 0;
+      health.fallback.skipped = 0;
+      health.fallback.lastError = null;
+    }
+    const plan = this.fallbackPlan(channelCount);
+    health.fallback.quotaUnitsUsed = Math.max(Number(health.fallback.quotaUnitsUsed || 0), Number(health.fallback.quotaUsed || 0));
+    health.fallback.quotaUsed = health.fallback.quotaUnitsUsed;
+    health.fallback.requests = Number(health.fallback.requests ?? health.fallback.quotaUnitsUsed);
+    health.fallback.quotaLimit = plan.dailyCap;
+    health.fallback.quotaUnitLimit = plan.quotaUnitLimit;
+    health.fallback.requestLimit = plan.requestLimit;
+    health.fallback.projectedDailyRequests = plan.projectedDailyRequests;
+    health.fallback.reserveUnits = plan.reserveUnits;
+    health.fallback.postsProjection = plan.postsProjection;
+    health.fallback.resetsAt = window.resetsAt;
+    health.fallback.coverageMinutes = plan.coverageMinutes;
+    return plan;
+  }
+
+  resetIndependentRssConfirmation(health) {
+    this.remoteConfirmationDueAt = null;
+    Object.assign(health.independentProbe, {
+      unavailableStreak: 0, firstUnavailableAt: null, lastUnavailableAt: null,
+      nextConfirmationAt: null, confirmedAt: null, confirmationPending: false,
+    });
+  }
+
+  applyIndependentRssProbe(health, probe, channelCount) {
+    const nowMs = this.now();
+    const previous = health.independentProbe;
+    const lastUnavailableMs = Date.parse(previous.lastUnavailableAt || '');
+    health.independentProbe = {
+      ...previous, lastAt: iso(nowMs), outcome: probe.outcome,
+      official: probe.probes.find((entry) => entry.label === 'official') || null,
+      active: probe.probes.find((entry) => entry.label === 'active') || null,
+      errorCategory: probe.errorCategory || null,
+    };
+    if (probe.outcome !== 'failure') {
+      this.resetIndependentRssConfirmation(health);
+      health.sourceMode = probe.outcome === 'success' ? 'home-egress-throttled' : 'rss-probe-inconclusive';
+      return;
+    }
+    const streak = Number(previous.unavailableStreak || 0);
+    // A repeated call within the minute can never manufacture confirmation.
+    const spaced = Number.isFinite(lastUnavailableMs) && nowMs - lastUnavailableMs >= MINUTE_MS;
+    const nextStreak = streak > 0 ? (spaced ? Math.min(2, streak + 1) : streak) : 1;
+    Object.assign(health.independentProbe, {
+      unavailableStreak: nextStreak,
+      firstUnavailableAt: previous.firstUnavailableAt || iso(nowMs),
+      lastUnavailableAt: streak > 0 && !spaced ? previous.lastUnavailableAt : iso(nowMs),
+      nextConfirmationAt: nextStreak < 2 ? iso((streak > 0 && !spaced ? lastUnavailableMs : nowMs) + MINUTE_MS) : null,
+      confirmedAt: nextStreak >= 2 ? previous.confirmedAt || iso(nowMs) : null,
+      confirmationPending: nextStreak < 2,
+    });
+    this.remoteConfirmationDueAt = health.independentProbe.nextConfirmationAt;
+    if (nextStreak < 2) {
+      health.sourceMode = 'rss-probe-confirming';
+      return;
+    }
+    const plan = this.refreshFallbackQuota(health, channelCount, nowMs);
+    const fallbackAvailable = this.config.youtubeApiFallback?.enabled
+      && this.config.workerBindings?.YOUTUBE_API_KEY
+      && health.fallback.requests < plan.requestLimit
+      && health.fallback.quotaUnitsUsed < plan.quotaUnitLimit;
+    health.sourceMode = fallbackAvailable ? 'rss-global-down-api-fallback' : 'stale-cache';
+  }
+
+  async openRssCircuit(health, channels, outageClass, scheduledTime) {
+    const nowMs = this.now();
+    const probe = await this.independentRssProbe(channels[0]);
+    this.refreshFallbackQuota(health, channels.length, nowMs);
+    const cooldownMinutes = Math.min(
+      this.config.rssCircuitInitialCooldownMinutes ?? 15,
+      this.config.rssCircuitMaximumCooldownMinutes ?? 60,
+    );
+    this.resetIndependentRssConfirmation(health);
+    this.applyIndependentRssProbe(health, probe, channels.length);
+    health.circuit = {
+      open: true,
+      reason: `full-fleet-${outageClass}`,
+      outageClass,
+      openedAt: iso(nowMs),
+      until: iso(nowMs + cooldownMinutes * MINUTE_MS),
+      cooldownMinutes,
+      recoverySuccesses: 0,
+      confirmedCycleAt: iso(scheduledTime),
+    };
+  }
+
+  async runYoutubeFallback(env, health, channels, scheduledTime) {
+    const plan = this.refreshFallbackQuota(health, channels.length, this.now());
+    if (!this.config.youtubeApiFallback?.enabled || !this.config.workerBindings?.YOUTUBE_API_KEY) {
+      return { outcome: 'not-configured', requestCount: 0, coverageMinutes: plan.coverageMinutes };
+    }
+    if (!plan.coverageMinutes || plan.dailyCap <= 0) {
+      health.fallback.skipped++;
+      return { outcome: 'quota-unavailable', requestCount: 0, coverageMinutes: plan.coverageMinutes };
+    }
+    const selected = fallbackChannelsForMinute(channels, scheduledTime, plan.coverageMinutes);
+    if (selected.length === 0) return { outcome: 'not-due', requestCount: 0, coverageMinutes: plan.coverageMinutes };
+    let successes = 0;
+    let failures = 0;
+    let quotaBlocked = 0;
+    for (const channelId of selected) {
+      // Check both persisted budgets before every individual call, including
+      // when the selected cohort contains two channels.
+      const currentPlan = this.refreshFallbackQuota(health, channels.length, this.now());
+      if (!Number.isFinite(health.fallback.requests) || !Number.isFinite(health.fallback.quotaUnitsUsed)
+        || health.fallback.requests + 1 > currentPlan.requestLimit
+        || health.fallback.quotaUnitsUsed + 1 > currentPlan.quotaUnitLimit) {
+        health.fallback.skipped++;
+        quotaBlocked++;
+        continue;
+      }
+      // playlistItems.list consumes one quota unit whether the request
+      // succeeds or returns an API error, so reserve the unit first.
+      health.fallback.quotaUnitsUsed++;
+      health.fallback.quotaUsed = health.fallback.quotaUnitsUsed;
+      health.fallback.requests++;
+      const reservedState = await this.stateFile.read();
+      reservedState.rssHealth = health;
+      await this.stateFile.write(reservedState);
+      try {
+        const source = await this.youtubeApiFetcher(channelId, {
+          apiKey: this.config.workerBindings.YOUTUBE_API_KEY,
+          timeoutMs: this.config.channelTimeoutMs,
+        });
+        const ctx = new WaitUntilContext();
+        await withTimeout(
+          processChannelUploads(env, ctx, channelId, source, { now: this.now() }),
+          this.config.channelTimeoutMs,
+          'YouTube API fallback processing',
+        );
+        await ctx.flush();
+        successes++;
+        health.lastGoodApiAt = iso(this.now());
+        health.fallback.lastError = null;
+      } catch (error) {
+        failures++;
+        health.fallback.failures++;
+        health.fallback.lastError = {
+          at: iso(this.now()),
+          category: String(error?.category || error?.name || 'fallback-failed').slice(0, 40),
+        };
+      }
+    }
+    return {
+      outcome: quotaBlocked ? 'quota-blocked' : failures ? (successes ? 'partial' : 'error') : 'ok',
+      requestCount: successes + failures,
+      successCount: successes,
+      failureCount: failures,
+      quotaBlocked,
+      coverageMinutes: plan.coverageMinutes,
+    };
+  }
+
+  async runOpenCircuitTick(env, channels, scheduledTime, health) {
+    const normalPlan = rssCohortForMinute(channels, scheduledTime);
+    health.skippedCount += normalPlan.channels.length;
+    const confirmationDueAt = Date.parse(health.independentProbe.nextConfirmationAt || '');
+    if (health.independentProbe.confirmationPending && Number.isFinite(confirmationDueAt)
+      && this.now() >= confirmationDueAt && channels.length > 0) {
+      const probe = await this.independentRssProbe(normalPlan.order[0]);
+      this.applyIndependentRssProbe(health, probe, channels.length);
+      if (!health.independentProbe.confirmationPending) {
+        health.circuit.until = iso(this.now() + health.circuit.cooldownMinutes * MINUTE_MS);
+      }
+      const fallback = health.sourceMode === 'rss-global-down-api-fallback'
+        ? await this.runYoutubeFallback(env, health, channels, scheduledTime) : null;
+      return { sourceMode: health.sourceMode, outcome: 'remote-confirmation', homeProbe: 'not-due', fallback };
+    }
+    const dueAt = Date.parse(health.circuit.until || '');
+    if (Number.isFinite(dueAt) && this.now() >= dueAt && channels.length > 0) {
+      const probeChannel = normalPlan.order[0];
+      const homeProbe = await this.pollRssChannelOnce(env, probeChannel);
+      health.requestCount++;
+      health.attemptCount++;
+      if (homeProbe.outcome === 'ok') {
+        this.resetIndependentRssConfirmation(health);
+        health.lastGoodRssAt = iso(this.now());
+        health.circuit.recoverySuccesses = Number(health.circuit.recoverySuccesses || 0) + 1;
+        health.sourceMode = 'rss-recovering';
+        if (health.circuit.recoverySuccesses >= (this.config.rssRecoverySuccessesRequired ?? 2)) {
+          health.sourceMode = 'rss';
+          health.circuit = {
+            open: false,
+            reason: null,
+            outageClass: null,
+            openedAt: null,
+            until: null,
+            cooldownMinutes: this.config.rssCircuitInitialCooldownMinutes ?? 15,
+            recoverySuccesses: 0,
+          };
+          health.currentCycle = null;
+          return { sourceMode: 'rss', outcome: 'recovered', homeProbe: 'success', fallback: null };
+        }
+        health.circuit.until = iso(this.now() + MINUTE_MS);
+        return { sourceMode: health.sourceMode, outcome: 'recovering', homeProbe: 'success', fallback: null };
+      }
+
+      health.circuit.recoverySuccesses = 0;
+      health.circuit.outageClass = homeProbe.errorCategory;
+      const probe = await this.independentRssProbe(probeChannel);
+      this.applyIndependentRssProbe(health, probe, channels.length);
+      const cooldown = Math.min(
+        Math.max(this.config.rssCircuitInitialCooldownMinutes ?? 15, Number(health.circuit.cooldownMinutes || 15) * 2),
+        this.config.rssCircuitMaximumCooldownMinutes ?? 60,
+      );
+      health.circuit.cooldownMinutes = cooldown;
+      health.circuit.until = iso(this.now() + cooldown * MINUTE_MS);
+      return { sourceMode: health.sourceMode, outcome: 'probe-failed', homeProbe: homeProbe.errorCategory, fallback: null };
+    }
+
+    const fallback = health.sourceMode === 'rss-global-down-api-fallback'
+      ? await this.runYoutubeFallback(env, health, channels, scheduledTime)
+      : null;
+    return { sourceMode: health.sourceMode, outcome: 'backoff', homeProbe: 'not-due', fallback };
+  }
+
+  async runRssCohort(env, target, scheduledTime) {
+    const active = await getKV(target, key.channelsActive()) || [];
+    const channels = [...new Set(active)].sort();
+    const state = await this.stateFile.read();
+    const health = normalizeRssHealthState(state.rssHealth, this.now());
+    const startedAt = this.now();
+    if (health.circuit.open) {
+      const circuit = await this.runOpenCircuitTick(env, channels, scheduledTime, health);
+      state.rssHealth = health;
+      state.currentSweep = null;
+      await this.stateFile.write(state);
+      return {
+        scheduledAt: iso(scheduledTime),
+        finishedAt: iso(this.now()),
+        durationMs: this.now() - startedAt,
+        activeCount: active.length,
+        uniqueActiveCount: channels.length,
+        duplicateActiveEntries: active.length - channels.length,
+        coveredCount: circuit.homeProbe === 'success' ? 1 : 0,
+        successCount: circuit.homeProbe === 'success' ? 1 : 0,
+        failureCount: circuit.outcome === 'probe-failed' ? 1 : 0,
+        retryCount: 0,
+        concurrency: 1,
+        sourceMode: health.sourceMode,
+        circuit,
+      };
+    }
+
+    const plan = rssCohortForMinute(channels, scheduledTime);
+    const planHash = crypto.createHash('sha256').update(stableJson(plan.order)).digest('hex');
+    if (health.currentCycle?.cycle !== plan.cycle || health.currentCycle?.planHash !== planHash) {
+      health.currentCycle = {
+        cycle: plan.cycle,
+        planHash,
+        channelCount: channels.length,
+        startedAt: iso(this.now()),
+        results: Array(channels.length).fill(null),
+      };
+    }
+    const cycle = health.currentCycle;
+    if (!Array.isArray(cycle.results) || cycle.results.length !== channels.length) {
+      cycle.results = Array(channels.length).fill(null);
+    }
+    state.currentSweep = {
+      id: `${plan.cycle}-${plan.slot}`,
+      status: 'running',
+      scheduledAt: iso(scheduledTime),
+      startedAt: iso(startedAt),
+      cycle: plan.cycle,
+      cohort: plan.slot,
+      channelCount: plan.channels.length,
+      completedCount: 0,
+    };
+    state.rssHealth = health;
+    await this.stateFile.write(state);
+
+    const results = [];
+    // RSS rollback mode is intentionally sequential so a fleet-wide failure
+    // cannot become a concentrated boundary burst.
+    for (const channelId of plan.channels) {
+      const orderIndex = plan.order.indexOf(channelId);
+      if (cycle.results[orderIndex]) {
+        results.push({ ...cycle.results[orderIndex], resumed: true });
+        continue;
+      }
+      const result = await this.pollRssChannelOnce(env, channelId);
+      health.requestCount++;
+      health.attemptCount++;
+      if (result.outcome === 'ok') health.lastGoodRssAt = iso(this.now());
+      const stored = result.outcome === 'ok'
+        ? { outcome: 'ok', attempts: 1 }
+        : { outcome: 'error', attempts: 1, errorCategory: result.errorCategory };
+      cycle.results[orderIndex] = stored;
+      results.push(stored);
+      const progress = await this.stateFile.read();
+      progress.rssHealth = health;
+      progress.currentSweep = {
+        ...progress.currentSweep,
+        completedCount: Number(progress.currentSweep?.completedCount || 0) + 1,
+      };
+      await this.stateFile.write(progress);
+    }
+
+    let circuitOpened = false;
+    const completed = cycle.results.filter(Boolean);
+    if (completed.length === channels.length && channels.length > 0) {
+      const outageClass = sameFleetOutage(completed, channels.length);
+      if (outageClass) {
+        await this.openRssCircuit(health, channels, outageClass, scheduledTime);
+        circuitOpened = true;
+      } else {
+        health.sourceMode = 'rss';
+      }
+    }
+    const finalState = await this.stateFile.read();
+    finalState.rssHealth = health;
+    await this.stateFile.write(finalState);
+    return {
+      id: `${plan.cycle}-${plan.slot}`,
+      scheduledAt: iso(scheduledTime),
+      startedAt: iso(startedAt),
+      finishedAt: iso(this.now()),
+      durationMs: this.now() - startedAt,
+      activeCount: active.length,
+      uniqueActiveCount: channels.length,
+      duplicateActiveEntries: active.length - channels.length,
+      cohort: plan.slot,
+      cohortCount: 5,
+      coveredCount: results.length,
+      successCount: results.filter((entry) => entry.outcome === 'ok').length,
+      failureCount: results.filter((entry) => entry.outcome === 'error').length,
+      retryCount: 0,
+      concurrency: 1,
+      sourceMode: health.sourceMode,
+      circuitOpened,
+      failureCategories: [...new Set(results.filter((entry) => entry.errorCategory).map((entry) => entry.errorCategory))],
+    };
   }
 
   async pollPostWithRetry(env, ctx, channelId) {
@@ -967,12 +1688,17 @@ export class HomeSchedulerRunner {
     const notificationQueue = [];
     const pendingNotifications = new Set();
     try {
-      const isSweepBoundary = forceSweep || Math.floor(scheduledTime / MINUTE_MS) % 5 === 0;
-      const shouldPrepare = this.config.mode === 'active' || isSweepBoundary;
+      // Minute ticks keep posts/aux work aligned. Video detection itself is
+      // batched and runs only on aligned five-minute boundaries.
+      const shouldPrepare = true;
       const seed = shouldPrepare ? await this.publication.prepare() : null;
       const target = new RecordingKv(this.publication.target(), journal);
       const env = this.createEnvironment(target, notifications, notificationQueue, pendingNotifications);
-      const sweep = isSweepBoundary ? await this.runRssSweep(env, target, scheduledTime) : null;
+      const sweep = this.config.videoSourceMode === 'youtube-api'
+        ? await this.runYoutubeDataApiCycle(env, target, scheduledTime, { force: forceSweep })
+        : forceSweep
+          ? await this.runRssSweep(env, target, scheduledTime)
+          : await this.runRssCohort(env, target, scheduledTime);
       const minuteJobs = await this.runMinuteJobs(env, target, scheduledTime, { forcePosts });
       let publication;
       let notificationPublication = null;
@@ -1065,7 +1791,7 @@ export class HomeSchedulerRunner {
   armNextMinute() {
     if (this.stopped || this.config.mode === 'standby') return;
     const now = this.now();
-    const next = Math.floor(now / MINUTE_MS) * MINUTE_MS + MINUTE_MS;
+    const { scheduledTime: next, runAt } = rssNextMinuteSchedule(now, this.remoteConfirmationDueAt);
     this.timer = setTimeout(() => {
       const activeTick = this.runTick(next)
         .catch((error) => this.handleScheduledTickError(error, next))
@@ -1078,7 +1804,7 @@ export class HomeSchedulerRunner {
         if (this.activeTick === activeTick) this.activeTick = null;
         this.armNextMinute();
       });
-    }, Math.max(1, next - now));
+    }, Math.max(1, runAt - now));
   }
 
   async run() {

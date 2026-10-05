@@ -41,6 +41,24 @@ test('reconciliation carries one leased identity through snapshot, activate, and
   assert.equal(calls[1].body.manifestHash, 'a'.repeat(64));
 });
 
+test('RSS probe client uses the dedicated signed read-only route', async () => {
+  const calls = [];
+  const client = new AuthorityClient({
+    baseUrl: 'https://api.example.test', secret: SECRET,
+    fetchImpl: async (url, init) => {
+      calls.push({ url, init });
+      return Response.json({ ok: true, outcome: 'success', probes: [] });
+    },
+  });
+  const channelId = 'UC0000000000000000000000';
+  const result = await client.probeRss(channelId);
+  assert.equal(result.outcome, 'success');
+  assert.equal(new URL(calls[0].url).pathname, authorityClientRoutes.rssProbe.path);
+  assert.equal(calls[0].init.headers['X-TubePulse-Authority-Operation'], 'authority-rss-probe');
+  assert.deepEqual(JSON.parse(calls[0].init.body), { activeChannelId: channelId });
+  assert.equal(JSON.stringify(calls).includes(SECRET), false);
+});
+
 test('authority client classifies retryable coordinator failures without leaking response content', async () => {
   const client = new AuthorityClient({
     baseUrl: 'https://api.example.test', secret: SECRET,

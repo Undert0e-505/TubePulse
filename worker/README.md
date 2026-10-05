@@ -4,9 +4,11 @@ This document describes the TubePulse backend: the HTTP API Worker, the active u
 
 The [self-host runtime](../self-host/README.md) executes these same source files through a local workerd-backed runtime with persistent KV. Its Preview and shadow profiles remain additive; the separately guarded unified Home authority is now the production scheduler and fresh feed authority.
 
-`tubepulse-api` retains the former one-device canary wrapper only for history and tests. Production instead routes every authenticated `GET /feed` to the unified Home store over `TUBEPULSE_HOME_VPC` while replication is current, with bounded Cloudflare-KV fallback. Successful app mutations remain Cloudflare-first and synchronously replicate exact deltas to Home. Home failures mark the authority stale and prevent local publication/notifications until a proven reconciliation.
+`tubepulse-api` retains the former one-device canary wrapper only for history and tests. Production routes every authenticated `GET /feed` to the unified Home store over `TUBEPULSE_HOME_VPC` while replication is current, with bounded Cloudflare-KV fallback. The seven authenticated app mutations are Home-first: the Worker holds the Durable Object global lease, Home runs the unchanged raw API handler against a buffered local KV view, and only a successful semantic response is committed locally. The Worker then durably coalesces the exact deltas in the coordinator's pending Cloudflare-backup queue without reading or writing Cloudflare KV on that request.
 
-`self-host/compose.authority.yaml` is the production successor to the earlier scheduler shadow. One local runtime/store combines signed all-device mutation ingress and scheduled work, publishes exact changed-key journals through a SQLite Durable Object coordinator, and serves all authenticated feeds over Workers VPC while current. It performs no periodic full pull. The coordinator caps scheduler backup publication at 650 writes/day and total coordinated writes at 950/day; deferred keys are coalesced, overlapping app keys are flushed before canonical mutations, and deferred batches do not send FCM. WebSub is acknowledged but suppressed while authority traffic owns detection. Production switched on 2026-10-04 after an exact 721-record seed; RSS0/1/2, posts, and aux deployments are retained but all five Cron Trigger lists are empty.
+`self-host/compose.authority.yaml` is the production successor to the earlier scheduler shadow. One local runtime/store combines signed all-device mutation execution and scheduled work, publishes exact changed-key journals through a SQLite Durable Object coordinator, and serves all authenticated feeds over Workers VPC while current. It performs no periodic full pull. The coordinator caps scheduler backup publication at 900 writes/day and total coordinated writes at 950/day, leaving a 50-write app reserve; deferred keys are coalesced and later drained by the existing publication path. App mutations no longer depend on Cloudflare KV read availability. Semantic `4xx`/`5xx` responses discard the buffered overlay, Home transport failures fail closed, and deferred scheduler batches still suppress FCM. WebSub is acknowledged but suppressed while authority traffic owns detection. Production switched on 2026-10-04 after an exact 721-record seed; RSS0/1/2, posts, and aux deployments are retained but all five Cron Trigger lists are empty.
+
+The current app-facing Worker deployment is version `fa626e36-e02d-4532-98e6-eb83ba6c22b3`. Deployment authentication is intentionally external to the repository.
 
 ---
 
@@ -16,27 +18,27 @@ Current production traffic keeps the existing app URL: `tubepulse-api` coordinat
 
 ```
                                                 ┌─────────────────────────────┐
-                                                │     YouTube RSS feed        │
-                                                │  (free, no auth, no quota)  │
+                                                │ YouTube Data API v3         │
+                                                │ channels/uploads/statistics │
                                                 └──────────────┬──────────────┘
-                                                               │ rotating poll
+                                                               │ batched poll
                                                                ▼
 ┌────────────┐     HTTPS     ┌────────────────────┐    fan-out    ┌────────────────────┐
 │ Android    │──────────────▶│ tubepulse-api      │◀──────────────│ Home authority     │
-│ app        │               │ (Cloudflare Worker)│               │ scheduled polling  │
-│            │◀── FCM push ──│                    │── FCM v1 API ─▶│ YouTube Data API   │
-└────────────┘               └────────┬───────────┘               │ (subscribe-time    │
-                                     │                           │  only, 1-2 units)  │
-                                     ▼                           └────────────────────┘
+│ app        │               │ (Cloudflare Worker)│               │ scheduler + KV     │
+│            │◀── FCM push ──│                    │               │ server-side keys   │
+└────────────┘               └────────┬───────────┘               └────────────────────┘
+                                     │
+                                     ▼
                             ┌─────────────────┐
                             │ Cloudflare KV   │
-                            │ (single ns)     │
+                            │ bounded backup  │
                             └─────────────────┘
                                        ▲
-                                       │ same KV
+                                       │ rollback only
                                        │
                             ┌──────────┴──────────┐
-                            │ rollback Workers    │
+                            │ scheduled Workers   │
                             │ (triggers disabled) │
                             └─────────────────────┘
 ```
@@ -51,64 +53,64 @@ Current production traffic keeps the existing app URL: `tubepulse-api` coordinat
 | `tubepulse-aux` | `worker/tubepulse-aux/` | Retained bounded nag/prewarn processing | No Cron Trigger; rollback cadence is one minute. |
 | `tubepulse-cron` | `worker/tubepulse-cron/` | Retired compatibility stub | Deliberate no-op with `triggers.crons = []`; do not deploy it as the active scheduler. |
 | `tubepulse-resolver` | `worker/archive/tubepulse-resolver/` | Historical standalone resolver worker | Archived for reference only; do not deploy unless deliberately restoring historical resolver behaviour. |
-| `TUBEPULSE_KV` | KV namespace `52e77ca9f5f6493e89d2478c8d3055ec` | All current backend persistent state | Shared by the API and all five scheduled workers. |
+| `TUBEPULSE_KV` | KV namespace `52e77ca9f5f6493e89d2478c8d3055ec` | Bounded canonical backup/fallback state | Shared by the API and five triggerless rollback Workers; Home is the current primary store. |
 
 > **Verified route:** on 2026-06-25, `GET /` at the app API URL returned `200 OK` with `{"status":"ok","version":"3.0.0","worker":"tubepulse-api","architecture":"channel-first"}`. The health `version` is an API worker label and appears stale or independent from the app release version `3.3.3`. `worker/tubepulse-api/wrangler.toml` has no explicit route setting and still contains a stale/incomplete "No HTTP routes" comment.
 
-The active workers share the **same KV namespace** so scheduled workers can update state that the API reads when serving `/feed`.
+The API Worker and retained rollback Workers share the **same KV namespace**. Current scheduled state is owned by Home and journaled into that namespace as a bounded backup; live authenticated feeds normally come from Home over VPC.
 
 ---
 
-## 2. Why split scheduled workers?
+## 2. Retained split scheduled Workers (rollback only)
 
-The scheduled workers have no `fetch()` handler. This is deliberate:
+The retained scheduled Workers have no `fetch()` handler. They are currently triggerless and exist only for an explicit stop-Home-first rollback:
 
 - **No public HTTP surface** — no attack surface, no auth concerns
-- **Free-tier CPU bounds** — each invocation performs one RSS/post channel or a bounded aux batch rather than one large combined scan.
-- **Independent deploy cadence** — RSS, posts, aux, and API changes can be deployed separately.
+- **Free-tier CPU bounds on rollback** — each invocation performs one RSS/post channel or a bounded aux batch rather than one large combined scan.
+- **Independent rollback deployment** — RSS, posts, aux, and API changes can be deployed separately.
 
-All scheduled workers use the same KV namespace, so they can write state that the API reads directly.
+If deliberately re-enabled after Home has stopped and drained, these Workers use the same Cloudflare KV namespace. They are not part of normal production scheduling.
 
 ---
 
-## 3. Scheduled workers
+## 3. Scheduled work
 
-The active entry points are `worker/tubepulse-rss-0/1/2/index.js`, `worker/tubepulse-posts/index.js`, and `worker/tubepulse-aux/index.js`. Shared runtime helpers live in `worker/tubepulse-cron/shared.mjs`; `worker/tubepulse-cron/index.js` itself is a retired no-op.
+The active scheduler runs in the unified Home authority and reuses shared runtime helpers from `worker/tubepulse-cron/shared.mjs` and the established notification path. The Cloudflare entry points `worker/tubepulse-rss-0/1/2/index.js`, `worker/tubepulse-posts/index.js`, and `worker/tubepulse-aux/index.js` are retained rollback wrappers; `worker/tubepulse-cron/index.js` is a retired no-op.
 
-**Current schedule ownership:** the three RSS, posts, and aux Workers have no live Cron Triggers. The unified Home authority checks every active video's RSS at five-minute boundaries, checks every eligible channel's community posts hourly, and runs bounded aux work each minute. The historical trigger cadences below remain rollback evidence, not current production ownership.
+**Current schedule ownership:** the three RSS, posts, and aux Workers have no live Cron Triggers. Every aligned five-minute cycle, the unified Home authority batches all active channel IDs through `channels.list` (at most 50 IDs/request), reconciles the uploads playlist only for migration/change/safety-due channels, and polls video statistics in batches. It checks eligible community posts hourly and runs bounded aux work each minute. RSS is not an automatic fallback.
 
 See [CONTRACTS.md](CONTRACTS.md) for the active worker contract/inventory reference before changing worker behavior.
 
-| Worker | Selection/work |
+| Current runtime | Selection/work |
 |---|---|
-| RSS 0/1/2 | Sort `channels:active`, choose the active shard count (one per five channels, up to three), then rotate one channel per shard using a monotonically advancing five-minute epoch tick. A durable known-video watermark prevents deletion/restoration notification cascades. |
-| Posts | Filter active channels through the optional allowlist and use minute-derived spacing to select one channel. First-poll seeding sends no notification. |
-| Aux | Drain one legacy upcoming bucket, process at most five `nag:active` entries, then check prewarns when no nag fired. |
+| Home video detector | Sort/de-duplicate `channels:active`; batch `channels.list` by 50; reconcile uploads playlists on baseline/change/six-hour safety due; batch metadata and statistics by 50. A durable known-video watermark prevents deletion/restoration notification cascades. |
+| Home posts | Filter active channels through the optional allowlist and poll eligible channels hourly. First-poll seeding sends no notification. |
+| Home aux | Drain one legacy upcoming bucket, process at most five `nag:active` entries, then check prewarns when no nag fired. |
 
-Each RSS handler passes `floor((scheduledTime ?? Date.now()) / 300000)` to the shared selector, so the selection index advances by one per five-minute trigger. Trigger and tick duration intentionally match; using raw epoch minutes would advance by five and could repeatedly visit only a subset of a shard when its length shared a factor with five. Rotation tests cover every active-channel count from 1 through 100. For live count `N`, the selector activates `S = min(3, max(1, ceil(N / 5)))` shards; stable round-robin assignment makes each rotation `5 minutes × shard length`, with average detection approximately half a rotation. Always read `channels:active` for the current value rather than relying on a historical count.
+The old RSS shard selector used `floor((scheduledTime ?? Date.now()) / 300000)` and remains tested for rollback. It is historical behavior, not the current production detector. Always read `channels:active` for the current fleet rather than relying on a historical count.
 
-### 3.1 RSS poll — the active new-video detection path
+### 3.1 YouTube Data API poll — the active new-video detection path
 
-Since WebSub hub shutdown, the RSS shards detect new videos by polling YouTube's public RSS feed:
+Since WebSub hub shutdown, Home detects videos through the structural Data API path:
 
 ```
-https://www.youtube.com/feeds/videos.xml?channel_id=UCxxxxxxxxxxxxxxxxxxxxxx
+channels.list(part=statistics,contentDetails&id=<up to 50 IDs>)
+  -> contentDetails.relatedPlaylists.uploads
+  -> playlistItems.list(maxResults=50)
+  -> videos.list metadata and videos:batchGetStats statistics (up to 50 IDs)
 ```
 
-Each entry in the Atom feed carries: `videoId`, `title`, `publishedAt`, `thumbnail`, `link`, **view count** (from `media:community/media:statistics/@_views`), **like count** (from `media:starRating/@_count`), and **dislike count** (from `media:statistics/@_dislikes`). Any count that YouTube omits or hides is stored as `null` (unknown), not as a synthetic zero. An explicit `"0"` remains a real public count.
+Playlist items provide structural upload identity and publication data. Batched video detail/statistics responses provide titles, thumbnails, duration/live status, views, likes, and comments as needed. Any count YouTube omits or hides is stored as `null` (unknown), not as a synthetic zero. An explicit `"0"` remains a real public count.
 
-**Flow for the selected channel:**
+**Flow for each five-minute cycle:**
 
-1. Read `channels:active` and select this shard's channel for the current five-minute epoch tick.
-2. For that channelId:
-   - GET the RSS feed (with `User-Agent` + `SOCS` cookie to bypass the EU/UK consent wall)
-   - Parse with a regex-based Atom parser (no XML library needed in the worker)
-   - Read `channel:{id}:recent` from KV
-   - Find videos in RSS that aren't in `recent` → new videos
-   - For new videos: write updated `channel:{id}:recent` and `channel:{id}:meta`, then look up subscribers and fan out FCM pushes
-3. Truncate `recent` to 15 entries
+1. Read, sort, and de-duplicate `channels:active`.
+2. Call `channels.list` in batches of at most 50 IDs. The current fleet fits in exactly two requests per cycle.
+3. Reconcile a channel's cached uploads playlist when its baseline is missing, public `videoCount` changed, or its staggered six-hour safety check is due. A one-time migration marker ensures capturing a count baseline cannot suppress catch-up.
+4. Compare playlist IDs against the durable known/high-watermark state, fetch missing detail in 50-ID batches, and pass results through the existing recent/scheduled/live/notification path. New channels seed silently; established channels retain their watermark.
+5. Poll due video metrics adaptively in 50-ID batches for only each channel's current app-visible top three, and persist canonical metric changes only under the existing 25%-or-24-hour throttle.
 
-**Quota cost: 0 YouTube Data API units.** RSS is a free public feed. Cloudflare KV writes occur for structural/recent-list changes, notification state changes, and engagement refreshes allowed by the persistence policy in §6.4.
+**Normal detector quota cost: 576 general units/day.** Two one-unit `channels.list` calls every five minutes yield `2 × 288 = 576`. A six-hour first-page safety sweep adds up to `active channels × 4` general units/day; changed-channel playlist/detail calls are event-driven. `videos:batchGetStats` uses the separately accounted statistics bucket. Request counters persist across restart, reset at Pacific midnight, and enforce reserves. There is no active RSS fallback.
 
 ### 3.2 FCM push from the cron
 
@@ -120,7 +122,7 @@ For each new video, the cron does the standard fan-out (which is identical to wh
    - Skip if muted via override, or if DND is active and the override doesn't bypass it
    - Sign a JWT using the Firebase service account, exchange for an OAuth token, POST to `fcm.googleapis.com/v1/projects/{projectId}/messages:send`
 3. Update `device:{id}:state:{channelId}` with the new `unwatched` list
-4. Nag scheduling is handled by the aux worker's timestamp-based bounded processor; RSS adds newly unread channel/device pairs to `nag:active`.
+4. Nag scheduling is handled by Home's timestamp-based bounded aux processor; the video detector adds newly unread channel/device pairs to `nag:active`.
 
 ---
 
@@ -136,14 +138,15 @@ For each new video, the cron does the standard fan-out (which is identical to wh
 |--------|------|------|---------|
 | `GET`  | `/` | none | Health check (inlined — verified live on 2026-06-25 as `{ status: 'ok', version: '3.0.0', worker: 'tubepulse-api', architecture: 'channel-first' }`). The `version` field is a worker health label and appears stale/independent from the app release version. |
 | `POST` | `/register` | Bearer | `handleRegister` — create/update device profile (FCM token optional). Two-phase deviceId migration for cross-version upgrades (see §11.1). |
-| `POST` | `/subscribe-channel` | Bearer | `handleSubscribeChannel` — add a channel, fetch its avatar via Data API (first-subscribe only), RSS bootstrap (zero quota) |
-| `POST` | `/unsubscribe` | Bearer | `handleUnsubscribe` — remove a channel, clean up subscriber list and active index, call `cleanupDeadChannel` if the device was the last subscriber |
+| `POST` | `/subscribe-channel` | Bearer | `handleSubscribeChannel` — add a channel, fetch cached metadata if needed, and bootstrap recent uploads through `channels.list` → uploads playlist → `playlistItems.list` |
+| `POST` | `/unsubscribe` | Bearer | `handleUnsubscribe` — remove a channel and subscriber state; the final subscriber removes it from `channels:active`, stops polling, cleans display caches, and retains the known-video watermark for safe resubscribe |
 | `POST` | `/seen` | Bearer | `handleSeen` — mark videos / posts as watched. `ids: [videoId, "post:activityId", ...]` for individual marks; `clearAll: true` for channel-tap (clears all videos and posts for that channel) |
 | `GET`  | `/feed` | Bearer | `handleFeed` — return recent videos + community posts for all subscribed channels, with per-device `unwatched` flags merged in |
 | `GET`  | `/resolve` | Bearer | `handleResolve` — `@handle` → channelId (Data API, cached 7 days in `handle:*`) |
-| `POST` | `/bootstrap` | Bearer | `handleBootstrap` — on-demand channel meta + recent videos refresh (RSS primary, Data API fallback for the rare unreachable-RSS case) |
+| `POST` | `/bootstrap` | Bearer | `handleBootstrap` — on-demand channel metadata + recent uploads refresh through the Data API structural path |
 | `POST` | `/settings` | Bearer | `handleSettings` — update device notification settings. Accepts `prewarnMinutes` and `includeCommunityPosts` (v3.1) |
 | `POST` | `/channel-override` | Bearer | `handleChannelOverride` — set per-channel override. Accepts `prewarnMinutes` and `includeCommunityPosts` (v3.1, tri-state null/value) |
+| `POST` | `/_tubepulse/authority/rss-probe` | Authority HMAC | Retained legacy read-only RSS diagnostic. It is not called by the active scheduler and cannot enable an automatic RSS fallback. |
 | `GET`  | `/websub` | none | `handleWebSubVerification` — WebSub handshake (dormant) |
 | `POST` | `/websub` | HMAC | `handleWebSubPush` — WebSub push delivery (dormant) |
 | `OPTIONS` | * | none | CORS preflight — allow any path |
@@ -152,15 +155,15 @@ For each new video, the cron does the standard fan-out (which is identical to wh
 
 ### 4.2 Bootstrap-on-subscribe (the most important code path)
 
-When a new device subscribes to a channel, the API worker does **the only work that uses the YouTube Data API at subscribe time**:
+When a new device subscribes to a channel, the authority uses the same structural Data API path as scheduled detection:
 
-1. **Resolve channel via Data API** (`channels.list?part=snippet&forHandle=...` or `forUsername=...`) — 1 quota unit, returns channelId + name + avatar URL in one call. Only runs if `meta` is missing.
-2. **Fetch recent videos via RSS** — 0 quota units, returns up to 15 videos with view counts, like counts, and dislike counts (from `media:community`, `media:starRating`, and `media:statistics`)
-3. Cache the channel meta + recent list in KV
+1. **Resolve channel via Data API** when a handle must be resolved (`channels.list?part=snippet&forHandle=...` or `forUsername=...`) — 1 general unit, cached for seven days.
+2. **Obtain the uploads playlist** with `channels.list(part=contentDetails,...)`, then fetch the newest playlist page with `playlistItems.list(maxResults=50)`.
+3. Fetch required video metadata/statistics in batches, then cache channel metadata and the recent list.
 4. Add the channel to `channels:active` (if this device is the first subscriber)
-5. Try a dormant WebSub subscription (no quota cost, just a POST that 404s — kept for future hub revival)
+5. Preserve dormant WebSub bookkeeping for compatibility; it does not own detection.
 
-**The YouTube Data API is called at most once per new channel** (the avatar resolve, on the very first subscribe for that channel). After that, RSS shard Workers refresh `channel:{id}:meta` and `channel:{id}:recent` at zero quota cost.
+**A brand-new channel seeds silently.** Its structural bootstrap may require a small number of one-unit general requests plus batched statistics; after that, the five-minute fleet detector and event-driven/safety reconciliation keep it current. Scheduled Home operation never falls back to RSS.
 
 ### 4.3 WebSub (dormant)
 
@@ -174,22 +177,22 @@ The WebSub handlers are intact but unused since 2024 (Google's hub was shut down
 
 | Key | Type | Contents | Written by | Read by |
 |-----|------|----------|------------|---------|
-| `channel:{channelId}:meta` | JSON | `{ name, avatarUrl, lastVideoId, addedAt }` | API (subscribe), Cron (new video) | API (feed, bootstrap) |
-| `channel:{channelId}:subscribers` | JSON array | `[deviceId, ...]` | API (subscribe, unsubscribe) | Cron (FCM fan-out), API (unsubscribe cleanup) |
+| `channel:{channelId}:meta` | JSON | `{ name, avatarUrl, lastVideoId, addedAt }` | API subscribe/bootstrap; Home repairs missing display metadata but does not rewrite solely for `lastVideoId` | API (feed, bootstrap) |
+| `channel:{channelId}:subscribers` | JSON array | `[deviceId, ...]` | API (subscribe, unsubscribe) | Home (FCM fan-out), API (unsubscribe cleanup) |
 | `channel:{channelId}:websub` | JSON | `{ leaseExpiresAt, hmacSecret, lastVerified }` | API (subscribe, dormant) | (none — never used) |
-| `channel:{channelId}:recent` | JSON array | `[{ videoId, title, publishedAt, thumbnail, type, link, views, likes, dislikes, viewsLastCheckedHour?, likesLastCheckedHour? }]` — metrics are decimal strings when known and `null` when hidden/unavailable; the two UTC-hour clocks independently gate view and likes/dislikes persistence | Cron (RSS poll) | API (feed, bootstrap), API (subscribe for first-time populate) |
-| `channel:{channelId}:recent:posts` | JSON array | `[{ activityId, kind, text, thumbnail, link, publishedAt }, ...]` — last 30 community posts (**v3.1**) | Cron (community posts) | API (feed) |
-| `channel:{channelId}:firstPollAt:posts` | string | ISO timestamp of the first posts-cron run for this channel — drives the first-run guard (**v3.1**) | Cron (community posts) | Cron (community posts) |
-| `device:{deviceId}:profile` | JSON | `{ fcmToken, platform, appVersion, createdAt, lastSeenAt }` | API (register) | API (any auth call), Cron (FCM fan-out) |
-| `device:{deviceId}:settings` | JSON | `{ mode, nagInterval, dndEnabled, dndStart, dndEnd, dndTimezone, dndBypass, tapAction, includeCommunityPosts (v3.1), prewarnMinutes (v3.1), ... }` | API (settings) | Cron (FCM fan-out filter) |
+| `channel:{channelId}:recent` | JSON array | `[{ videoId, title, publishedAt, thumbnail, type, link, views, likes, comments, dislikes, viewsLastCheckedHour?, likesLastCheckedHour? }]` — metrics are decimal strings when known and `null` when hidden/unavailable; persistence clocks gate canonical metric writes | Home Data API scheduler | API (feed, bootstrap), API (subscribe for first-time populate) |
+| `channel:{channelId}:recent:posts` | JSON array | `[{ activityId, kind, text, thumbnail, link, publishedAt, fetchedAt, likeCount, viewCount }, ...]`; engagement observations use the same 25%/hour-or-24-hour persistence throttle | Home posts sweep | API (feed) |
+| `channel:{channelId}:firstPollAt:posts` | string | ISO timestamp of the first posts sweep for this channel — drives the first-run guard (**v3.1**) | Home posts sweep | Home posts sweep |
+| `device:{deviceId}:profile` | JSON | `{ fcmToken, platform, appVersion, createdAt, lastSeenAt }` | API (register) | API (any auth call), Home (FCM fan-out) |
+| `device:{deviceId}:settings` | JSON | `{ mode, nagInterval, dndEnabled, dndStart, dndEnd, dndTimezone, dndBypass, tapAction, includeCommunityPosts (v3.1), prewarnMinutes (v3.1), ... }` | API (settings) | Home (FCM fan-out filter) |
 | `device:{deviceId}:channels` | JSON array | `[channelId, ...]` | API (subscribe, unsubscribe) | API (feed filter) |
-| `device:{deviceId}:override:{channelId}` | JSON | per-channel notification override. May include `mode?`, `nagInterval?`, `dndBypass?`, `muted?`, `includeCommunityPosts?` (**v3.1**, tri-state null/true/false), `prewarnMinutes?` (**v3.1**, tri-state null/number) | API (channel-override) | Cron (FCM fan-out filter) |
-| `device:{deviceId}:state:{channelId}` | JSON | `{ unwatched: [...], lastNagAt, nagCount }` — `unwatched` holds plain videoIds and `post:{activityId}` for community posts (**v3.1** shares the array via `post:` namespace). `lastNagAt` is a timestamp updated after each successful nag push. `nagCount` tracks the number of reminder nags sent (not counting the initial new-video push). Both are reset to `null`/`0` by `/seen` when `unwatched` becomes empty, so the next unread item starts a fresh nag cadence. | Cron (new video, nag fire) | Cron (nag fire, seen cleanup) |
-| `upcoming:events:list` | JSON array | `[{ channelId, videoId, scheduledFor, addedAt }, ...]` — currently-scheduled live events, pruned 24h after live (**v3.1**, replaces the pre-v3.1 `upcoming:{bucket}` scheme) | Cron (RSS poll) | Cron (prewarn cron) |
-| `upcoming:prewarn:{videoId}:{deviceId}` | number | `prewarnMinutes` value at send-time, sentinel for "prewarn sent for this (event, device)" (**v3.1**) | Cron (prewarn fire) | Cron (prewarn fire) |
-| `upcoming:{bucket}` | JSON array | pre-v3.1 scheduled-livestream entries | (legacy writes only) | Cron (`runUpcomingCron` drain-only) |
+| `device:{deviceId}:override:{channelId}` | JSON | per-channel notification override. May include `mode?`, `nagInterval?`, `dndBypass?`, `muted?`, `includeCommunityPosts?` (**v3.1**, tri-state null/true/false), `prewarnMinutes?` (**v3.1**, tri-state null/number) | API (channel-override) | Home (FCM fan-out filter) |
+| `device:{deviceId}:state:{channelId}` | JSON | `{ unwatched: [...], lastNagAt, nagCount }` — `unwatched` holds plain videoIds and `post:{activityId}` for community posts (**v3.1** shares the array via `post:` namespace). `lastNagAt` is a timestamp updated after each successful nag push. `nagCount` tracks the number of reminder nags sent (not counting the initial new-video push). Both are reset to `null`/`0` by `/seen` when `unwatched` becomes empty, so the next unread item starts a fresh nag cadence. | Home (new video, nag fire) | Home (nag fire, seen cleanup) |
+| `upcoming:events:list` | JSON array | `[{ channelId, videoId, scheduledFor, addedAt }, ...]` — currently-scheduled live events, pruned 24h after live (**v3.1**, replaces the pre-v3.1 `upcoming:{bucket}` scheme) | Home video detector | Home aux (prewarn) |
+| `upcoming:prewarn:{videoId}:{deviceId}` | number | `prewarnMinutes` value at send-time, sentinel for "prewarn sent for this (event, device)" (**v3.1**) | Home aux (prewarn fire) | Home aux (prewarn fire) |
+| `upcoming:{bucket}` | JSON array | pre-v3.1 scheduled-livestream entries | (legacy writes only) | Home aux (`runUpcomingCron` drain-only) |
 | `nag:{bucket}` | JSON array | **Legacy/unused** — pending nag entries from the old 15-min bucket system. No longer written by any code path. The timestamp-based `runNagCron` replaces this entirely. | (none — legacy) | (none) |
-| `channels:active` | JSON array | `[channelId, ...]` — index of channels with ≥1 subscriber | API (subscribe, unsubscribe) | Cron (RSS poll, community posts) |
+| `channels:active` | JSON array | `[channelId, ...]` — index of channels with ≥1 subscriber | API (subscribe, unsubscribe) | Home scheduler (Data API video detection, community posts) |
 | `handle:{lowercase}` | JSON | `{ channelId, cachedAt }` — 7-day TTL | API (resolve) | API (resolve) |
 | `fcm:lookup:{fcmToken}` | string | `deviceId` — reverse index from FCM token to the device that owns it | API (register) | API (register, migration) |
 
@@ -197,7 +200,7 @@ The WebSub handlers are intact but unused since 2024 (Google's hub was shut down
 
 **`fcm:lookup:*` is the deviceId-migration index.** When the same FCM token registers with a new `deviceId` (e.g. a v3.0.18 UUID-based install upgrades to v3.0.19's Android-ID-based install), the server uses this index to find the old device and migrate its state. See §11.1.
 
-**Key lifecycle (cleanup):** channel and device keys are deleted by two helpers, `cleanupDeadChannel()` and `cleanupDeadDevice()` — see §11. Channel keys (`meta`/`recent`/`websub` + the `channels:active` membership) are deleted when the last subscriber leaves or is detected as dead. Device keys (`profile`/`settings`/`channels`/`state:*`/`override:*`) are deleted only when the FCM token is reported dead. The API cleanup path deletes `fcm:lookup:*`; the cron cleanup path has known drift documented in [CONTRACTS.md](CONTRACTS.md).
+**Key lifecycle (cleanup):** channel and device keys are cleaned by two helpers, `cleanupDeadChannel()` and `cleanupDeadDevice()` — see §11. When the last subscriber leaves, the channel is removed from `channels:active`, polling stops, and display/subscriber/post caches are deleted; `channel:{id}:known:videos` is deliberately retained so resubscription cannot replay old uploads. Device keys (`profile`/`settings`/`channels`/`state:*`/`override:*`) are deleted only when the FCM token is reported dead. The API cleanup path deletes `fcm:lookup:*`; the cron cleanup path has known drift documented in [CONTRACTS.md](CONTRACTS.md).
 
 ---
 
@@ -309,7 +312,7 @@ All FCM pushes include an `android.notification.tag` for tray replacement:
 
 | Push type | Tag | Effect |
 |---|---|---|
-| New video (RSS poll) | `video-{videoId}` | Replaces any existing notification for the same video |
+| New video (Home Data API poll) | `video-{videoId}` | Replaces any existing notification for the same video |
 | Batch new videos | `tubepulse-batch` | Replaces previous batch notifications |
 | Single-video nag | `video-{videoId}` | Replaces the original notification (updates tray) |
 | Multi-video nag | `tubepulse-nag-{channelId}` | Replaces previous batch nags for that channel |
@@ -330,7 +333,7 @@ KV writes are the primary budget concern. The free tier allows 1,000 writes/day 
 
 ---
 
-## 6. Cost analysis (1 user, 4 channels)
+## 6. Current cost model
 
 ### 6.1 YouTube Data API (free tier: 10,000 units/day)
 
@@ -338,27 +341,32 @@ KV writes are the primary budget concern. The free tier allows 1,000 writes/day 
 |-----------|-------------|------|
 | `/resolve` (`channels.list?part=snippet&forHandle=...`) | 1 unit | Per unique handle, cached 7 days |
 | `handle:*` cache hit | 0 units | Subsequent lookups for the same handle |
-| Subscribe-time avatar fetch (in `/subscribe-channel`) | 1 unit | Per new channel added (one-time, cached forever in `channel:{id}:meta`) |
-| Cron tick — RSS-based video detection | **0 units** | RSS feed has no API key requirement |
-| Cron tick — community posts (`runCommunityPostsCron`, **v3.1**) | 0 units | InnerTube `youtubei/v1/browse` is free, no YouTube Data API quota cost |
-| **Total steady-state (4 channels)** | **~4 units/day** | 0 for community posts (InnerTube is free) + ~4 for occasional handle resolves. New-channel adds are one-time, ~2 units each. |
+| Home detector — `channels.list` | **576 general units/day** | Current fleet = 2 batched calls every 5 minutes = `2 × 288` |
+| Six-hour uploads safety sweep | **up to `active channels × 4` general units/day** | One first-page `playlistItems.list` per channel, four times/day; staggered and bounded |
+| Changed/migration uploads reconciliation | 1+ general units/channel/event | First playlist page, with pagination only until known overlap or the configured three-page bound |
+| New-video metadata | 1 general unit per 50 IDs | Event-driven `videos.list`; requested only where playlist data is insufficient |
+| Adaptive engagement metrics | 1 statistics unit per 50 IDs | `videos:batchGetStats`; only each channel's current top three are eligible, with the newest remaining frequent |
+| Community posts | 0 units | InnerTube `youtubei/v1/browse` is not a YouTube Data API request |
+| **Normal general baseline** | **576 + (`active channels × 4`) units/day plus events** | Detector plus bounded safety; comfortably below the configured 10,000-unit cap and reserve for the current fleet |
+
+Every request, including a failed request, is reserved in persisted Pacific-day accounting before it is issued. Detector work has priority; safety pagination, metadata, and old-video metrics are deferrable. Partial-response `fields` reduce payload, not quota units. RSS consumes no quota because it is not called by the active scheduler.
 
 ### 6.2 Cloudflare Workers (free tier: 100,000 requests/day, 10ms CPU per invocation)
 
 | Worker | Invocations/day | CPU per | Notes |
 |--------|-----------------|---------|-------|
-| RSS shard workers | One invocation/worker/five minutes | Bounded | One RSS channel per active shard per invocation |
-| Posts/aux scheduled workers | One invocation/worker/minute | Bounded | One post channel or bounded aux batch per invocation |
+| Home authority | One minute timer; video work on aligned five-minute boundaries | Bounded | Active video, posts, aux, mutation, and feed authority |
+| RSS/posts/aux scheduled Workers | **0** | N/A | Cron Triggers disabled; rollback only |
 | `tubepulse-api` (HTTP) | ~20-50 | ~5ms | Depends on app open frequency and action count |
 
 ### 6.3 Cloudflare KV (free tier: 100K reads, 1K writes, 1K list, 1GB storage)
 
-**Reads per day (1 user, 4 channels):**
-- Scheduled workers: each RSS tick reads `channels:active` and one selected channel; posts reads the active set and one selected channel; aux performs a bounded nag/prewarn batch. Exact reads depend on subscriptions and due work.
+**Reads per day depend on fleet and app use:**
+- Home scheduled work reads persistent local KV. It does not perform routine Cloudflare KV reads.
 - API (per app open): 4 `channel:{id}:*` reads × 4 channels = 16 reads × 20 opens = **320 reads/day**
-- **Total: ~2,400 reads/day = 2.4% of free tier**
+- Production app mutations execute Home-first; successful changed keys are later coalesced into the bounded Cloudflare backup journal.
 
-**Writes are workload-dependent.** New uploads, notification state, app activity, subscription changes, cleanup, posts, aux work, and RSS cache updates all share the namespace. Any daily total is therefore a projection until measured in Cloudflare analytics.
+**Writes are workload-dependent.** New uploads, notification state, app activity, subscription changes, cleanup, posts, aux work, and throttled metric changes share the backup namespace. The coordinator caps scheduler publication at 900 writes/day and total coordinated publication at 950/day, leaving a 50-write app reserve; deferred keys coalesce. Any source-specific daily total remains a projection until measured.
 
 Predeployment evidence supplied from Cloudflare adaptive analytics on 2026-09-20 (approximate and potentially delayed):
 
@@ -369,7 +377,7 @@ Predeployment evidence supplied from Cloudflare adaptive analytics on 2026-09-20
 
 Those observations motivated the persistence-code fix below. They are not measurements of the corrected code; the initial postdeployment observation is recorded in §6.5. Namespace totals also include API, posts, and aux writes.
 
-**Cron `KV.list()` calls: 0 in the current code.** The `channels:active` index replaces cron-side namespace scans. The API `/register` path intentionally uses `KV.list({ prefix: 'device:' })` for FCM-token migration; see [CONTRACTS.md](CONTRACTS.md).
+**Scheduled `KV.list()` calls: 0 in the current code.** The `channels:active` index replaces scheduler-side namespace scans. The API `/register` path intentionally uses `KV.list({ prefix: 'device:' })` for FCM-token migration; see [CONTRACTS.md](CONTRACTS.md).
 
 **Deletes per day (cleanup):** dead-device cleanup is event-driven, not scheduled — it only fires when FCM reports a token as `UNREGISTERED`. Steady-state cost is ~0 deletes/day. A single cleanup of a device subscribed to N channels costs roughly `1 + 5N + 3N` KV ops (1 read of `device:{id}:channels` + N reads + N writes of subscriber lists + 3 + 2N deletes). In practice this is one user uninstalling every few months, well under free tier. See §11.
 
@@ -379,16 +387,16 @@ The 25% rule was ineffective in the predeployment shard code. After conditionall
 
 Current policy (updated 2026-09-20):
 
-- Existing cached videos preserve `views`, `likes`, and `dislikes`; older-video metric movement alone does not change the persisted array.
-- Only the latest existing video is eligible for a metric refresh.
+- Existing cached videos preserve `views`, `likes`, and `dislikes`; videos below the app-visible top three do not receive further metric observations or persistence-clock state.
+- The current top three existing videos are eligible for a metric refresh. A deletion/private transition promotes the new third item immediately without changing durable known-video dedupe history.
 - Views use `viewsLastCheckedHour`; likes/dislikes use `likesLastCheckedHour` as an independent group clock.
 - Each group can refresh at most once per UTC hour and only when a metric changes by **strictly more than 25%**, or when that group has not been persisted for at least 24 hours.
-- New entries seed current RSS metrics and both clocks. Missing or hidden metrics remain `null`; explicit zero remains zero. Missing legacy clocks are migrated with one refresh. Older synthetic zeros are also repaired once from the current RSS value even if an earlier worker already assigned them a clock; normal threshold gating resumes immediately afterward.
-- Current RSS order, structural edits, additions/restorations, and removals are still persisted.
+- New entries seed current API metrics and both clocks. Missing or hidden metrics remain `null`; explicit zero remains zero. Missing legacy clocks are migrated with one refresh. Older synthetic zeros are also repaired once from the current API value even if an earlier worker already assigned them a clock; normal threshold gating resumes immediately afterward.
+- Current uploads-playlist order, structural edits, additions/restorations, and removals are still persisted.
 
-The policy is expected to reduce RSS-driven writes, but the shared-namespace observation below cannot attribute changes to RSS alone and is not a guaranteed daily write count.
+Community-post engagement uses the same strict greater-than-25%, once-per-UTC-hour, or 24-hour forced refresh policy, with `fetchedAt` as its persisted observation clock. Missing metrics hydrate once; rotating thumbnail signatures and stable relative-time churn remain no-ops. The policy reduces metric-driven writes regardless of discovery source. The dated shared-namespace observation below is historical RSS-era evidence and is not a guaranteed daily write count.
 
-### 6.5 Production deployment and observation (2026-09-20)
+### 6.5 Historical RSS deployment observation (2026-09-20)
 
 The corrected RSS workers were deployed individually:
 
@@ -400,7 +408,7 @@ The corrected RSS workers were deployed individually:
 
 All three live schedules were verified as exactly `*/5 * * * *`. From `2026-09-20T16:20:14Z` through `2026-09-20T16:55:14Z`, eight consecutive ticks produced 24/24 successful scheduled `CronEvent`s (8 per worker) with zero scheduled/runtime errors, RSS HTTP errors, fetch errors, FCM errors, or error-level console messages.
 
-The run covered 19/19 active channel IDs. Shards contained 7/6/6 channels, every selection matched the five-minute tick calculation, and each shard visited every member before wrapping: shard 0 wrapped on tick 8, while shards 1 and 2 wrapped on ticks 7 and 8. There was no starvation or unexpected within-cycle duplicate.
+The run covered the complete active test set. Every selection matched the five-minute tick calculation, and each shard visited every member before wrapping. There was no starvation or unexpected within-cycle duplicate.
 
 RSS 0 and RSS 1 each produced normal poll output on 8/8 ticks; RSS 2 did so on 6/8. Its other two selections were both `UCvhToxTqKbs0iUgM6MYjTGw`, whose public RSS request returned HTTP 200 and valid feed metadata but zero `<entry>` elements, so both post-fetch early returns were expected. Separately, external monitoring sent one non-cron `workers.dev` `FetchEvent` probe to each scheduled-only worker. Those three probes returned the expected HTTP 500 because these workers intentionally export no `fetch()` handler; they are not scheduled-worker failures and are excluded from the cron health totals.
 
@@ -408,7 +416,7 @@ Cloudflare adaptive analytics for the shared KV namespace reported this adjacent
 
 No API, posts, aux, or retired `tubepulse-cron` worker was deployed during this change. Production KV was not mutated to manufacture traffic, and no test notification push was sent.
 
-### 6.6 One-minute RSS cadence restoration (2026-09-21)
+### 6.6 Historical one-minute RSS cadence restoration (2026-09-21)
 
 After confirming that the corrected 25% merge/persistence policy materially reduced write churn at the temporary five-minute cadence, all three RSS schedules were restored to `* * * * *`. The handler selection tick was changed with the trigger to `floor((scheduledTime ?? Date.now()) / 60000)`, so each shard advances exactly one position per invocation instead of selecting the same channel repeatedly. The threshold, once-per-hour group limits, 24-hour refresh, and independent view versus likes/dislikes clocks described in §6.4 were not changed.
 
@@ -426,11 +434,11 @@ Cloudflare's trigger read API immediately reported exactly one `* * * * *` sched
 
 From `2026-09-21T07:20:36Z` through `2026-09-21T07:24:36Z`, five consecutive aligned ticks produced **15/15 successful scheduled `CronEvent`s** (five per worker). Every event explicitly reported `cron: "* * * * *"`, ran the expected 100%-active version, selected the next channel in its shard, and completed with outcome `ok`, zero exceptions, zero error-level logs, and no RSS/FCM warnings. No channel repeated within any shard's five-tick observation window.
 
-During pre-propagation legacy-cadence ticks, six transient feed warnings were observed: five RSS HTTP 404 responses and one HTTP 500 across six channel selections. Those invocations still completed with outcome `ok`; three of the affected channels were subsequently fetched normally during the qualifying one-minute window. The warnings are retained here separately from the clean post-propagation validation and did not prompt any subscription or KV mutation.
+During pre-propagation legacy-cadence ticks, several transient RSS HTTP warnings were observed across channel selections. Those invocations still completed with outcome `ok`, and affected channels were subsequently fetched normally during the qualifying window. The warnings are retained here separately from the clean post-propagation validation and did not prompt any subscription or KV mutation.
 
 No API, posts, aux, or retired `tubepulse-cron` worker was deployed. Production KV was not edited, YouTube/FCM traffic was not triggered manually, and the later scheduled review remains the checkpoint for comparing the new write rate and deciding whether to commit or push.
 
-### 6.7 Five-minute RSS cadence restoration (2026-10-03)
+### 6.7 Historical five-minute RSS cadence restoration (2026-10-03)
 
 After the one-minute cadence was measured against a much larger active-channel set, only the three RSS schedules were returned to `*/5 * * * *`. The handler clock changed with each trigger to `floor((scheduledTime ?? Date.now()) / 300000)`, ensuring that one shard position advances per real invocation rather than skipping positions when a shard length shares a factor with five. Posts and aux remain at `* * * * *`; API and the retired combined cron remain unscheduled. The 25% metric threshold, independent view and like/dislike clocks, 24-hour forced refresh, semantic-change guard, notification behavior, and KV schema were not changed.
 
@@ -442,7 +450,7 @@ After the one-minute cadence was measured against a much larger active-channel s
 
 Cloudflare's schedule API reported exactly one `*/5 * * * *` trigger for each RSS shard, exactly one `* * * * *` trigger for posts and aux, and no triggers for API or the retired combined cron. During propagation, the new RSS versions briefly received the previous one-minute event metadata; those transitional events were excluded from cadence qualification. From `2026-10-03T18:05:57Z` through `18:10:57Z`, two consecutive aligned ticks produced **6/6 successful scheduled events**. Every event reported `cron: "*/5 * * * *"`, ran the intended 100%-active version, selected a channel, completed with outcome `ok`, and contained zero exceptions and no warning/error-level logs. Each shard selected a different channel on the second tick, demonstrating that the coupled five-minute selector advanced normally.
 
-The assessment baseline had 71 active channels (24/24/23, rotations of 120/120/115 minutes), and the deployment-time read found 74 (25/25/24, 125/125/120 minutes). A later read-only check on 2026-10-04 found **82 unique active channels**, producing **28/27/27** and a maximum **140-minute** rotation (approximately **70 minutes average** for the largest shard). These are time-stamped observations; calculate future latency from the current `channels:active` value using the formula in §3. The predeployment estimate of about **500 shared-KV writes/day typically, with a broad 300–750 range**, is a projection rather than a measured post-change outcome; the larger active set and other writers in the shared namespace add uncertainty. API/onboarding writes are independent of this RSS cadence and can still cause a high-write day. A full-day observation is required before treating the reduction as measured.
+Historical RSS assessments observed changing fleet sizes and correspondingly changing shard rotations. Those time-stamped inventory counts are intentionally omitted; calculate any rollback latency from the live `channels:active` value using the formula in §3. The predeployment write estimate was a projection rather than a measured post-change outcome, and the larger active set plus other writers in the shared namespace add uncertainty. API/onboarding writes are independent of scheduler cadence and can still cause a high-write day. A full-day observation is required before treating the current reduction as measured.
 
 No API, posts, aux, or retired cron worker was deployed, and production KV was not modified to manufacture traffic. The repository change remains uncommitted pending post-change measurement.
 
@@ -495,7 +503,9 @@ The local miniflare has its own KV simulator. The state is cached in `worker/*/.
 
 **Secrets permissions:** the `secrets/` directory contains live credentials. The whole directory is gitignored (see `.gitignore` line 23), so perms are not enforced by git. After copying or creating the files, run `chmod 600 secrets/*.env secrets/*.json` and `chmod 700 secrets/*.sh` to make them private to your user. On Windows-native or NTFS-mounted filesystems (e.g. `/mnt/d/...` in WSL) the POSIX mode bits are ignored — security is then controlled by Windows ACLs.
 
-### 8.2 Deploying to production
+### 8.2 Deploying rollback Workers
+
+The active scheduler is the Home authority and is deployed with `self-host/compose.authority.yaml`. The following loop only updates the triggerless Cloudflare rollback artifacts; it does not make them active and must not be paired with Cron Triggers while Home owns scheduling.
 
 ```bash
 source secrets/load-secrets.sh
@@ -504,7 +514,7 @@ for worker in tubepulse-rss-0 tubepulse-rss-1 tubepulse-rss-2 tubepulse-posts tu
 done
 ```
 
-Deploy only affected workers during ordinary changes. The loop is the full scheduled-worker rollout. Each `triggers.crons` entry controls that worker's schedule; `tubepulse-cron` deliberately has none.
+Deploy only affected rollback Workers when deliberately maintaining that path. All five production Cron Trigger lists remain empty; `tubepulse-cron` deliberately has none.
 
 ### 8.3 Pushing secrets to a worker
 
@@ -517,7 +527,7 @@ Deploy only affected workers during ordinary changes. The loop is the full sched
 ./secrets/set-worker-secrets.sh tubepulse-aux
 ```
 
-This pushes the secrets required by each worker via `wrangler secret put`. The API uses `YOUTUBE_API_KEY` and Firebase credentials; RSS, posts, and aux require Firebase credentials for notification paths.
+This pushes secrets via `wrangler secret put` for the public API and retained rollback Workers. Active discovery and notification credentials live only in Home's mounted secret files; do not copy the Home Data API key into unnecessary Workers.
 
 ### 8.4 Tailing live logs
 
@@ -528,7 +538,7 @@ npx wrangler tail tubepulse-posts
 npx wrangler tail tubepulse-aux
 ```
 
-Live-streamed logs from the deployed worker. Useful for watching a cron tick fire or debugging an FCM error.
+Live-streamed logs from a deployed rollback Worker. With Cron Triggers disabled, no scheduled events are expected in normal production.
 
 ---
 
@@ -543,9 +553,9 @@ Live-streamed logs from the deployed worker. Useful for watching a cron tick fir
 
 ### Adding a new scheduled job
 
-1. Add the bounded job to the appropriate RSS, posts, or aux worker; keep the retired `tubepulse-cron/index.js` unchanged.
-2. Update that worker's `scheduled()` handler and focused tests.
-3. Run `npm run check:workers`, deploy only that worker, then verify a Cron Event or bounded live tail.
+1. Add active work to the Home scheduler while reusing the established shared helper/notification path; keep the retired `tubepulse-cron/index.js` unchanged.
+2. Update the appropriate Home/shared handler and focused tests. Change a retained RSS/posts/aux wrapper only when rollback parity requires it.
+3. Run `npm run check:workers` and `npm run check:self-host`; deploy Home through the documented authority flow and verify scheduler status without enabling Cloudflare Cron Triggers.
 
 ### Rotating the FCM service account
 
@@ -587,11 +597,11 @@ worker/
 ├── archive/
 │   └── tubepulse-resolver/    ← legacy resolver worker archive; reference only
 ├── tubepulse-api/             ← app-facing HTTP worker
-├── tubepulse-rss-0/           ← active RSS shard 0
-├── tubepulse-rss-1/           ← active RSS shard 1
-├── tubepulse-rss-2/           ← active RSS shard 2
-├── tubepulse-posts/           ← active community-post worker
-├── tubepulse-aux/             ← active nag/prewarn worker
+├── tubepulse-rss-0/           ← triggerless rollback RSS shard 0
+├── tubepulse-rss-1/           ← triggerless rollback RSS shard 1
+├── tubepulse-rss-2/           ← triggerless rollback RSS shard 2
+├── tubepulse-posts/           ← triggerless rollback post wrapper
+├── tubepulse-aux/             ← triggerless rollback aux wrapper
 └── tubepulse-cron/
     ├── index.js               ← retired no-op entrypoint
     ├── shared.mjs             ← shared scheduled-worker helpers
@@ -696,5 +706,5 @@ The scan is one `kv.list` per `register` call, costing ~1 KV op per app launch. 
 
 **What survives the migration:** the new device's `profile.fcmToken`, `profile.platform`, `profile.appVersion`, `profile.createdAt`, `profile.lastSeenAt`. Migration does NOT copy the old profile — only the channels, settings, and per-channel state. The new device is the canonical install going forward.
 
-**Verified end-to-end** during the v3.0.19 development cycle: two stale device profiles (`974444b4-...`, `5ffc51a1-...`) from the v3.0.18 duplicate-UUID race, both pointing to the same FCM token, were merged into a single new `android:*` device in a single `register` call. All 4 channels survived. The scan-based migration found both old devices and the lookup-based migration found the most recently registered one — they cooperated correctly.
+**Verified end-to-end** during the v3.0.19 development cycle: stale device profiles from the duplicate-UUID race, both pointing to the same FCM token, were merged into a single new `android:*` device in one `register` call. All subscriptions survived. The scan-based migration and lookup-based migration cooperated correctly.
 

@@ -34,6 +34,38 @@ test('Home scheduler defaults to fail-closed shadow mode', () => {
   assert.equal(config.remoteWriteEnabled, false);
   assert.equal(config.notificationsEnabled, false);
   assert.equal(config.workerBindings.TUBEPULSE_NOTIFICATION_MODE, 'shadow');
+  assert.equal(config.rssChannelTimeoutMs, 3_000);
+  assert.equal(config.youtubeApiFallback.enabled, false);
+});
+
+test('YouTube API fallback is key-gated and can be explicitly disabled or capped', () => {
+  const enabled = readHomeSchedulerConfig({
+    ...readEnv,
+    YOUTUBE_API_KEY: 'synthetic-key',
+    TUBEPULSE_HOME_SCHEDULER_YOUTUBE_FALLBACK_DAILY_CAP: '321',
+  });
+  assert.equal(enabled.youtubeApiFallback.configured, true);
+  assert.equal(enabled.youtubeApiFallback.enabled, true);
+  assert.equal(enabled.youtubeApiFallback.dailyCap, 321);
+  const disabled = readHomeSchedulerConfig({
+    ...readEnv,
+    YOUTUBE_API_KEY: 'synthetic-key',
+    TUBEPULSE_HOME_SCHEDULER_YOUTUBE_API_FALLBACK_ENABLED: 'false',
+  });
+  assert.equal(disabled.youtubeApiFallback.configured, true);
+  assert.equal(disabled.youtubeApiFallback.enabled, false);
+});
+
+test('RSS circuit tuning preserves exponential backoff and two-success anti-flap minimums', () => {
+  assert.throws(() => readHomeSchedulerConfig({
+    ...readEnv,
+    TUBEPULSE_HOME_SCHEDULER_RSS_CIRCUIT_INITIAL_COOLDOWN_MINUTES: '30',
+    TUBEPULSE_HOME_SCHEDULER_RSS_CIRCUIT_MAXIMUM_COOLDOWN_MINUTES: '15',
+  }), /maximum cooldown/);
+  assert.throws(() => readHomeSchedulerConfig({
+    ...readEnv,
+    TUBEPULSE_HOME_SCHEDULER_RSS_RECOVERY_SUCCESSES: '1',
+  }), /at least two consecutive successes/);
 });
 
 test('shadow and standby reject notification or write enablement', () => {
@@ -55,6 +87,7 @@ test('active mode requires every independent activation guard', () => {
     TUBEPULSE_HOME_SCHEDULER_REMOTE_WRITE_ENABLED: 'true',
     TUBEPULSE_HOME_SCHEDULER_NOTIFICATIONS_ENABLED: 'true',
     FIREBASE_SERVICE_ACCOUNT: '{"project_id":"test"}',
+    YOUTUBE_API_KEY: 'synthetic-key',
   };
   assert.throws(() => readHomeSchedulerConfig(base), /scheduled triggers are disabled/);
   assert.throws(
@@ -85,6 +118,7 @@ test('active notification delivery requires a local admin pull and HTTPS product
     TUBEPULSE_CLOUDFLARE_SCHEDULES_CONFIRMED_DISABLED: 'true',
     TUBEPULSE_HOME_SCHEDULER_ACTIVATION_LATCH: ACTIVE_LATCH,
     FIREBASE_SERVICE_ACCOUNT: '{"project_id":"test"}',
+    YOUTUBE_API_KEY: 'synthetic-key',
   };
   assert.throws(() => readHomeSchedulerConfig(base), /production API visibility barrier/);
   assert.throws(() => readHomeSchedulerConfig({

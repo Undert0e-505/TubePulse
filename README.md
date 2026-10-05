@@ -57,7 +57,7 @@ YouTube's in-app notifications can be inconsistent, especially for community pos
 | Push notifications | Firebase Cloud Messaging (FCM) via HTTP v1 API |
 | Backend | Cloudflare public API plus the self-host/Home runtime |
 | Storage | Persistent local KV with changed-key Cloudflare KV backup |
-| Video detection | YouTube RSS polling of every active channel every five minutes (zero Data API quota) |
+| Video detection | Batched YouTube Data API channel detection every five minutes, uploads-playlist reconciliation, and adaptive batched statistics |
 | Community post detection | InnerTube polling of every eligible channel hourly |
 | Widgets | react-native-android-widget |
 | Auth | Persistent device UUID (Bearer token, independent of FCM token rotation) |
@@ -79,7 +79,7 @@ YouTube's in-app notifications can be inconsistent, especially for community pos
 
 The additive [`self-host/`](self-host/) package runs the existing API and scheduled Worker modules through a workerd-backed local runtime. It supports standalone operation, persistent local KV, explicit Cloudflare reconciliation, and Docker/Windows operation. A debug-signed `TubePulse Preview` APK can be installed beside the main app, selects a health-tested Home URL at runtime, and never falls back to production. Its documented pilot Compose profile uses an isolated `data-pilot` directory and hard-disables Cloudflare sync/write behavior. A private Workers VPC canary was exercised on 2026-10-04 without a public Home hostname or inbound router port, then disabled after its full five-minute mirror was shown to consume about 233,000 KV reads/day at 811 records.
 
-Production switched to the **unified Home authority** on 2026-10-04: one process/store owns signed all-device mutation replication and the consolidated scheduler, polls every active channel's RSS every five minutes, polls community posts hourly, and runs aux work each minute. The unchanged public Worker URL serves every authenticated `/feed` from this local store over Workers VPC when the authority is current, with bounded Cloudflare-KV fallback. Home publishes only changed keys to Cloudflare backup storage; a coordinator caps scheduler backup writes at 650/day and total coordinated writes at 950/day, leaving 300 writes of app-mutation headroom. Deferred backup changes are coalesced, overlapping app keys are flushed before a Cloudflare-first mutation runs, and notification intents are suppressed while their backup publication is deferred. No periodic namespace pull runs after the one-time signed snapshot. The three RSS, posts, and aux Cloudflare Cron Triggers are disabled; their Worker deployments are retained for rollback.
+Production switched to the **unified Home authority** on 2026-10-04: one process/store owns signed all-device mutation execution and the consolidated scheduler, polls community posts hourly, and runs aux work each minute. On 2026-10-05 video detection moved to the YouTube Data API: every aligned five-minute cycle batches active channels into the two `channels.list` requests required by the current fleet, then reconciles uploads playlists only for migration/change/safety-due channels and batches video statistics. The unchanged public Worker URL serves every authenticated `/feed` from this local store over Workers VPC when the authority is current, with bounded Cloudflare-KV fallback. Authenticated app mutations also run on Home through the signed VPC ingress while a Durable Object provides global ordering. Successful exact deltas are durably coalesced for later Cloudflare-KV backup, so `/seen` and the other app writes do not consume or depend on Cloudflare KV reads/writes at request time. Home publishes only changed keys to Cloudflare backup storage; the coordinator caps scheduler backup writes at 900/day and total coordinated writes at 950/day, reserving 50 writes for app mutations. Deferred backup changes are coalesced, and notification intents are suppressed while their backup publication is deferred. No periodic namespace pull runs after the one-time signed snapshot. The RSS, posts, and aux Cloudflare Cron Triggers are disabled; their Worker deployments are retained for rollback. There is no automatic RSS fallback.
 
 Start with the [self-host guide](self-host/README.md) for its preview limitations, five-minute setup, synchronization safety model, Cloudflare Tunnel guidance, backups, and recovery procedure.
 
@@ -115,23 +115,23 @@ v3.3.1 fixes widget/HomeScreen feed parity so the widget uses the same latest vi
 > **Note:** Each device registers independently. There's no cross-device sync — if you install TubePulse on two phones, each manages its own channel list and settings.
 
 ### ⚡ New-Video Detection
-TubePulse detects new uploads via **three rotating YouTube RSS shard Workers** scheduled every five minutes. Originally it used **WebSub** (PubSubHubbub) for push-style detection, but Google's `pubsubhubbub.appspot.com` hub was shut down in 2024, and the v3.0.18 build abandoned the YouTube Data API poller because RSS provides the same data at zero quota cost.
+TubePulse detects new uploads through the YouTube Data API from the production Home authority. The old RSS shard deployments remain triggerless rollback assets and are not an automatic fallback. Originally TubePulse used **WebSub** (PubSubHubbub), but Google's `pubsubhubbub.appspot.com` hub was shut down in 2024.
 
-**Active path (since v3.0.18):**
-- **RSS-based polling** — active shards rotate over `channels:active`, polling one channel per shard every five minutes using a five-minute epoch tick
-- **Zero YouTube Data API quota cost** — RSS is a free public feed
-- **Latency** — up to one shard rotation. Derive the live value from `channels:active`: for `N` active channels, `S = min(3, max(1, ceil(N / 5)))` shards are active; each channel's worst-case revisit interval is `5 minutes × the size of its round-robin shard`, and average detection is approximately half that interval. Because subscriptions change, operational status—not a hard-coded README count—is the source for current latency.
-- **Includes view counts, likes & dislikes** — RSS carries `media:statistics/@_views`, `media:starRating/@_count` (likes), and `media:statistics/@_dislikes` (usually `0` since YouTube removed public dislike counts in Nov 2021, but the field is still captured)
-- **The YouTube Data API is reserved for subscribe-time only** — handle→channelId resolve (1 unit, cached 7 days) and avatar fetch (1 unit per new channel, cached forever). Community-post polling uses InnerTube rather than Data API quota.
+**Active path:**
+- **Two batched channel checks every five minutes** — `channels.list` accepts at most 50 IDs per request; the current fleet therefore costs 576 general quota units/day for detection.
+- **Structural discovery** — only channels with a changed public `videoCount` need `playlistItems.list`; a six-hour bounded safety pass catches count-neutral changes. `search.list` is not used.
+- **Batched engagement metrics** — `videos:batchGetStats` supplies views, likes, and comments for up to 50 videos per request from its separate statistics bucket. Only each channel's app-visible top three are eligible; polling backs off as those videos age or stay static.
+- **Latency** — normally at most one five-minute Home cycle plus request time. Last-good feed data remains available during transient API failures.
+- **Quota guarded** — request counters persist across restart, reset at Pacific midnight, and retain configured reserves below the 10,000-unit daily limits.
 
 **WebSub (dormant):** the `/websub` endpoints and handler code remain in the workers for:
 - Manual testing
 - Future YouTube-compatible hub revival
 - Self-hosted hub integration
 
-When a new video is detected, the RSS shard pushes it to all eligible devices via FCM. Detection latency is bounded by a shard's channel rotation. Dormant WebSub state remains for a future compatible hub; the last device to remove a channel triggers an unsubscribe.
+When a new video is detected, Home publishes the canonical feed state and then pushes it to eligible devices through FCM after the public-feed visibility barrier passes. Dormant WebSub state remains for compatibility. When the final subscriber removes a channel, it leaves `channels:active` immediately so polling stops; one-off backup cleanup is published while the durable known-video watermark is retained for a safe future resubscribe.
 
-**Scheduled event detection (v3.1):** RSS entries with a future `publishedAt` are treated as scheduled livestreams/premieres:
+**Scheduled event detection (v3.1):** Data API video metadata with a future scheduled start is treated as a scheduled livestream/premiere. The actual upload publication time remains separate from the scheduled start so a future event cannot advance the new-video watermark:
 - Stored silently when detected — no immediate notification
 - **Prewarn push** fired at the user's chosen offset (default 1h, options 15m–1d) before the scheduled start. Body shows the actual remaining time so the user sees accurate information even if the cron is a few minutes late.
 - **At the scheduled time, the regular new-video push fires** — the same `type: 'live'` notification as any other upload. There is no separate "is live now!" notification; the prewarn is the heads-up, the regular push is the "this just appeared" notification. Livestreams bypass DND.
@@ -152,7 +152,7 @@ TubePulse's notification system is built around **nagging**, not polling. You co
 - **DND scheduling** — blocks non-livestream pushes during custom silent hours (default 22:00–07:00). Livestreams (`type: 'live'`) bypass DND by default; regular new-video, prewarn, and post pushes respect DND unless the per-channel override sets `dndBypass: true`. Videos that arrive during DND are held and delivered when DND ends by the nag cycle.
 - **DND batching** — when DND ends and multiple unwatched videos are pending for the same channel, TubePulse sends a single per-channel summary (e.g. `ChannelName - 3 unwatched`) instead of flooding you with individual notifications. The batch groups by channel — you'll get one notification per channel with its unwatched count, not one per video.
 
-When an RSS shard detects a new video, TubePulse immediately notifies all eligible devices (unless DND is active). The aux worker then handles re-notifications on the user's chosen schedule.
+When Home detects a new video, TubePulse notifies eligible devices after canonical publication (unless DND is active). Home's minute aux job then handles re-notifications on the user's chosen schedule.
 
 ### 👆 Tap Actions — Video vs Channel
 
@@ -188,20 +188,17 @@ This is the key interaction: video tap for "I've seen this one", channel tap for
 ### Overview - Current Repo Evidence
 
 ```
-YouTube RSS feed ──rotating shard poll──▶ RSS Workers ──new videos/FCM push──▶ Phone
-  (free, no auth)        │                                       │                       │
-                          │                                       │   ┌── prewarn push   │
-                          │                                       │   │  (per-device,    │
-                          │                                       │   │   aux tick)      │
-                          ▼                                       │   │                  │
-                    Cloudflare KV                           YouTube / InnerTube          │
-                    (channels:active,                       (subscribe-time:             │
-                     channel meta/recent/subs/               handle→channelId,            │
-                     channel recent:posts,                  avatar; posts worker:         │
-                     device profile/settings/state/override) rotating InnerTube poll)     │
-                                                                                       ▼
-                                                                                   Phone
-                                                                  (also: nag cycle, WebSub dormant)
+YouTube Data API / InnerTube ──poll──▶ unified Home authority ──FCM──▶ Phone
+                                      │          ▲
+                                      │ local KV │ signed VPC feed/mutations
+                                      ▼          │
+                              Cloudflare API Worker ─────────────▶ App
+                                      │
+                                      └──durable coalesced deltas──▶ Cloudflare KV backup
+
+The API Worker retains a signed, bounded RSS diagnostic route for historical
+rollback tooling, but the active Home scheduler does not call it. Legacy
+scheduled Workers remain triggerless.
 ```
 
 **Verified API route:** as of 2026-06-25, `GET /` on `https://tubepulse-api.jimothyoakley55.workers.dev` returns Cloudflare-served health JSON identifying `worker: "tubepulse-api"` and `architecture: "channel-first"`. The health JSON reports `version: "3.0.0"`; keep that separate from the app version `3.3.1`. The wrangler config comment saying no HTTP routes is stale/incomplete, so review Cloudflare settings before changing routing.
@@ -211,11 +208,11 @@ Every operation asks "what's happening to this channel" first, then "who cares a
 This inverts the old device-first approach and eliminates `KV.list()` entirely.
 
 **Detection paths in v3.1:**
-- **Active (videos):** RSS shard Workers rotate over active channels, compare against a durable known-video watermark, and fan out new videos. Zero Data API quota cost.
-- **Active (posts, v3.1):** The posts Worker rotates active channels through InnerTube at roughly hourly-per-channel cadence. Zero Data API quota cost.
-- **Active (prewarn, v3.1):** The aux Worker checks `upcoming:events:list` and fires per-device prewarn pushes when each device's window is active.
+- **Active (videos):** Home batches active channels through `channels.list`, reconciles changed uploads playlists against a durable known-video watermark, and fans out new videos after canonical publication.
+- **Active (posts, v3.1):** Home polls every eligible active channel through InnerTube once per hour. Zero Data API quota cost.
+- **Active (prewarn, v3.1):** Home's minute aux job checks `upcoming:events:list` and fires per-device prewarn pushes when each device's window is active.
 - **Dormant:** WebSub handlers in both workers exist but the hub is shut down; `/websub` endpoint still works for manual testing or future hub revival.
-- **YouTube Data API:** reserved for subscribe-time operations (handle resolve + avatar fetch). RSS, posts, aux, and FCM push paths consume zero Data API quota.
+- **YouTube Data API:** active video discovery and metrics plus occasional handle resolution/avatar work. Posts still use InnerTube; aux and FCM do not consume YouTube quota.
 
 ### API Worker (`tubepulse-api`)
 
@@ -225,12 +222,12 @@ The central Cloudflare Worker. Handles:
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
 | `/register` | POST | Register/update device profile. `fcmToken` is optional (null accepted so a user who denied notification permission can still subscribe channels and use the app). Idempotent — safe to call on every launch and on FCM token refresh. |
-| `/subscribe-channel` | POST | Add a channel to this device. Triggers Data API avatar fetch (one-time, cached forever) + RSS bootstrap for the recent list. |
+| `/subscribe-channel` | POST | Add a channel to this device. Triggers a cached Data API avatar lookup and structural uploads-playlist bootstrap when needed. |
 | `/unsubscribe` | POST | Remove a channel from this device. Removes the device from the channel's subscriber list; if the subscriber list goes empty, the channel is removed from the `channels:active` index. |
 | `/seen` | POST | Mark videos/posts as watched. `{ channelId, ids: [videoId, "post:activityId", ...] }` for taps, `{ channelId, clearAll: true }` for channel-tap. Post IDs are namespaced with `post:` so they share the `deviceState.unwatched` array with videos without collision. |
 | `/feed` | GET | Fetch current video + post data for all tracked channels. Production serves authenticated feeds from the unified Home store over VPC while current, with bounded Cloudflare-KV fallback. Each post carries an `unwatched` flag mirroring the video pattern. |
 | `/resolve` | GET | Resolve `@handle` → channelId + name + avatar (YouTube Data API, key stays server-side). Result cached 7 days in `handle:{lowercase}`. |
-| `/bootstrap` | POST | Fetch RSS + avatar for a newly added channel synchronously. RSS is the primary path; Data API is the fallback for the rare case where RSS is unreachable. |
+| `/bootstrap` | POST | Fetch channel metadata and recent uploads through the Data API structural path. |
 | `/settings` | POST | Update notification settings (full replacement). Includes `prewarnMinutes` (v3.1). |
 | `/channel-override` | POST | Set/update per-channel notification override. Empty override deletes it. Supports `prewarnMinutes` and `includeCommunityPosts` overrides (v3.1). |
 | `/websub` | GET | WebSub verification handshake — **dormant**, responds with `hub.challenge` if any verification request ever arrives. |
@@ -239,21 +236,21 @@ The central Cloudflare Worker. Handles:
 **Per-request flow (`/subscribe-channel` example):**
 1. Look up the device profile (from `Authorization: Bearer <deviceId>`) — must exist
 2. Read channel meta from KV; if missing, fetch avatar via YouTube Data API (1 quota unit, cached forever)
-3. Read channel recent from KV; if missing, fetch RSS feed (0 quota cost, cached with view counts + likes + dislikes)
+3. Read channel recent from KV; if missing, obtain the uploads playlist and fetch recent items plus batched metadata/statistics
 4. Add `deviceId` to the channel's `subscribers` list (if not already there)
 5. Add `channelId` to the device's `channels` list (if not already there)
 6. Add `channelId` to `channels:active` (if this is the first subscriber)
 7. Return the channel meta + recent videos to the app
 
-**YouTube Data API usage:** Subscribe-time handle→channelId resolve (cached 7 days) and avatar fetch (cached forever). Video detection uses RSS and community posts use InnerTube, so neither Home polling path consumes Data API quota.
+**YouTube Data API usage:** Two five-minute `channels.list` detector calls cost 576 general units/day. Six-hour first-page reconciliation costs up to `active channels × 4` general units/day; changed-channel detail and metadata requests are event-driven. Engagement metrics use the separate `videos:batchGetStats` bucket. Persisted Pacific-day counters and reserves keep both buckets below their configured daily limits.
 
 ### Background scheduler
 
-Production scheduling moved to the unified local Home authority on 2026-10-04. It polls all 85 current active channels for videos every five minutes, polls all eligible channels for posts hourly, and runs bounded aux work each minute. The five Cloudflare scheduled Worker deployments and the old combined cron remain available only for rollback; all six currently have empty Cron Trigger lists.
+Production scheduling moved to the unified local Home authority on 2026-10-04. On 2026-10-05 its video source moved from RSS to batched Data API discovery. It checks all active channels every five minutes, polls eligible community posts hourly through InnerTube, and runs bounded aux work each minute. The five Cloudflare scheduled Worker deployments and old combined cron remain triggerless rollback artifacts.
 
 | Runtime | Live cadence | Work per invocation |
 |---|---|---|
-| Home video sweep | Every five minutes | Polls every active channel exactly once with bounded concurrency and watermark protection. |
+| Home video detector | Every five minutes | Two batched `channels.list` requests for the current fleet; changed/migration/safety-due uploads playlists enter the shared watermark and notification path. |
 | Home posts sweep | Hourly | Polls every eligible channel with InnerTube and preserves first-poll suppression. |
 | Home aux | Every minute | Processes bounded nag/prewarn work and drains legacy upcoming buckets. |
 | `tubepulse-rss-0/1/2`, `tubepulse-posts`, `tubepulse-aux` | Disabled (`crons = []`) | Retained code/deployments for stop-Home-first rollback only. |
@@ -264,11 +261,11 @@ Home publishes changed keys to `TUBEPULSE_KV` as a bounded backup while the publ
 
 | Key Pattern | Contents |
 |-------------|----------|
-| `channel:{channelId}:meta` | Channel name, avatarUrl, lastVideoId, addedAt |
+| `channel:{channelId}:meta` | Channel name, avatarUrl, compatibility/bootstrap `lastVideoId`, addedAt; active upload detection does not rewrite metadata solely for `lastVideoId` |
 | `channel:{channelId}:subscribers` | Array of deviceIds tracking this channel |
 | `channel:{channelId}:websub` | WebSub state: leaseExpiresAt, hmacSecret, lastVerified (dormant — no longer used) |
 | `channel:{channelId}:recent` | Last 15 videos: videoId, title, publishedAt, type, thumbnail, link, **views**, **likes**, **dislikes**, **viewsLastCheckedHour** (view persistence UTC hour), and **likesLastCheckedHour** (likes/dislikes persistence UTC hour) |
-| `channel:{channelId}:recent:posts` | Last 30 community posts: activityId, kind, text, thumbnail, link, publishedAt |
+| `channel:{channelId}:recent:posts` | Latest community post plus persisted engagement clock/metrics; structural changes are immediate while observation-only churn is suppressed |
 | `channel:{channelId}:firstPollAt:posts` | ISO timestamp of first posts-cron run for this channel (drives the first-run guard) |
 | `device:{deviceId}:profile` | fcmToken (nullable), platform, appVersion, createdAt, lastSeenAt |
 | `device:{deviceId}:settings` | mode, nagInterval, dndEnabled, dndStart, dndEnd, dndTimezone, tapAction, includeCommunityPosts, prewarnMinutes, etc. |
@@ -287,7 +284,7 @@ Home publishes changed keys to `TUBEPULSE_KV` as a bounded backup while the publ
 ### App → Server Communication
 
 1. **On launch**: `POST /register` with FCM token (null if notification permission denied) — creates/updates device profile
-2. **On channel add**: `POST /subscribe-channel` with channelId → Data API avatar fetch (one-time) + RSS bootstrap
+2. **On channel add**: `POST /subscribe-channel` with channelId → cached Data API metadata + structural uploads-playlist bootstrap
 3. **On channel remove**: `POST /unsubscribe` with channelId → device removed from channel's subscriber list (with a custom ConfirmDialog confirmation in v3.1)
 4. **On settings change**: `POST /settings` with updated settings (app uses `notificationMode` UX name, server stores as `mode`); includes `prewarnMinutes` and `includeCommunityPosts` in v3.1
 5. **On per-channel override**: `POST /channel-override` with channelId + override (or empty to clear). Supports `prewarnMinutes` and `includeCommunityPosts` overrides in v3.1, both tri-state (null = inherit, value = override)
@@ -307,8 +304,8 @@ Home publishes changed keys to `TUBEPULSE_KV` as a bounded backup while the publ
 Video uploaded on YouTube                              Channel posts on YouTube
          │                                                     │
          ▼                                                     ▼
-RSS shard polls YouTube RSS on its rotation          Posts worker polls one channel
-(via https://www.youtube.com/feeds/videos.xml)        through InnerTube per rotation
+Home batches every active channel every five minutes Home polls eligible post channels
+and reconciles due uploads playlists                 through InnerTube once per hour
          │                                                     │
          ▼                                                     ▼
 Diff against channel:{id}:recent → new videoIds       Diff against channel:{id}:recent:posts
@@ -344,7 +341,7 @@ Nag Cycle (every 15 min, scheduled into nag:{bucket} keys)
 Repeat until user watches
 ```
 
-The RSS poller is the active new-video detection path since the WebSub hub shutdown in 2024. The WebSub handlers in the workers are dormant but intact.
+The Home YouTube Data API poller is the active new-video detection path. RSS shards and their probe/circuit code are retained only for explicit rollback/history; there is no automatic RSS fallback. The WebSub handlers in the workers are dormant but intact.
 
 ## Project Structure
 
@@ -376,9 +373,9 @@ TubePulse/
 │   ├── tubepulse-api/
 │   │   ├── index.js               # API Worker — v3.1 channel-first + posts + prewarn
 │   │   └── wrangler.toml
-│   ├── tubepulse-rss-{0,1,2}/    # Active rotating RSS shard Workers
-│   ├── tubepulse-posts/          # Active rotating community-post Worker
-│   ├── tubepulse-aux/            # Active bounded nag/prewarn Worker
+│   ├── tubepulse-rss-{0,1,2}/    # Triggerless rollback RSS Workers; inactive in production
+│   ├── tubepulse-posts/          # Triggerless rollback post Worker; Home reuses poller
+│   ├── tubepulse-aux/            # Triggerless rollback aux Worker; Home reuses aux logic
 │   └── tubepulse-cron/
 │       ├── index.js               # Retired no-op compatibility entrypoint
 │       ├── shared.mjs             # Shared scheduled-worker helpers
@@ -461,7 +458,7 @@ The resulting ignored `dist/TubePulse-Preview-<version>-debug.apk` uses package 
 # Deploy API worker source (app-facing API in repo; verify live route state first)
 cd worker/tubepulse-api && npx wrangler deploy
 
-# Deploy the five active scheduled workers
+# Optional rollback-only Worker deploys (do not enable Cron Triggers while Home owns scheduling)
 for worker in tubepulse-rss-0 tubepulse-rss-1 tubepulse-rss-2 tubepulse-posts tubepulse-aux; do
   (cd "worker/$worker" && npx wrangler deploy)
 done
@@ -472,9 +469,9 @@ Before worker cleanup, note that the app's workers.dev API URL is verified reach
 For the full cloud architecture — KV schema, endpoint reference, FCM details, cost analysis, free tier budget — see **[worker/README.md](worker/README.md)**.
 
 Required Cloudflare secrets:
-- `YOUTUBE_API_KEY` — API worker only, for handle resolution and avatars
-- `FIREBASE_SERVICE_ACCOUNT` — API, RSS shards, posts, and aux, for FCM
-- `TUBEPULSE_KV` — configured KV binding shared by all active workers
+- `YOUTUBE_API_KEY` — Home authority for active discovery/metrics/bootstrap; API Worker for handle resolution where configured
+- `FIREBASE_SERVICE_ACCOUNT` — Home authority for active FCM; retained Workers need it only during an explicit rollback
+- `TUBEPULSE_KV` — configured KV binding for the public API and triggerless rollback Workers; Home journals bounded backup deltas into it
 
 ## License
 

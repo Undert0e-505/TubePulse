@@ -6,6 +6,7 @@ import test from 'node:test';
 import { signAuthorityRequest } from '../src/home-authority.mjs';
 import { UnifiedHomeAuthorityService } from '../src/home-authority-service.mjs';
 import { contentHash } from '../src/kv-adapters.mjs';
+import { appWorker } from '../../worker/tubepulse-api/index.js';
 
 const SECRET = 'synthetic-unified-service-secret-longer-than-32-characters';
 
@@ -21,10 +22,16 @@ class MemoryNamespace {
 }
 
 class FakeRuntime {
-  constructor(namespace) { this.namespace = namespace; this.started = false; }
+  constructor(namespace, { realApi = false } = {}) { this.namespace = namespace; this.started = false; this.realApi = realApi; }
   async start() { this.started = true; return this; }
   async getLocalNamespace() { return this.namespace; }
-  async dispatchFetch(_url, init) {
+  async dispatchFetch(url, init) {
+    if (this.realApi) {
+      return await appWorker.fetch(new Request(url, init), {
+        TUBEPULSE_KV: this.namespace,
+        TUBEPULSE_ENABLE_COMMUNITY_POSTS: 'false',
+      }, { waitUntil() {}, passThroughOnException() {} });
+    }
     return Response.json({ channels: [], authorization: init.headers.Authorization ? 'present' : 'missing' });
   }
   async close() { this.started = false; }
@@ -132,4 +139,76 @@ test('unified service closes an already-started runtime when scheduler startup f
   await assert.rejects(() => service.start(), /synthetic scheduler startup failure/);
   assert.equal(runtime.started, false);
   assert.equal(service.server, null);
+});
+
+test('signed Home mutation runs real /seen semantics locally and the next Home feed stays seen', async (t) => {
+  const dataDir = await temporaryDirectory(t);
+  const device = 'synthetic-device';
+  const channelId = 'UCseen000000000000000000';
+  const videoId = 'video-unwatched';
+  const stateKey = `device:${device}:state:${channelId}`;
+  const namespace = new MemoryNamespace({
+    [`device:${device}:profile`]: JSON.stringify({ platform: 'android' }),
+    [`device:${device}:channels`]: JSON.stringify([channelId]),
+    [`device:${device}:settings`]: JSON.stringify({ includeCommunityPosts: false }),
+    [`channel:${channelId}:meta`]: JSON.stringify({ name: 'Seen test' }),
+    [`channel:${channelId}:recent`]: JSON.stringify([{ videoId, title: 'Test', link: 'https://example.test/video' }]),
+    [stateKey]: JSON.stringify({ unwatched: [videoId], lastNagAt: 123, nagCount: 2 }),
+    'nag:active': JSON.stringify([`${device}|${channelId}`]),
+  });
+  const service = new UnifiedHomeAuthorityService(config(dataDir), {
+    runtime: new FakeRuntime(namespace, { realApi: true }),
+    runner: new FakeRunner(), host: '127.0.0.1', port: 0,
+  });
+  await service.start();
+  t.after(() => service.close());
+  await service.gate.reconcile({ manifestHash: contentHash('seen-test'), recordCount: namespace.values.size });
+  const base = `http://127.0.0.1:${service.server.address().port}`;
+  const mutationBody = JSON.stringify({ channelId, videoIds: [videoId] });
+  const leaseId = 'home-seen-mutation-00001';
+  const mutation = signed('/_tubepulse/authority/mutation', 'authority-mutation', {
+    leaseId,
+    method: 'POST',
+    path: '/seen',
+    body: mutationBody,
+    headers: { 'content-type': 'application/json' },
+  });
+  let response = await fetch(`${base}/_tubepulse/authority/mutation`, { method: 'POST', ...mutation });
+  assert.equal(response.status, 200);
+  const result = await response.json();
+  assert.equal(result.ok, true);
+  assert.equal(result.response.status, 200);
+  assert.equal(result.deltas.some((delta) => delta.key === stateKey), true);
+  assert.deepEqual(JSON.parse(namespace.values.get(stateKey)), { unwatched: [], lastNagAt: null, nagCount: 0 });
+
+  const invalid = signed('/_tubepulse/authority/mutation', 'authority-mutation', {
+    leaseId: 'home-seen-invalid-00001',
+    method: 'POST',
+    path: '/seen',
+    body: JSON.stringify({ videoIds: [videoId] }),
+    headers: { 'content-type': 'application/json' },
+  });
+  response = await fetch(`${base}/_tubepulse/authority/mutation`, { method: 'POST', ...invalid });
+  assert.equal(response.status, 200);
+  const rejected = await response.json();
+  assert.equal(rejected.response.status, 400);
+  assert.deepEqual(rejected.deltas, []);
+  assert.equal((await service.gate.status()).lease, null);
+
+  const authorization = `Bearer ${device}`;
+  const feedHeaders = signAuthorityRequest({
+    secret: SECRET,
+    operation: 'authority-feed',
+    method: 'GET',
+    target: '/_tubepulse/authority/feed',
+    authorization,
+    body: '',
+  });
+  response = await fetch(`${base}/_tubepulse/authority/feed`, {
+    headers: { ...feedHeaders, Authorization: authorization },
+  });
+  assert.equal(response.status, 200);
+  const feed = await response.json();
+  assert.equal(feed.channels[0].videos[0].unwatched, false);
+  assert.equal(feed.channels[0].unwatchedCount, 0);
 });

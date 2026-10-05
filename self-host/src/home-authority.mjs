@@ -335,12 +335,13 @@ export class HomeAuthorityGate {
 }
 
 export class HomeAuthorityIngress {
-  constructor({ secret, gate, replayGuard = new AuthorityReplayGuard(), feedHandler = null }) {
+  constructor({ secret, gate, replayGuard = new AuthorityReplayGuard(), feedHandler = null, mutationHandler = null }) {
     if (!secret || secret.length < 32) throw new Error('Home authority secret must contain at least 32 characters');
     this.secret = secret;
     this.gate = gate;
     this.replayGuard = replayGuard;
     this.feedHandler = feedHandler;
+    this.mutationHandler = mutationHandler;
   }
 
   async handle(request) {
@@ -360,6 +361,7 @@ export class HomeAuthorityIngress {
       return await this.feedHandler(request);
     }
     const routes = new Map([
+      ['/_tubepulse/authority/mutation', 'authority-mutation'],
       ['/_tubepulse/authority/preflight', 'authority-preflight'],
       ['/_tubepulse/authority/cancel', 'authority-cancel'],
       ['/_tubepulse/authority/commit', 'authority-commit'],
@@ -382,6 +384,43 @@ export class HomeAuthorityIngress {
     if (!/^[a-zA-Z0-9_-]{16,128}$/.test(leaseId)) return Response.json({ error: 'Invalid request' }, { status: 400 });
     const identityHash = contentHash(bearer);
     try {
+      if (operation === 'authority-mutation') {
+        const method = String(payload.method || '').toUpperCase();
+        let target;
+        try { target = new URL(String(payload.path || ''), 'http://authority.local'); } catch {
+          return Response.json({ error: 'Invalid request' }, { status: 400 });
+        }
+        if (!AUTHORITY_MUTATION_ROUTES.has(`${method} ${target.pathname}`)) {
+          return Response.json({ error: 'Route is not allowed' }, { status: 404 });
+        }
+        if (typeof payload.body !== 'string' || Buffer.byteLength(payload.body) > MAX_BODY_BYTES) {
+          return Response.json({ error: 'Invalid request' }, { status: 400 });
+        }
+        if (!this.mutationHandler) return Response.json({ error: 'Home mutation handler is unavailable' }, { status: 503 });
+        await this.gate.acquire({ leaseId, kind: 'api', identityHash, method, route: target.pathname });
+        let result;
+        try {
+          result = await this.mutationHandler({
+            method,
+            path: `${target.pathname}${target.search}`,
+            body: payload.body,
+            headers: payload.headers && typeof payload.headers === 'object' ? payload.headers : {},
+            authorization,
+          });
+          if (!result?.response || !Array.isArray(result.deltas)) throw new Error('Invalid Home mutation result');
+          if (Number(result.response.status) >= 400) {
+            await this.gate.release(leaseId);
+            return Response.json({ ok: true, response: result.response, deltas: [] });
+          }
+          await this.gate.commit({ leaseId, deltas: result.deltas, kind: 'api', identityHash });
+          return Response.json({ ok: true, response: result.response, deltas: result.deltas });
+        } catch (error) {
+          await this.gate.release(leaseId).catch(() => {});
+          const message = String(error?.message || 'Home mutation failed');
+          if (/stale|busy|lease|diverged|recovery/i.test(message)) throw error;
+          return Response.json({ error: 'Home mutation failed' }, { status: 500 });
+        }
+      }
       if (operation === 'authority-preflight') {
         const method = String(payload.method || '').toUpperCase();
         const route = new URL(String(payload.path || ''), 'http://authority.local').pathname;

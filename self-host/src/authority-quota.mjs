@@ -8,7 +8,7 @@ export const CLOUDFLARE_FREE_LIMITS = Object.freeze({
 
 export function projectAuthorityDailyUsage({
   users = 6,
-  channels = 85,
+  channels = 100,
   canonicalKeyCount = 900,
   feedRequestsPerUser = 48,
   mutationRequestsPerUser = 24,
@@ -16,7 +16,7 @@ export function projectAuthorityDailyUsage({
   registerListsPerUser = 24,
   fallbackFeedFraction = 0,
   averageFallbackFeedReads = 10,
-  schedulerPublicationCap = 650,
+  schedulerPublicationCap = 900,
   totalWriteCap = 950,
   schedulerTicks = 1_440,
   coordinatorRequestsPerTick = 3,
@@ -24,6 +24,7 @@ export function projectAuthorityDailyUsage({
   averageDoActiveMs = 20,
   durableObjectMemoryGb = 0.125,
 } = {}) {
+  schedulerPublicationCap = Math.max(0, Math.min(totalWriteCap, schedulerPublicationCap));
   const feeds = users * feedRequestsPerUser;
   const mutations = users * mutationRequestsPerUser;
   const fallbackFeeds = Math.ceil(feeds * fallbackFeedFraction);

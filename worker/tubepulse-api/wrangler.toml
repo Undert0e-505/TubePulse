@@ -47,14 +47,14 @@ new_sqlite_classes = ["TubePulseAuthorityCoordinator"]
 # Unified local-first authority. Values stay encrypted Worker secrets; never
 # commit them under [vars]. The production deployment enables this separately
 # from source: all authenticated feeds use the one Home store over VPC while
-# current, with bounded Cloudflare-KV fallback, and exact mutation deltas are
-# synchronously replicated under the shared coordinator.
+# current, with bounded Cloudflare-KV fallback. App mutations execute on Home;
+# their exact deltas are durably queued for later KV backup by the coordinator.
 # TUBEPULSE_HOME_AUTHORITY_ENABLED=false
 # TUBEPULSE_HOME_AUTHORITY_TRAFFIC_ENABLED=false
 # TUBEPULSE_HOME_AUTHORITY_TRANSPORT=vpc
 # TUBEPULSE_HOME_AUTHORITY_ORIGIN=http://gateway-origin:8788
 # TUBEPULSE_HOME_AUTHORITY_TIMEOUT_MS=5000
-# TUBEPULSE_AUTHORITY_KV_PUBLICATION_CAP=650
+# TUBEPULSE_AUTHORITY_KV_PUBLICATION_CAP=900
 # TUBEPULSE_AUTHORITY_KV_WRITE_HARD_CAP=950
 # wrangler secret put TUBEPULSE_HOME_AUTHORITY_SECRET
 

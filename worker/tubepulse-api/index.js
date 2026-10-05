@@ -552,11 +552,17 @@ async function fetchYouTubeRSS(channelId) {
 // ─── YouTube Data API (avatars + resolve + recent videos) ──────────────
 
 async function fetchRecentVideosViaAPI(apiKey, channelId, maxResults = 15) {
-  const apiUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&channelId=${encodeURIComponent(channelId)}&maxResults=${maxResults}&order=date&type=video&key=${apiKey}`;
+  const channelUrl = `https://www.googleapis.com/youtube/v3/channels?part=contentDetails&id=${encodeURIComponent(channelId)}&fields=items(contentDetails(relatedPlaylists(uploads)))&key=${apiKey}`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 15000);
 
   try {
+    const channelResp = await fetch(channelUrl, { signal: controller.signal });
+    if (!channelResp.ok) return null;
+    const channelData = await channelResp.json();
+    const playlistId = channelData.items?.[0]?.contentDetails?.relatedPlaylists?.uploads;
+    if (!playlistId) return null;
+    const apiUrl = `https://www.googleapis.com/youtube/v3/playlistItems?part=snippet,contentDetails,status&playlistId=${encodeURIComponent(playlistId)}&maxResults=${Math.min(50, maxResults)}&fields=items(snippet(publishedAt,channelTitle,title,thumbnails),contentDetails(videoId,videoPublishedAt),status(privacyStatus))&key=${apiKey}`;
     const resp = await fetch(apiUrl, { signal: controller.signal });
     if (!resp.ok) return null;
     const data = await resp.json();
@@ -566,18 +572,19 @@ async function fetchRecentVideosViaAPI(apiKey, channelId, maxResults = 15) {
       const s = item.snippet;
       const thumbs = s.thumbnails || {};
       return {
-        videoId: item.id?.videoId,
+        videoId: item.contentDetails?.videoId,
         title: s.title,
-        publishedAt: s.publishedAt,
+        publishedAt: item.contentDetails?.videoPublishedAt || s.publishedAt,
         thumbnail: thumbs.high?.url || thumbs.medium?.url || thumbs.default?.url || null,
-        type: classifyVideo({ title: s.title, published: s.publishedAt }),
-        link: `https://www.youtube.com/watch?v=${item.id?.videoId}`,
+        type: classifyVideo({ title: s.title, published: item.contentDetails?.videoPublishedAt || s.publishedAt }),
+        link: `https://www.youtube.com/watch?v=${item.contentDetails?.videoId}`,
       };
-    }).filter((v) => v.videoId);
+    }).filter((v, index) => v.videoId && data.items[index]?.status?.privacyStatus !== 'private'
+      && !/^(deleted|private) video$/i.test(String(v.title || '').trim()));
 
     return videos;
   } catch (err) {
-    console.error(`Search API error for ${channelId}:`, err.message);
+    console.error(`Uploads playlist API error for ${channelId}:`, err.message);
     return null;
   } finally {
     clearTimeout(timer);
@@ -1012,49 +1019,8 @@ async function handleSubscribeChannel(request, env, ctx) {
 
   // Bootstrap channel data SYNCHRONOUSLY so /feed works immediately.
   if (!meta || !recent) {
-    // Fetch recent videos via RSS — primary path, 0 quota cost.
-    // RSS provides videoId, title, publishedAt, thumbnail, link, and
-    // views + likes + dislikes (from media:statistics / starRating).
-    // Cron takes over from here.
-    if (!recent) {
-      try {
-        const rssResult = await fetchYouTubeRSS(channelId);
-        if (rssResult?.videos?.length > 0) {
-          const checkedHour = Math.floor(Date.now() / 3600000);
-          recent = rssResult.videos.slice(0, 15).map((v) => ({
-            videoId: v.videoId,
-            title: v.title,
-            publishedAt: v.published,
-            thumbnail: v.thumbnail,
-            type: classifyVideo(v),
-            link: v.link,
-            views: v.views ?? null,
-            likes: v.likes ?? null,
-            dislikes: v.dislikes ?? null,
-            viewsLastCheckedHour: checkedHour,
-            likesLastCheckedHour: checkedHour,
-          }));
-
-          if (!meta) {
-            meta = {
-              name: rssResult.channel?.name || channelId,
-              avatarUrl: null,
-              lastVideoId: rssResult.videos[0]?.videoId || null,
-              addedAt: Date.now(),
-            };
-          } else {
-            meta.lastVideoId = rssResult.videos[0]?.videoId || meta.lastVideoId;
-          }
-
-          await putKV(env.TUBEPULSE_KV, key.channelMeta(channelId), meta);
-          await putKV(env.TUBEPULSE_KV, key.channelRecent(channelId), recent);
-        }
-      } catch (e) {
-        console.warn(`[API] RSS bootstrap failed for ${channelId}:`, e.message);
-      }
-    }
-
-    // Data API fallback (only if RSS is unreachable)
+    // Bootstrap structurally from the channel uploads playlist. Routine and
+    // bootstrap discovery deliberately avoid both RSS and search.list.
     if (!recent && env.YOUTUBE_API_KEY) {
       try {
         const apiVideos = await fetchRecentVideosViaAPI(env.YOUTUBE_API_KEY, channelId);
@@ -1082,7 +1048,7 @@ async function handleSubscribeChannel(request, env, ctx) {
           await putKV(env.TUBEPULSE_KV, key.channelRecent(channelId), recent);
         }
       } catch (e) {
-        console.warn(`[API] Data API fallback also failed for ${channelId}:`, e.message);
+        console.warn(`[API] Data API uploads bootstrap failed for ${channelId}:`, e.message);
       }
     }
   }
@@ -1372,52 +1338,11 @@ async function handleBootstrap(request, env, ctx) {
   let meta = await getKV(env.TUBEPULSE_KV, key.channelMeta(channelId));
   meta = await ensureChannelAvatar(env, channelId, meta, 'Bootstrap');
 
-  // Fetch recent videos — RSS first (zero quota cost), Data API as fallback
-  // for the rare case where RSS is unreachable. RSS provides videoId, title,
-  // publishedAt, thumbnail, link, and view counts (from media:statistics).
-  // The avatar is fetched separately when cached metadata is incomplete
-  // (normally a one-time, 1-unit repair).
+  // Bootstrap structurally from the uploads playlist; never consume the
+  // scarce search.list bucket and never depend on RSS health.
   let recent = await getKV(env.TUBEPULSE_KV, key.channelRecent(channelId));
   if (!recent) {
-    // Try RSS first — primary path since v3.0.18
-    try {
-      const rssResult = await fetchYouTubeRSS(channelId);
-      if (rssResult?.videos?.length > 0) {
-        const checkedHour = Math.floor(Date.now() / 3600000);
-        recent = rssResult.videos.slice(0, 15).map((v) => ({
-          videoId: v.videoId,
-          title: v.title,
-          publishedAt: v.published,
-          thumbnail: v.thumbnail,
-          type: classifyVideo(v),
-          link: v.link,
-          views: v.views ?? null,
-          likes: v.likes ?? null,
-          dislikes: v.dislikes ?? null,
-          viewsLastCheckedHour: checkedHour,
-          likesLastCheckedHour: checkedHour,
-        }));
-
-        if (!meta) {
-          meta = {
-            name: rssResult.channel?.name || channelId,
-            avatarUrl: null,
-            lastVideoId: rssResult.videos[0]?.videoId || null,
-            addedAt: Date.now(),
-          };
-        } else {
-          meta.lastVideoId = rssResult.videos[0]?.videoId || meta.lastVideoId;
-        }
-
-        await putKV(env.TUBEPULSE_KV, key.channelMeta(channelId), meta);
-        await putKV(env.TUBEPULSE_KV, key.channelRecent(channelId), recent);
-      }
-    } catch (e) {
-      console.warn(`[Bootstrap] RSS fetch failed for ${channelId}:`, e.message);
-    }
-
-    // Data API fallback — only if RSS is unreachable
-    if (!recent && env.YOUTUBE_API_KEY) {
+    if (env.YOUTUBE_API_KEY) {
       try {
         const apiVideos = await fetchRecentVideosViaAPI(env.YOUTUBE_API_KEY, channelId);
         if (apiVideos && apiVideos.length > 0) {
@@ -1445,7 +1370,7 @@ async function handleBootstrap(request, env, ctx) {
           await putKV(env.TUBEPULSE_KV, key.channelRecent(channelId), recent);
         }
       } catch (e) {
-        console.warn(`[Bootstrap] Data API fallback also failed for ${channelId}:`, e.message);
+        console.warn(`[Bootstrap] Data API uploads bootstrap failed for ${channelId}:`, e.message);
       }
     }
   }
@@ -1830,7 +1755,7 @@ async function handleWebSubPush(request, env, ctx) {
 
 // ─── Main handler ───────────────────────────────────────────────────────
 
-const appWorker = {
+export const appWorker = {
   async fetch(request, env, ctx) {
     if (request.method === 'OPTIONS') {
       return new Response(null, { headers: corsHeaders() });

@@ -128,6 +128,19 @@ export function readHomeSchedulerConfig(env = process.env, options = {}) {
     'FIREBASE_SERVICE_ACCOUNT_FILE',
   );
   const youtubeApiKey = readSecret(env, 'YOUTUBE_API_KEY', 'YOUTUBE_API_KEY_FILE');
+  const videoSourceMode = String(env.TUBEPULSE_HOME_SCHEDULER_VIDEO_SOURCE || 'youtube-api').trim().toLowerCase();
+  if (!['youtube-api', 'rss-legacy'].includes(videoSourceMode)) {
+    throw new Error('TUBEPULSE_HOME_SCHEDULER_VIDEO_SOURCE must be youtube-api or rss-legacy');
+  }
+  const youtubeApiFallbackRequested = booleanValue(
+    env.TUBEPULSE_HOME_SCHEDULER_YOUTUBE_API_FALLBACK_ENABLED,
+    true,
+    'TUBEPULSE_HOME_SCHEDULER_YOUTUBE_API_FALLBACK_ENABLED',
+  );
+  const fallbackDailyCapText = String(env.TUBEPULSE_HOME_SCHEDULER_YOUTUBE_FALLBACK_DAILY_CAP ?? '').trim();
+  const youtubeFallbackDailyCap = fallbackDailyCapText === ''
+    ? null
+    : nonNegativeInteger(fallbackDailyCapText, 0, 'TUBEPULSE_HOME_SCHEDULER_YOUTUBE_FALLBACK_DAILY_CAP');
   const activationLatch = String(env.TUBEPULSE_HOME_SCHEDULER_ACTIVATION_LATCH || '');
   const postsCadenceMinutes = positiveInteger(
     env.TUBEPULSE_HOME_SCHEDULER_POSTS_CADENCE_MINUTES,
@@ -145,6 +158,27 @@ export function readHomeSchedulerConfig(env = process.env, options = {}) {
   const fiveMinutePostsLatch = String(env.TUBEPULSE_HOME_SCHEDULER_5M_POSTS_LATCH || '');
   if (postsCadenceMinutes === 5 && (!allowFiveMinutePosts || fiveMinutePostsLatch !== FIVE_MINUTE_POSTS_LATCH)) {
     throw new Error('Five-minute post sweeps require the explicit quota flag and 5M_POSTS_LATCH');
+  }
+  const rssCircuitInitialCooldownMinutes = positiveInteger(
+    env.TUBEPULSE_HOME_SCHEDULER_RSS_CIRCUIT_INITIAL_COOLDOWN_MINUTES,
+    15,
+    'TUBEPULSE_HOME_SCHEDULER_RSS_CIRCUIT_INITIAL_COOLDOWN_MINUTES',
+  );
+  const rssCircuitMaximumCooldownMinutes = positiveInteger(
+    env.TUBEPULSE_HOME_SCHEDULER_RSS_CIRCUIT_MAXIMUM_COOLDOWN_MINUTES,
+    60,
+    'TUBEPULSE_HOME_SCHEDULER_RSS_CIRCUIT_MAXIMUM_COOLDOWN_MINUTES',
+  );
+  if (rssCircuitMaximumCooldownMinutes < rssCircuitInitialCooldownMinutes) {
+    throw new Error('RSS circuit maximum cooldown must be at least the initial cooldown');
+  }
+  const rssRecoverySuccessesRequired = positiveInteger(
+    env.TUBEPULSE_HOME_SCHEDULER_RSS_RECOVERY_SUCCESSES,
+    2,
+    'TUBEPULSE_HOME_SCHEDULER_RSS_RECOVERY_SUCCESSES',
+  );
+  if (rssRecoverySuccessesRequired < 2) {
+    throw new Error('RSS circuit recovery requires at least two consecutive successes');
   }
 
   if (!syncConfigured && mode === 'shadow') {
@@ -172,6 +206,9 @@ export function readHomeSchedulerConfig(env = process.env, options = {}) {
     }
     if (!authorityApiUrl || !authoritySecret || authoritySecret.length < 32) {
       throw new Error('Active mode requires the signed unified authority API configuration');
+    }
+    if (videoSourceMode !== 'youtube-api' || !youtubeApiKey) {
+      throw new Error('Active mode requires the Home YouTube Data API video source and API key');
     }
     if (gatewayConvergenceRequired && (!gatewayAdminToken || !gatewayAdminUrl || !gatewayReconcileUrl)) {
       throw new Error('Active mode requires gateway reconciliation configuration when gateway convergence is enabled');
@@ -229,6 +266,14 @@ export function readHomeSchedulerConfig(env = process.env, options = {}) {
     },
     schedulesDisabled,
     concurrency: positiveInteger(env.TUBEPULSE_HOME_SCHEDULER_CONCURRENCY, 6, 'TUBEPULSE_HOME_SCHEDULER_CONCURRENCY'),
+    rssChannelTimeoutMs: positiveInteger(
+      env.TUBEPULSE_HOME_SCHEDULER_RSS_CHANNEL_TIMEOUT_SECONDS,
+      3,
+      'TUBEPULSE_HOME_SCHEDULER_RSS_CHANNEL_TIMEOUT_SECONDS',
+    ) * 1000,
+    rssCircuitInitialCooldownMinutes,
+    rssCircuitMaximumCooldownMinutes,
+    rssRecoverySuccessesRequired,
     channelTimeoutMs: positiveInteger(env.TUBEPULSE_HOME_SCHEDULER_CHANNEL_TIMEOUT_SECONDS, 25, 'TUBEPULSE_HOME_SCHEDULER_CHANNEL_TIMEOUT_SECONDS') * 1000,
     retryCount: nonNegativeInteger(env.TUBEPULSE_HOME_SCHEDULER_RETRY_COUNT, 2, 'TUBEPULSE_HOME_SCHEDULER_RETRY_COUNT'),
     retryBackoffMs: positiveInteger(env.TUBEPULSE_HOME_SCHEDULER_RETRY_BACKOFF_MS, 1000, 'TUBEPULSE_HOME_SCHEDULER_RETRY_BACKOFF_MS'),
@@ -246,6 +291,42 @@ export function readHomeSchedulerConfig(env = process.env, options = {}) {
       1_000,
       'TUBEPULSE_HOME_SCHEDULER_YOUTUBE_QUOTA_RESERVE_UNITS',
     ),
+    videoSourceMode,
+    youtubeSafetyReconcileHours: positiveInteger(
+      env.TUBEPULSE_HOME_SCHEDULER_YOUTUBE_SAFETY_RECONCILE_HOURS,
+      6,
+      'TUBEPULSE_HOME_SCHEDULER_YOUTUBE_SAFETY_RECONCILE_HOURS',
+    ),
+    youtubeMaxReconciliationsPerCycle: positiveInteger(
+      env.TUBEPULSE_HOME_SCHEDULER_YOUTUBE_MAX_RECONCILIATIONS_PER_CYCLE,
+      5,
+      'TUBEPULSE_HOME_SCHEDULER_YOUTUBE_MAX_RECONCILIATIONS_PER_CYCLE',
+    ),
+    youtubeMaxMigrationReconciliationsPerCycle: positiveInteger(
+      env.TUBEPULSE_HOME_SCHEDULER_YOUTUBE_MAX_MIGRATION_RECONCILIATIONS_PER_CYCLE,
+      100,
+      'TUBEPULSE_HOME_SCHEDULER_YOUTUBE_MAX_MIGRATION_RECONCILIATIONS_PER_CYCLE',
+    ),
+    youtubeMaxPlaylistPages: positiveInteger(
+      env.TUBEPULSE_HOME_SCHEDULER_YOUTUBE_MAX_PLAYLIST_PAGES,
+      3,
+      'TUBEPULSE_HOME_SCHEDULER_YOUTUBE_MAX_PLAYLIST_PAGES',
+    ),
+    youtubeStatisticsDailyQuotaUnits: positiveInteger(
+      env.TUBEPULSE_HOME_SCHEDULER_YOUTUBE_STATISTICS_DAILY_QUOTA_UNITS,
+      10_000,
+      'TUBEPULSE_HOME_SCHEDULER_YOUTUBE_STATISTICS_DAILY_QUOTA_UNITS',
+    ),
+    youtubeStatisticsReserveUnits: nonNegativeInteger(
+      env.TUBEPULSE_HOME_SCHEDULER_YOUTUBE_STATISTICS_RESERVE_UNITS,
+      1_000,
+      'TUBEPULSE_HOME_SCHEDULER_YOUTUBE_STATISTICS_RESERVE_UNITS',
+    ),
+    youtubeApiFallback: {
+      enabled: youtubeApiFallbackRequested && Boolean(youtubeApiKey),
+      configured: Boolean(youtubeApiKey),
+      dailyCap: youtubeFallbackDailyCap,
+    },
     allowFiveMinutePosts,
     workerBindings: {
       TUBEPULSE_ENABLE_COMMUNITY_POSTS: String(env.TUBEPULSE_ENABLE_COMMUNITY_POSTS ?? 'true'),
@@ -278,12 +359,26 @@ export function publicHomeSchedulerConfig(config) {
     notificationHomeRouteRequired: Boolean(config.notificationBarrier?.requireHomeAuthorityRoute),
     schedulesDisabledConfirmed: config.schedulesDisabled,
     concurrency: config.concurrency,
+    rssChannelTimeoutSeconds: config.rssChannelTimeoutMs / 1000,
     channelTimeoutSeconds: config.channelTimeoutMs / 1000,
     retryCount: config.retryCount,
+    rssCircuitInitialCooldownMinutes: config.rssCircuitInitialCooldownMinutes,
+    rssCircuitMaximumCooldownMinutes: config.rssCircuitMaximumCooldownMinutes,
+    rssRecoverySuccessesRequired: config.rssRecoverySuccessesRequired,
     postsCadenceMinutes: config.postsCadenceMinutes,
     postsConcurrency: config.postsConcurrency,
     postsMaxResponseBytes: config.postsMaxResponseBytes,
     youtubeDailyQuotaUnits: config.youtubeDailyQuotaUnits,
     youtubeQuotaReserveUnits: config.youtubeQuotaReserveUnits,
+    videoSourceMode: config.videoSourceMode,
+    youtubeSafetyReconcileHours: config.youtubeSafetyReconcileHours,
+    youtubeMaxReconciliationsPerCycle: config.youtubeMaxReconciliationsPerCycle,
+    youtubeMaxMigrationReconciliationsPerCycle: config.youtubeMaxMigrationReconciliationsPerCycle,
+    youtubeMaxPlaylistPages: config.youtubeMaxPlaylistPages,
+    youtubeStatisticsDailyQuotaUnits: config.youtubeStatisticsDailyQuotaUnits,
+    youtubeStatisticsReserveUnits: config.youtubeStatisticsReserveUnits,
+    youtubeApiFallbackConfigured: Boolean(config.youtubeApiFallback?.configured),
+    youtubeApiFallbackEnabled: Boolean(config.youtubeApiFallback?.enabled),
+    youtubeApiFallbackDailyCap: config.youtubeApiFallback?.dailyCap ?? null,
   };
 }

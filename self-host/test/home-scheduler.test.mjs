@@ -18,8 +18,13 @@ import {
   addToNagActive,
   getCachedFcmAccessToken,
   sendFCMPush,
+  mergeCachedCommunityPostForPersistence,
   shouldRefreshCachedCommunityPost,
 } from '../../worker/tubepulse-cron/shared.mjs';
+import { fallbackChannelsForMinute, pacificQuotaWindow, normalizeRssHealthState } from '../src/home-rss-policy.mjs';
+import { AuthorityClient } from '../src/authority-client.mjs';
+import { createAuthorityWorker } from '../../worker/tubepulse-api/authority.mjs';
+import { pollSingleCommunityChannel } from '../../worker/tubepulse-posts/index.js';
 
 class MemoryNamespace {
   constructor(entries = {}) { this.values = new Map(Object.entries(entries)); }
@@ -68,6 +73,10 @@ function config(dataDir, overrides = {}) {
     notificationsEnabled: false,
     schedulesDisabled: false,
     concurrency: 5,
+    rssChannelTimeoutMs: 500,
+    rssCircuitInitialCooldownMinutes: 15,
+    rssCircuitMaximumCooldownMinutes: 60,
+    rssRecoverySuccessesRequired: 2,
     channelTimeoutMs: 500,
     retryCount: 1,
     retryBackoffMs: 1,
@@ -77,6 +86,7 @@ function config(dataDir, overrides = {}) {
     postsMaxResponseBytes: 2 * 1024 * 1024,
     youtubeDailyQuotaUnits: 10_000,
     youtubeQuotaReserveUnits: 1_000,
+    youtubeApiFallback: { enabled: false, configured: false, dailyCap: null },
     allowFiveMinutePosts: false,
     authority: {
       enabled: true,
@@ -93,6 +103,12 @@ function config(dataDir, overrides = {}) {
     quiet: true,
     ...overrides,
   };
+}
+
+function remoteProbe(outcome, classification = outcome === 'success' ? 'valid-feed' : 'http-404', status = outcome === 'success' ? 200 : 404) {
+  return { ok: true, outcome, probes: ['official', 'active'].map((label) => ({
+    label, status, validXml: outcome === 'success', classification,
+  })) };
 }
 
 class FakeAuthorityGate {
@@ -215,6 +231,623 @@ test('RSS retry succeeds without losing deterministic coverage', async (t) => {
   assert.equal(result.sweep.coveredCount, 3);
   assert.equal(result.sweep.failureCount, 0);
   assert.equal(result.sweep.retryCount, 1);
+});
+
+test('regular ticks stagger one exact no-retry RSS cycle and partial failure cannot open the fleet circuit', async (t) => {
+  const dataDir = await temporaryDirectory(t);
+  const { channels, entries } = canonicalChannels(9);
+  const namespace = new MemoryNamespace();
+  const remote = new MemoryAdapter(entries);
+  const visited = [];
+  let remoteProbes = 0;
+  let clock = Date.UTC(2026, 9, 5, 12, 0);
+  const runner = new HomeSchedulerRunner({
+    config: config(dataDir), runtime: new FakeRuntime(namespace), remote, now: () => clock,
+    authorityClient: { async probeRss() { remoteProbes++; return { outcome: 'failure', probes: [] }; } },
+    rssPoller: async (_env, _ctx, channelId) => {
+      visited.push(channelId);
+      if (channelId === channels[0]) {
+        const error = new Error('synthetic 404');
+        error.category = 'http-404';
+        throw error;
+      }
+    },
+    postPoller: async () => {}, auxRunner: async () => {},
+  });
+  await runner.start();
+  t.after(() => runner.close());
+  const results = [];
+  for (let minute = 0; minute < 5; minute++) {
+    clock = Date.UTC(2026, 9, 5, 12, minute);
+    results.push(await runner.runTick(clock));
+  }
+  assert.equal(visited.length, channels.length);
+  assert.deepEqual([...new Set(visited)].sort(), channels);
+  assert.ok(visited.every((channelId) => visited.filter((entry) => entry === channelId).length === 1));
+  assert.ok(results.every((result) => result.sweep.retryCount === 0 && result.sweep.concurrency === 1));
+  const state = await runner.status();
+  assert.equal(state.rssHealth.sourceMode, 'rss');
+  assert.equal(state.rssHealth.circuit.open, false);
+  assert.equal(remoteProbes, 0);
+});
+
+test('staggered cycle progress survives restart without polling a completed cohort twice', async (t) => {
+  const dataDir = await temporaryDirectory(t);
+  const { entries } = canonicalChannels(5);
+  const namespace = new MemoryNamespace();
+  const remote = new MemoryAdapter(entries);
+  const visited = [];
+  const scheduled = Date.UTC(2026, 9, 5, 12, 0);
+  const makeRunner = () => new HomeSchedulerRunner({
+    config: config(dataDir), runtime: new FakeRuntime(namespace), remote, now: () => scheduled,
+    rssPoller: async (_env, _ctx, channelId) => { visited.push(channelId); },
+    postPoller: async () => {}, auxRunner: async () => {},
+  });
+  const first = makeRunner();
+  await first.start();
+  await first.runTick(scheduled);
+  await first.close();
+  const second = makeRunner();
+  await second.start();
+  t.after(() => second.close());
+  await second.runTick(scheduled);
+  assert.equal(visited.length, 1);
+  const state = await second.status();
+  assert.equal(state.rssHealth.currentCycle.results.filter(Boolean).length, 1);
+});
+
+test('all-home 404 plus independent success enters home-egress backoff without API fallback', async (t) => {
+  const dataDir = await temporaryDirectory(t);
+  const { channels, entries } = canonicalChannels(5);
+  entries[`channel:${channels[0]}:recent`] = JSON.stringify([{ videoId: 'last-good' }]);
+  const namespace = new MemoryNamespace();
+  let clock = Date.UTC(2026, 9, 5, 12, 0);
+  let apiCalls = 0;
+  let probeCalls = 0;
+  let postCalls = 0;
+  let auxCalls = 0;
+  const runner = new HomeSchedulerRunner({
+    config: config(dataDir, {
+      rssCircuitInitialCooldownMinutes: 15,
+      workerBindings: {
+        TUBEPULSE_ENABLE_COMMUNITY_POSTS: 'true', TUBEPULSE_NOTIFICATION_MODE: 'shadow',
+        FIREBASE_SERVICE_ACCOUNT: '{"project_id":"test"}', YOUTUBE_API_KEY: 'configured',
+      },
+      youtubeApiFallback: { enabled: true, configured: true, dailyCap: null },
+    }),
+    runtime: new FakeRuntime(namespace), remote: new MemoryAdapter(entries), now: () => clock,
+    authorityClient: { async probeRss() {
+      probeCalls++;
+      return remoteProbe('success');
+    } },
+    rssPoller: async () => { const error = new Error('404'); error.category = 'http-404'; throw error; },
+    youtubeApiFetcher: async () => { apiCalls++; throw new Error('must not use API'); },
+    postPoller: async () => { postCalls++; }, auxRunner: async () => { auxCalls++; },
+  });
+  await runner.start();
+  t.after(() => runner.close());
+  for (let minute = 0; minute < 5; minute++) {
+    clock = Date.UTC(2026, 9, 5, 12, minute);
+    await runner.runTick(clock);
+  }
+  let state = await runner.status();
+  assert.equal(state.rssHealth.sourceMode, 'home-egress-throttled');
+  assert.equal(state.rssHealth.circuit.open, true);
+  assert.equal(state.rssHealth.circuit.reason, 'full-fleet-http-404');
+  assert.equal(probeCalls, 1);
+  assert.equal(JSON.stringify(state).includes(channels[0]), false, 'scheduler status must not expose channel identities');
+  clock = Date.UTC(2026, 9, 5, 12, 5);
+  await runner.runTick(clock);
+  state = await runner.status();
+  assert.equal(apiCalls, 0);
+  assert.equal(postCalls, channels.length, 'hourly posts remain due during the RSS outage');
+  assert.equal(auxCalls, 6, 'aux remains due every minute during the RSS outage');
+  assert.equal(state.lastError, null);
+  assert.deepEqual(JSON.parse(namespace.values.get(`channel:${channels[0]}:recent`)), [{ videoId: 'last-good' }]);
+});
+
+test('all-home 404 plus independent failure enables staggered API fallback within quota', async (t) => {
+  const dataDir = await temporaryDirectory(t);
+  const { channels, entries } = canonicalChannels(5);
+  const namespace = new MemoryNamespace();
+  let clock = Date.UTC(2026, 9, 5, 12, 0);
+  const apiChannels = [];
+  const runner = new HomeSchedulerRunner({
+    config: config(dataDir, {
+      rssCircuitInitialCooldownMinutes: 60,
+      rssCircuitMaximumCooldownMinutes: 60,
+      workerBindings: {
+        TUBEPULSE_ENABLE_COMMUNITY_POSTS: 'true', TUBEPULSE_NOTIFICATION_MODE: 'shadow',
+        FIREBASE_SERVICE_ACCOUNT: '{"project_id":"test"}', YOUTUBE_API_KEY: 'configured',
+      },
+      youtubeApiFallback: { enabled: true, configured: true, dailyCap: null },
+    }),
+    runtime: new FakeRuntime(namespace), remote: new MemoryAdapter(entries), now: () => clock,
+    authorityClient: { async probeRss() {
+      return remoteProbe('failure');
+    } },
+    rssPoller: async () => { const error = new Error('404'); error.category = 'http-404'; throw error; },
+    youtubeApiFetcher: async (channelId) => {
+      apiChannels.push(channelId);
+      return {
+        channelName: 'Synthetic',
+        uploads: [{
+          videoId: `video-${channelId}`, title: 'Existing upload', published: '2026-10-01T00:00:00.000Z',
+          thumbnail: null, link: 'https://example.test/video', channelTitle: 'Synthetic',
+          views: null, likes: null, dislikes: null,
+        }],
+      };
+    },
+    postPoller: async () => {}, auxRunner: async () => {},
+  });
+  await runner.start();
+  t.after(() => runner.close());
+  for (let minute = 0; minute < 5; minute++) {
+    clock = Date.UTC(2026, 9, 5, 12, minute);
+    await runner.runTick(clock);
+  }
+  let state = await runner.status();
+  assert.equal(state.rssHealth.sourceMode, 'rss-probe-confirming');
+  assert.equal(apiChannels.length, 0, 'opening the circuit must not immediately backfill');
+  clock = Date.UTC(2026, 9, 5, 12, 5);
+  await runner.runTick(clock);
+  state = await runner.status();
+  assert.equal(state.rssHealth.sourceMode, 'rss-global-down-api-fallback');
+  const coverage = state.rssHealth.fallback.coverageMinutes;
+  let fallbackAt = null;
+  for (let minute = 5; minute < 60; minute++) {
+    const candidate = Date.UTC(2026, 9, 5, 12, minute);
+    if (fallbackChannelsForMinute(channels, candidate, coverage).length > 0) { fallbackAt = candidate; break; }
+  }
+  assert.ok(fallbackAt);
+  clock = fallbackAt;
+  const result = await runner.runTick(clock);
+  state = await runner.status();
+  assert.equal(apiChannels.length, 1);
+  assert.equal(result.wouldNotify.total, 0);
+  assert.equal(state.rssHealth.fallback.quotaUsed, 1);
+  assert.equal(state.rssHealth.fallback.requests, 1);
+  assert.equal(state.rssHealth.fallback.failures, 0);
+  assert.ok(state.rssHealth.lastGoodApiAt);
+});
+
+test('85 Home 404s plus two signed Cloudflare network-failure rounds persist across restart and begin capped API work', async (t) => {
+  const dataDir = await temporaryDirectory(t);
+  const { channels, entries } = canonicalChannels(85);
+  const namespace = new MemoryNamespace();
+  let clock = Date.UTC(2026, 9, 5, 12, 0);
+  let homeCalls = 0;
+  let subrequests = 0;
+  const apiPerMinute = new Map();
+  const worker = createAuthorityWorker({ async fetch() { throw new Error('unexpected app route'); } }, {
+    rssProbeFetch: async (_url, init) => {
+      assert.equal(init.redirect, 'manual');
+      subrequests++;
+      throw new Error('independent network rejection');
+    },
+  });
+  const runnerConfig = config(dataDir, {
+    workerBindings: { YOUTUBE_API_KEY: 'configured', TUBEPULSE_ENABLE_COMMUNITY_POSTS: 'false', TUBEPULSE_NOTIFICATION_MODE: 'shadow' },
+    youtubeApiFallback: { enabled: true, configured: true, dailyCap: null },
+  });
+  const authorityClient = new AuthorityClient({
+    baseUrl: runnerConfig.authority.apiUrl, secret: runnerConfig.authority.secret,
+    fetchImpl: async (url, init) => await worker.fetch(new Request(url, init), {
+      TUBEPULSE_HOME_AUTHORITY_ENABLED: 'true', TUBEPULSE_HOME_AUTHORITY_TRANSPORT: 'https',
+      TUBEPULSE_HOME_AUTHORITY_ORIGIN: 'https://home.example.test',
+      TUBEPULSE_HOME_AUTHORITY_SECRET: runnerConfig.authority.secret,
+      TUBEPULSE_AUTHORITY_COORDINATOR: { get() { throw new Error('probe must not touch coordinator'); } },
+    }, {}),
+  });
+  const dependencies = {
+    config: runnerConfig, runtime: new FakeRuntime(namespace), remote: new MemoryAdapter(entries), now: () => clock, authorityClient,
+    rssPoller: async () => { homeCalls++; throw Object.assign(new Error('404'), { category: 'http-404' }); },
+    youtubeApiFetcher: async () => {
+      const minute = Math.floor(clock / 60_000);
+      apiPerMinute.set(minute, (apiPerMinute.get(minute) || 0) + 1);
+      return { channelName: 'Synthetic', uploads: [] };
+    }, postPoller: async () => {}, auxRunner: async () => {},
+  };
+  let runner = new HomeSchedulerRunner(dependencies);
+  await runner.start();
+  t.after(() => runner.close());
+  for (let minute = 0; minute < 5; minute++) {
+    clock = Date.UTC(2026, 9, 5, 12, minute);
+    await runner.runTick(clock);
+    if (minute < 4) assert.equal(subrequests, 0, 'partial cycle must not probe');
+  }
+  const first = await runner.status();
+  assert.equal(homeCalls, 85);
+  assert.equal(subrequests, 2);
+  assert.equal(first.rssHealth.sourceMode, 'rss-probe-confirming');
+  assert.equal(first.rssHealth.independentProbe.unavailableStreak, 1);
+  assert.equal(first.rssHealth.fallback.requests, 0);
+  await runner.close();
+  runner = new HomeSchedulerRunner(dependencies);
+  await runner.start();
+  assert.equal((await runner.status()).rssHealth.independentProbe.unavailableStreak, 1);
+  clock += 60_000;
+  await runner.runTick(clock);
+  const second = await runner.status();
+  assert.equal(homeCalls, 85, 'remote confirmation avoids an extra Home fetch');
+  assert.equal(subrequests, 4);
+  assert.equal(second.rssHealth.sourceMode, 'rss-global-down-api-fallback');
+  assert.equal(second.rssHealth.independentProbe.unavailableStreak, 2);
+  assert.equal(Date.parse(second.rssHealth.independentProbe.lastUnavailableAt) - Date.parse(first.rssHealth.independentProbe.lastUnavailableAt), 60_000);
+  assert.ok(second.rssHealth.fallback.requests >= 1);
+  for (let minute = 6; minute < 12; minute++) {
+    clock = Date.UTC(2026, 9, 5, 12, minute);
+    await runner.runTick(clock);
+  }
+  const final = await runner.status();
+  assert.ok([...apiPerMinute.values()].every((count) => count >= 1 && count <= 2));
+  assert.equal(final.rssHealth.fallback.requests, [...apiPerMinute.values()].reduce((sum, value) => sum + value, 0));
+  assert.equal(final.rssHealth.fallback.quotaUnitsUsed, final.rssHealth.fallback.requests);
+  assert.equal(final.rssHealth.fallback.quotaLimit, 6960);
+  assert.equal(final.rssHealth.fallback.projectedDailyRequests, 2040);
+  assert.ok(Date.parse(final.rssHealth.circuit.until) > clock, 'bounded recovery is armed');
+});
+
+test('confirmation rejects same-minute repetitions, cancels for any valid feed or ambiguity, and needs budget', async (t) => {
+  const dataDir = await temporaryDirectory(t);
+  let clock = Date.UTC(2026, 9, 5, 12, 0);
+  const runner = new HomeSchedulerRunner({ config: config(dataDir, {
+    workerBindings: { YOUTUBE_API_KEY: 'configured' }, youtubeApiFallback: { enabled: true, dailyCap: 1 },
+  }), now: () => clock });
+  const health = normalizeRssHealthState(null, clock);
+  const failed = remoteProbe('failure', 'network', null);
+  runner.applyIndependentRssProbe(health, failed, 85);
+  clock += 59_999;
+  runner.applyIndependentRssProbe(health, failed, 85);
+  assert.equal(health.independentProbe.unavailableStreak, 1);
+  assert.equal(health.sourceMode, 'rss-probe-confirming');
+  const success = remoteProbe('failure');
+  success.outcome = 'success';
+  success.probes[1] = { label: 'active', status: 200, validXml: true, classification: 'valid-feed' };
+  clock++;
+  runner.applyIndependentRssProbe(health, success, 85);
+  assert.equal(health.sourceMode, 'home-egress-throttled');
+  assert.equal(health.independentProbe.unavailableStreak, 0);
+  runner.applyIndependentRssProbe(health, failed, 85);
+  clock += 60_000;
+  runner.applyIndependentRssProbe(health, { outcome: 'inconclusive', probes: [] }, 85);
+  assert.equal(health.sourceMode, 'rss-probe-inconclusive');
+  assert.equal(health.independentProbe.unavailableStreak, 0);
+  runner.applyIndependentRssProbe(health, failed, 85);
+  clock += 60_000;
+  health.fallback.requests = 1;
+  health.fallback.quotaUnitsUsed = health.fallback.quotaUsed = 1;
+  runner.applyIndependentRssProbe(health, failed, 85);
+  assert.equal(health.independentProbe.unavailableStreak, 2);
+  assert.equal(health.sourceMode, 'stale-cache', 'exhausted budget prevents activation');
+});
+
+test('each API reservation enforces both exact 10000 boundaries before calls without overshooting by one', async (t) => {
+  const dataDir = await temporaryDirectory(t);
+  const { channels } = canonicalChannels(85);
+  const clock = Date.UTC(2026, 9, 5, 12, 2); // Two selected channels.
+  let apiCalls = 0;
+  const runner = new HomeSchedulerRunner({ config: config(dataDir, {
+    workerBindings: { YOUTUBE_API_KEY: 'configured' }, youtubeApiFallback: { enabled: true },
+  }), now: () => clock, youtubeApiFetcher: async () => {
+    apiCalls++;
+    const reserved = (await runner.stateFile.read()).rssHealth.fallback;
+    assert.equal(reserved.requests, 10000);
+    assert.equal(reserved.quotaUnitsUsed, 10000);
+    return { uploads: [] };
+  } });
+  runner.fallbackPlan = () => ({ dailyCap: 10000, requestLimit: 10000, quotaUnitLimit: 10000, coverageMinutes: 60 });
+  for (const [requests, units, expectedCalls] of [[10000, 9999, 0], [9999, 10000, 0], [9999, 9999, 1]]) {
+    const health = normalizeRssHealthState(null, clock);
+    Object.assign(health.fallback, { requests, quotaUsed: units, quotaUnitsUsed: units });
+    const before = apiCalls;
+    await runner.runYoutubeFallback({ TUBEPULSE_KV: new MemoryNamespace() }, health, channels, clock);
+    assert.equal(apiCalls - before, expectedCalls);
+    assert.ok(health.fallback.requests <= 10000);
+    assert.ok(health.fallback.quotaUnitsUsed <= 10000);
+  }
+});
+
+test('independent probe outage fails safe with stale cache and no Data API request', async (t) => {
+  const dataDir = await temporaryDirectory(t);
+  const { entries } = canonicalChannels(5);
+  let clock = Date.UTC(2026, 9, 5, 12, 0);
+  let apiCalls = 0;
+  const runner = new HomeSchedulerRunner({
+    config: config(dataDir, {
+      workerBindings: {
+        TUBEPULSE_ENABLE_COMMUNITY_POSTS: 'true', TUBEPULSE_NOTIFICATION_MODE: 'shadow',
+        FIREBASE_SERVICE_ACCOUNT: '{"project_id":"test"}', YOUTUBE_API_KEY: 'configured',
+      },
+      youtubeApiFallback: { enabled: true, configured: true, dailyCap: null },
+    }),
+    runtime: new FakeRuntime(), remote: new MemoryAdapter(entries), now: () => clock,
+    authorityClient: { async probeRss() { throw new Error('unavailable'); } },
+    rssPoller: async () => { const error = new Error('404'); error.category = 'http-404'; throw error; },
+    youtubeApiFetcher: async () => { apiCalls++; }, postPoller: async () => {}, auxRunner: async () => {},
+  });
+  await runner.start();
+  t.after(() => runner.close());
+  for (let minute = 0; minute < 6; minute++) {
+    clock = Date.UTC(2026, 9, 5, 12, minute);
+    await runner.runTick(clock);
+  }
+  const state = await runner.status();
+  assert.equal(state.rssHealth.sourceMode, 'rss-probe-inconclusive');
+  assert.equal(apiCalls, 0);
+});
+
+test('confirmed global RSS failure remains stale-cache when the Data API key is absent', async (t) => {
+  const dataDir = await temporaryDirectory(t);
+  const { entries } = canonicalChannels(5);
+  let clock = Date.UTC(2026, 9, 5, 12, 0);
+  let apiCalls = 0;
+  const runner = new HomeSchedulerRunner({
+    config: config(dataDir, {
+      youtubeApiFallback: { enabled: false, configured: false, dailyCap: null },
+    }),
+    runtime: new FakeRuntime(), remote: new MemoryAdapter(entries), now: () => clock,
+    authorityClient: { async probeRss() {
+      return remoteProbe('failure');
+    } },
+    rssPoller: async () => { const error = new Error('404'); error.category = 'http-404'; throw error; },
+    youtubeApiFetcher: async () => { apiCalls++; }, postPoller: async () => {}, auxRunner: async () => {},
+  });
+  await runner.start();
+  t.after(() => runner.close());
+  for (let minute = 0; minute < 6; minute++) {
+    clock = Date.UTC(2026, 9, 5, 12, minute);
+    await runner.runTick(clock);
+  }
+  const state = await runner.status();
+  assert.equal(state.rssHealth.sourceMode, 'stale-cache');
+  assert.equal(state.rssHealth.circuit.open, true);
+  assert.equal(state.rssHealth.independentProbe.outcome, 'failure');
+  assert.equal(apiCalls, 0);
+});
+
+test('Data API fallback failure is bounded, quota-counted, and does not fail scheduler authority', async (t) => {
+  const dataDir = await temporaryDirectory(t);
+  const { channels, entries } = canonicalChannels(5);
+  let clock = Date.UTC(2026, 9, 5, 12, 0);
+  let apiCalls = 0;
+  const runner = new HomeSchedulerRunner({
+    config: config(dataDir, {
+      workerBindings: {
+        TUBEPULSE_ENABLE_COMMUNITY_POSTS: 'true', TUBEPULSE_NOTIFICATION_MODE: 'shadow',
+        FIREBASE_SERVICE_ACCOUNT: '{"project_id":"test"}', YOUTUBE_API_KEY: 'configured',
+      },
+      youtubeApiFallback: { enabled: true, configured: true, dailyCap: null },
+    }),
+    runtime: new FakeRuntime(), remote: new MemoryAdapter(entries), now: () => clock,
+    rssPoller: async () => {},
+    youtubeApiFetcher: async () => {
+      apiCalls++;
+      const error = new Error('synthetic quota response');
+      error.category = 'quota-or-forbidden';
+      throw error;
+    },
+    postPoller: async () => {}, auxRunner: async () => {},
+  });
+  await runner.start();
+  t.after(() => runner.close());
+  const state = await runner.status();
+  state.rssHealth.sourceMode = 'rss-global-down-api-fallback';
+  state.rssHealth.circuit = {
+    open: true, reason: 'full-fleet-http-404', outageClass: 'http-404',
+    openedAt: new Date(clock).toISOString(), until: new Date(clock + 60 * 60_000).toISOString(),
+    cooldownMinutes: 60, recoverySuccesses: 0,
+  };
+  await runner.stateFile.write(state);
+  const coverage = runner.fallbackPlan(channels.length).coverageMinutes;
+  for (let minute = 0; minute < coverage; minute++) {
+    const candidate = Date.UTC(2026, 9, 5, 12, minute);
+    if (fallbackChannelsForMinute(channels, candidate, coverage).length > 0) { clock = candidate; break; }
+  }
+  const result = await runner.runTick(clock);
+  const after = await runner.status();
+  assert.equal(apiCalls, 1);
+  assert.equal(result.outcome, 'ok');
+  assert.equal(result.wouldNotify.total, 0);
+  assert.equal(after.rssHealth.sourceMode, 'rss-global-down-api-fallback');
+  assert.equal(after.rssHealth.fallback.quotaUsed, 1);
+  assert.equal(after.rssHealth.fallback.failures, 1);
+  assert.equal(after.rssHealth.fallback.lastError.category, 'quota-or-forbidden');
+  assert.equal(after.lastError, null);
+});
+
+test('persisted fallback quota resets at Pacific midnight rather than UTC midnight', async (t) => {
+  const dataDir = await temporaryDirectory(t);
+  const runner = new HomeSchedulerRunner({ config: config(dataDir) });
+  const health = {
+    fallback: {
+      quotaDay: '2026-03-08', quotaUsed: 123, requests: 123, failures: 2,
+      skipped: 4, lastError: { category: 'synthetic' },
+    },
+  };
+  runner.refreshFallbackQuota(health, 5, Date.parse('2026-03-09T06:59:59.000Z'));
+  assert.equal(health.fallback.quotaDay, '2026-03-08');
+  assert.equal(health.fallback.quotaUsed, 123);
+  runner.refreshFallbackQuota(health, 5, Date.parse('2026-03-09T07:00:00.000Z'));
+  assert.equal(health.fallback.quotaDay, '2026-03-09');
+  assert.equal(health.fallback.quotaUsed, 0);
+  assert.equal(health.fallback.requests, 0);
+  assert.equal(health.fallback.failures, 0);
+  assert.equal(health.fallback.lastError, null);
+});
+
+test('persisted fallback sub-cap blocks requests instead of borrowing from the next Google quota day', async (t) => {
+  const dataDir = await temporaryDirectory(t);
+  const { channels } = canonicalChannels(5);
+  let apiCalls = 0;
+  let scheduledTime = Date.UTC(2026, 9, 5, 12, 0);
+  const runner = new HomeSchedulerRunner({
+    config: config(dataDir, {
+      workerBindings: { YOUTUBE_API_KEY: 'configured' },
+      youtubeApiFallback: { enabled: true, configured: true, dailyCap: 1 },
+    }),
+    youtubeApiFetcher: async () => { apiCalls++; },
+    now: () => scheduledTime,
+  });
+  const coverage = runner.fallbackPlan(channels.length).coverageMinutes;
+  const epochStart = Math.floor(Date.UTC(2026, 9, 5, 12, 0) / (coverage * 60_000)) * coverage * 60_000;
+  scheduledTime = undefined;
+  for (let minute = 0; minute < coverage; minute++) {
+    const candidate = epochStart + minute * 60_000;
+    if (fallbackChannelsForMinute(channels, candidate, coverage).length > 0) { scheduledTime = candidate; break; }
+  }
+  assert.ok(Number.isFinite(scheduledTime));
+  const day = pacificQuotaWindow(scheduledTime).day;
+  const health = {
+    fallback: {
+      quotaDay: day, quotaUsed: 1, requests: 1, failures: 0, skipped: 0,
+      quotaLimit: 1, resetsAt: null, coverageMinutes: coverage, lastError: null,
+    },
+  };
+  const result = await runner.runYoutubeFallback({}, health, channels, scheduledTime);
+  assert.equal(result.outcome, 'quota-blocked');
+  assert.equal(result.quotaBlocked, 1);
+  assert.equal(apiCalls, 0);
+  assert.equal(health.fallback.quotaUsed, 1);
+});
+
+test('failed home recovery probes exponentially back off and cap the persisted cooldown', async (t) => {
+  const dataDir = await temporaryDirectory(t);
+  const { entries } = canonicalChannels(5);
+  let clock = Date.UTC(2026, 9, 5, 12, 0);
+  let rssCalls = 0;
+  const runner = new HomeSchedulerRunner({
+    config: config(dataDir, {
+      rssCircuitInitialCooldownMinutes: 1,
+      rssCircuitMaximumCooldownMinutes: 4,
+    }),
+    runtime: new FakeRuntime(), remote: new MemoryAdapter(entries), now: () => clock,
+    authorityClient: { async probeRss() {
+      return remoteProbe('success');
+    } },
+    rssPoller: async () => {
+      rssCalls++;
+      const error = new Error('404');
+      error.category = 'http-404';
+      throw error;
+    },
+    postPoller: async () => {}, auxRunner: async () => {},
+  });
+  await runner.start();
+  t.after(() => runner.close());
+  for (let minute = 0; minute < 5; minute++) {
+    clock = Date.UTC(2026, 9, 5, 12, minute);
+    await runner.runTick(clock);
+  }
+  let state = await runner.status();
+  assert.equal(state.rssHealth.circuit.cooldownMinutes, 1);
+  assert.equal(Date.parse(state.rssHealth.circuit.until), Date.UTC(2026, 9, 5, 12, 5));
+
+  clock = Date.parse(state.rssHealth.circuit.until);
+  await runner.runTick(clock);
+  state = await runner.status();
+  assert.equal(state.rssHealth.circuit.cooldownMinutes, 2);
+  assert.equal(Date.parse(state.rssHealth.circuit.until), Date.UTC(2026, 9, 5, 12, 7));
+
+  clock = Date.parse(state.rssHealth.circuit.until);
+  await runner.runTick(clock);
+  state = await runner.status();
+  assert.equal(state.rssHealth.circuit.cooldownMinutes, 4);
+  assert.equal(Date.parse(state.rssHealth.circuit.until), Date.UTC(2026, 9, 5, 12, 11));
+
+  clock = Date.parse(state.rssHealth.circuit.until);
+  await runner.runTick(clock);
+  state = await runner.status();
+  assert.equal(state.rssHealth.circuit.cooldownMinutes, 4);
+  assert.equal(Date.parse(state.rssHealth.circuit.until), Date.UTC(2026, 9, 5, 12, 15));
+  assert.equal(state.rssHealth.sourceMode, 'home-egress-throttled');
+  assert.equal(rssCalls, 8, 'five cycle requests plus one bounded home probe at each due time');
+});
+
+test('open RSS circuit persists and requires two consecutive valid home probes before resuming', async (t) => {
+  const dataDir = await temporaryDirectory(t);
+  const { entries } = canonicalChannels(5);
+  const namespace = new MemoryNamespace();
+  const remote = new MemoryAdapter(entries);
+  let clock = Date.UTC(2026, 9, 5, 12, 0);
+  let calls = 0;
+  const options = {
+    config: config(dataDir, { rssCircuitInitialCooldownMinutes: 1, rssCircuitMaximumCooldownMinutes: 4 }),
+    runtime: new FakeRuntime(namespace), remote, now: () => clock,
+    authorityClient: { async probeRss() {
+      return remoteProbe('success');
+    } },
+    rssPoller: async () => {
+      calls++;
+      if (calls <= 5) { const error = new Error('404'); error.category = 'http-404'; throw error; }
+    },
+    postPoller: async () => {}, auxRunner: async () => {},
+  };
+  const first = new HomeSchedulerRunner(options);
+  await first.start();
+  for (let minute = 0; minute < 5; minute++) {
+    clock = Date.UTC(2026, 9, 5, 12, minute);
+    await first.runTick(clock);
+  }
+  let state = await first.status();
+  assert.equal(state.rssHealth.circuit.open, true);
+  const due = Date.parse(state.rssHealth.circuit.until);
+  await first.close();
+
+  const second = new HomeSchedulerRunner({ ...options, runtime: new FakeRuntime(namespace) });
+  await second.start();
+  t.after(() => second.close());
+  clock = due - 1;
+  await second.runTick(clock);
+  assert.equal(calls, 5, 'restart before cooldown must not issue a probe');
+  clock = due;
+  await second.runTick(clock);
+  state = await second.status();
+  assert.equal(state.rssHealth.sourceMode, 'rss-recovering');
+  assert.equal(state.rssHealth.circuit.open, true);
+  assert.equal(state.rssHealth.circuit.recoverySuccesses, 1);
+  clock = due + 60_000;
+  await second.runTick(clock);
+  state = await second.status();
+  assert.equal(state.rssHealth.sourceMode, 'rss');
+  assert.equal(state.rssHealth.circuit.open, false);
+  assert.equal(state.lastError, null);
+});
+
+test('fleet RSS outage remains a recoverable source state and never marks active Home authority stale', async (t) => {
+  const dataDir = await temporaryDirectory(t);
+  const { entries } = canonicalChannels(5);
+  const remote = new MemoryAdapter(entries);
+  const gate = new FakeAuthorityGate();
+  const authorityClient = new FakeAuthorityClient(remote);
+  let clock = Date.UTC(2026, 9, 5, 12, 0);
+  const notificationCoordinator = {
+    async stage() {},
+    async flush() { return { queued: 0, sent: 0, failed: 0, suppressed: 0, barrier: 'passed' }; },
+    async suppress() { throw new Error('nothing should be suppressed'); },
+  };
+  const runner = new HomeSchedulerRunner({
+    config: config(dataDir, {
+      mode: 'active', remoteWriteEnabled: true, notificationsEnabled: true,
+      schedulesDisabled: true, notificationBarrier: { configured: true },
+    }),
+    runtime: new FakeRuntime(new MemoryNamespace(entries)), remote, now: () => clock,
+    authorityGate: gate, authorityClient, notificationCoordinator,
+    rssPoller: async () => { const error = new Error('404'); error.category = 'http-404'; throw error; },
+    postPoller: async () => {}, auxRunner: async () => {},
+  });
+  await runner.start();
+  t.after(() => runner.close());
+  for (let minute = 0; minute < 5; minute++) {
+    clock = Date.UTC(2026, 9, 5, 12, minute);
+    await runner.runTick(clock);
+  }
+  const state = await runner.status();
+  assert.equal(state.rssHealth.circuit.open, true);
+  assert.equal(state.rssHealth.sourceMode, 'rss-probe-inconclusive');
+  assert.equal(gate.stale, false);
+  assert.equal((await gate.status()).replication.status, 'current');
+  assert.equal(state.lastError, null);
 });
 
 test('channel timeout is bounded and reported without aborting coverage', async (t) => {
@@ -494,7 +1127,7 @@ test('predicted write accounting separates metric-only churn and redacts key ide
     ...cachedPost[0], likeCount: 2, likeText: '2 likes', viewCount: 11, viewText: '11 views',
   }];
   const observationRefresh = [{
-    ...metricRefresh[0], fetchedAt: '2026-10-04T11:00:00.000Z',
+    ...cachedPost[0], fetchedAt: '2026-10-04T11:00:00.000Z',
   }];
   assert.equal(
     mutationReason('channel:UCx:recent:posts', JSON.stringify(cachedPost), JSON.stringify(metricRefresh)),
@@ -551,6 +1184,109 @@ test('community post cache ignores only rotating YouTube thumbnail delivery para
     publishedAt: null,
     publishedText: '2 days ago',
   }, [{ ...cached, publishedAt: null }]), true, 'relative label remains authoritative without a timestamp');
+});
+
+test('community post persistence throttles observation and engagement churn without delaying structure', () => {
+  const cached = {
+    id: 'post:Ugpost', activityId: 'Ugpost', postId: 'Ugpost',
+    fetchedAt: '2026-10-04T10:05:00.000Z',
+    publishedAt: '2026-10-03T10:00:00.000Z', publishedAtSource: 'estimated_from_relative',
+    publishedText: '1 day ago', thumbnail: 'https://i.ytimg.com/abc/image.jpg?sqp=old&rs=old',
+    text: 'same', likeCount: 100, likeText: '100 likes', viewCount: 1000, viewText: '1K views',
+    kind: 'community', link: 'https://www.youtube.com/post/Ugpost', source: 'innertube',
+  };
+  const latest = (overrides = {}) => ({
+    ...cached,
+    fetchedAt: '2026-10-04T11:05:00.000Z',
+    publishedText: '25 hours ago',
+    thumbnail: 'https://i.ytimg.com/abc/image.jpg?sqp=new&rs=new',
+    ...overrides,
+  });
+
+  assert.equal(
+    mergeCachedCommunityPostForPersistence(latest({ likeCount: 124, likeText: '124 likes' }), [cached]),
+    cached,
+    'sub-threshold metrics, relative text and rotating delivery signatures are a true no-op',
+  );
+  const significant = mergeCachedCommunityPostForPersistence(
+    latest({ likeCount: 126, likeText: '126 likes' }), [cached],
+  );
+  assert.equal(significant.likeCount, 126);
+  assert.equal(significant.fetchedAt, '2026-10-04T11:05:00.000Z');
+  assert.equal(significant.thumbnail, cached.thumbnail);
+
+  assert.equal(
+    mergeCachedCommunityPostForPersistence(latest({
+      fetchedAt: '2026-10-04T10:55:00.000Z', likeCount: 500, likeText: '500 likes',
+    }), [cached]),
+    cached,
+    'a same-hour spike cannot cause a second persistence write',
+  );
+
+  const forced = mergeCachedCommunityPostForPersistence(latest({
+    fetchedAt: '2026-10-05T10:05:00.000Z', viewCount: 1100, viewText: '1.1K views',
+  }), [cached]);
+  assert.equal(forced.viewCount, 1100);
+  assert.equal(forced.fetchedAt, '2026-10-05T10:05:00.000Z');
+
+  const unknown = { ...cached, likeCount: null, likeText: null };
+  const hydrated = mergeCachedCommunityPostForPersistence(latest({
+    fetchedAt: cached.fetchedAt, likeCount: 0, likeText: '0 likes',
+  }), [unknown]);
+  assert.equal(hydrated.likeCount, 0, 'explicit zero hydrates an unknown metric');
+
+  const structural = mergeCachedCommunityPostForPersistence(latest({ text: 'edited' }), [cached]);
+  assert.equal(structural.text, 'edited');
+  assert.notEqual(structural, cached);
+  const newPost = latest({ id: 'post:Ugnew', activityId: 'Ugnew', postId: 'Ugnew', text: 'new' });
+  assert.equal(mergeCachedCommunityPostForPersistence(newPost, [cached]), newPost);
+});
+
+test('eligible post comparison with only sub-threshold observation churn publishes zero writes', async () => {
+  const channelId = 'UC0000000000000000000000';
+  const postId = 'Ugpost';
+  const now = Date.now();
+  const cached = {
+    id: `post:${postId}`, activityId: postId, postId,
+    publishedAt: new Date(now - 24 * 60 * 60 * 1000).toISOString(),
+    publishedAtSource: 'estimated_from_relative', publishedText: '1 day ago',
+    fetchedAt: new Date(now - 60_000).toISOString(),
+    likeCount: 100, likeText: '100 likes', viewCount: 1000, viewText: '1K views',
+    authorName: null, text: 'same',
+    thumbnail: 'https://i.ytimg.com/abc/image.jpg?sqp=old&rs=old',
+    kind: 'community', link: `https://www.youtube.com/post/${postId}`, source: 'innertube',
+  };
+  const namespace = new MemoryNamespace({
+    [`channel:${channelId}:firstPollAt:posts`]: JSON.stringify('2026-10-01T00:00:00Z'),
+    [`channel:${channelId}:recent:posts`]: JSON.stringify([cached]),
+    [`channel:${channelId}:known:posts`]: JSON.stringify([`post:${postId}`]),
+  });
+  let writes = 0;
+  const originalPut = namespace.put.bind(namespace);
+  namespace.put = async (...args) => { writes++; return await originalPut(...args); };
+  const payload = {
+    contents: [{ backstagePostThreadRenderer: { post: { backstagePostRenderer: {
+      postId,
+      publishedTimeText: { simpleText: '1 day ago' },
+      voteCount: { simpleText: '124 likes' },
+      viewCount: { simpleText: '1.1K views' },
+      contentText: { simpleText: 'same' },
+      backstageAttachment: { image: { thumbnails: [{
+        url: 'https://i.ytimg.com/abc/image.jpg?sqp=new&rs=new', width: 640, height: 360,
+      }] } },
+    } } } }],
+  };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => Response.json(payload);
+  try {
+    const result = await pollSingleCommunityChannel(
+      { TUBEPULSE_KV: namespace }, { waitUntil() {} }, channelId, false,
+    );
+    assert.equal(result.outcome, 'unchanged');
+    assert.equal(writes, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test('shadow notification path cannot mint a token or contact FCM', async () => {

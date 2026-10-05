@@ -102,6 +102,37 @@ function appRequest(path, body = {}) {
   });
 }
 
+async function signedInternalRequest(path, operation, body, overrides = {}) {
+  const bodyText = JSON.stringify(body);
+  const timestamp = overrides.timestamp ?? Date.now();
+  const requestId = overrides.requestId || `synthetic-probe-${crypto.randomUUID()}`;
+  const bodyDigest = await authoritySha256(bodyText);
+  const authorizationDigest = await authoritySha256('');
+  const canonical = authorityTestHelpers.authorityCanonical({
+    timestamp,
+    requestId,
+    operation,
+    method: 'POST',
+    target: path,
+    authorizationDigest,
+    bodyDigest,
+  });
+  const signature = crypto.createHmac('sha256', SECRET).update(canonical).digest('hex');
+  return new Request(`https://api.example.test${path}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-TubePulse-Authority-Version': '1',
+      'X-TubePulse-Authority-Timestamp': String(timestamp),
+      'X-TubePulse-Authority-Request-Id': requestId,
+      'X-TubePulse-Authority-Operation': operation,
+      'X-TubePulse-Authority-Body-SHA256': bodyDigest,
+      'X-TubePulse-Authority-Signature': overrides.signature || signature,
+    },
+    body: bodyText,
+  });
+}
+
 test('feature off preserves the exact app request/response and performs no authority work', async () => {
   const originalResponse = new Response('unchanged', { status: 202 });
   const originalRequest = appRequest('/register');
@@ -163,6 +194,170 @@ test('active authority acknowledges legacy WebSub pushes without writes and disa
   assert.equal(verification.status, 200);
   assert.equal(calls, 1);
   assert.equal(fixture.kv.writes, 0);
+});
+
+test('signed RSS probe uses only fixed YouTube feed URLs and performs no KV or coordinator operation', async () => {
+  const fixture = coordinatorFixture();
+  const requested = [];
+  let appCalls = 0;
+  const worker = createAuthorityWorker({ async fetch() { appCalls++; return new Response('unexpected'); } }, {
+    rssProbeFetch: async (url) => {
+      const parsed = new URL(url);
+      requested.push(parsed);
+      const channelId = parsed.searchParams.get('channel_id');
+      return new Response(`<feed xmlns:yt="http://www.youtube.com/xml/schemas/2015"><yt:channelId>${channelId}</yt:channelId></feed>`, {
+        headers: { 'Content-Type': 'application/atom+xml' },
+      });
+    },
+  });
+  const before = { reads: fixture.kv.reads, writes: fixture.kv.writes };
+  const activeChannelId = 'UC0000000000000000000000';
+  const request = await signedInternalRequest(
+    '/_tubepulse/authority/rss-probe', 'authority-rss-probe', { activeChannelId },
+  );
+  const response = await worker.fetch(request, authorityEnv(fixture, async () => { throw new Error('Home must not be called'); }), {});
+  assert.equal(response.status, 200);
+  const payload = await response.json();
+  assert.equal(payload.outcome, 'success');
+  assert.equal(payload.probes.length, 2);
+  assert.equal(appCalls, 0);
+  assert.deepEqual({ reads: fixture.kv.reads, writes: fixture.kv.writes }, before);
+  assert.equal(requested.length, 2);
+  for (const url of requested) {
+    assert.equal(url.origin, 'https://www.youtube.com');
+    assert.equal(url.pathname, '/feeds/videos.xml');
+    assert.deepEqual([...url.searchParams.keys()], ['channel_id']);
+  }
+  assert.equal(payload.probes.some((probe) => Object.values(probe).includes(activeChannelId)), false);
+});
+
+test('RSS probe requires valid HMAC, rejects replay/arbitrary targets, and classifies bounded failures', async () => {
+  const fixture = coordinatorFixture();
+  let fetchCalls = 0;
+  const worker = createAuthorityWorker({ async fetch() { throw new Error('must not run'); } }, {
+    rssProbeFetch: async () => { fetchCalls++; return new Response('not found', { status: 404 }); },
+  });
+  const env = authorityEnv(fixture, async () => { throw new Error('Home must not be called'); });
+  const path = '/_tubepulse/authority/rss-probe';
+  const requestId = 'synthetic-probe-replay-0001';
+  let request = await signedInternalRequest(path, 'authority-rss-probe', {}, { requestId });
+  let response = await worker.fetch(request, env, {});
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).outcome, 'failure');
+  assert.equal(fetchCalls, 1);
+
+  request = await signedInternalRequest(path, 'authority-rss-probe', {}, { requestId });
+  response = await worker.fetch(request, env, {});
+  assert.equal(response.status, 401);
+  assert.equal(fetchCalls, 1);
+
+  request = await signedInternalRequest(path, 'authority-rss-probe', { url: 'https://example.test/' });
+  response = await worker.fetch(request, env, {});
+  assert.equal(response.status, 400);
+  assert.equal(fetchCalls, 1);
+
+  request = await signedInternalRequest(path, 'authority-rss-probe', {}, { signature: '0'.repeat(64) });
+  response = await worker.fetch(request, env, {});
+  assert.equal(response.status, 401);
+  assert.equal(fetchCalls, 1);
+});
+
+test('RSS probe returns independent inability on subrequest network errors and rejects oversized bodies before fetch', async () => {
+  const fixture = coordinatorFixture();
+  let fetchCalls = 0;
+  const worker = createAuthorityWorker({ async fetch() { throw new Error('must not run'); } }, {
+    rssProbeFetch: async () => { fetchCalls++; throw new Error('network unavailable'); },
+  });
+  const env = authorityEnv(fixture, async () => { throw new Error('Home must not be called'); });
+  const path = '/_tubepulse/authority/rss-probe';
+  let request = await signedInternalRequest(path, 'authority-rss-probe', {});
+  let response = await worker.fetch(request, env, {});
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).outcome, 'failure');
+  assert.equal(fetchCalls, 1);
+
+  const body = JSON.stringify({ activeChannelId: 'x'.repeat(authorityTestHelpers.RSS_PROBE_MAX_BODY_BYTES + 100) });
+  request = new Request(`https://api.example.test${path}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body,
+  });
+  response = await worker.fetch(request, env, {});
+  assert.equal(response.status, 413);
+  assert.equal(fetchCalls, 1);
+});
+
+test('RSS probe bounds upstream response size and timeout without returning content', async () => {
+  const fixture = coordinatorFixture();
+  const path = '/_tubepulse/authority/rss-probe';
+  const oversizedWorker = createAuthorityWorker({ async fetch() { throw new Error('must not run'); } }, {
+    rssProbeFetch: async () => new Response('x'.repeat(authorityTestHelpers.RSS_PROBE_MAX_RESPONSE_BYTES + 1)),
+  });
+  let response = await oversizedWorker.fetch(
+    await signedInternalRequest(path, 'authority-rss-probe', {}),
+    authorityEnv(fixture, async () => { throw new Error('Home must not be called'); }),
+    {},
+  );
+  let payload = await response.json();
+  assert.equal(payload.outcome, 'failure');
+  assert.equal(payload.probes[0].classification, 'response-too-large');
+  assert.equal(Object.hasOwn(payload.probes[0], 'body'), false);
+
+  const timeoutWorker = createAuthorityWorker({ async fetch() { throw new Error('must not run'); } }, {
+    rssProbeFetch: async (_url, init) => await new Promise((resolve, reject) => {
+      init.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+    }),
+  });
+  response = await timeoutWorker.fetch(
+    await signedInternalRequest(path, 'authority-rss-probe', {}),
+    authorityEnv(fixture, async () => { throw new Error('Home must not be called'); }),
+    {},
+  );
+  payload = await response.json();
+  assert.equal(payload.outcome, 'failure');
+  assert.equal(payload.probes[0].classification, 'timeout');
+});
+
+test('RSS redirects stop at fixed URLs without forwarding credentials, following or exposing Location/body', async () => {
+  const fixture = coordinatorFixture();
+  let fetchCalls = 0;
+  const worker = createAuthorityWorker({ async fetch() { throw new Error('must not run'); } }, {
+    rssProbeFetch: async (url, init) => {
+      fetchCalls++;
+      assert.equal(new URL(url).origin, 'https://www.youtube.com');
+      assert.equal(init.redirect, 'manual');
+      assert.deepEqual(Object.keys(init.headers), ['Accept']);
+      return new Response('private upstream body', { status: 302, headers: { Location: 'https://evil.test/private-token' } });
+    },
+  });
+  const response = await worker.fetch(
+    await signedInternalRequest('/_tubepulse/authority/rss-probe', 'authority-rss-probe', { activeChannelId: 'UC0000000000000000000000' }),
+    authorityEnv(fixture, async () => { throw new Error('Home must not run'); }), {},
+  );
+  const payload = await response.json();
+  assert.equal(fetchCalls, 2);
+  assert.equal(payload.outcome, 'failure');
+  assert.ok(payload.probes.every((entry) => entry.classification === 'redirect' && entry.status === 302));
+  assert.equal(JSON.stringify(payload).includes('private'), false);
+  assert.equal(JSON.stringify(payload).includes('evil.test'), false);
+  assert.equal(response.headers.has('Location'), false);
+});
+
+test('a valid remote feed cancels mixed unavailable subrequests and malformed XML never counts as valid', async () => {
+  const fixture = coordinatorFixture();
+  const active = 'UC0000000000000000000000';
+  const worker = createAuthorityWorker({ async fetch() { throw new Error('must not run'); } }, {
+    rssProbeFetch: async (url) => {
+      const channel = new URL(url).searchParams.get('channel_id');
+      return new Response(channel === active ? `<feed><yt:channelId>${channel}</yt:channelId></feed>` : '<feed><yt:channelId>wrong</yt:channelId>');
+    },
+  });
+  const response = await worker.fetch(
+    await signedInternalRequest('/_tubepulse/authority/rss-probe', 'authority-rss-probe', { activeChannelId: active }),
+    authorityEnv(fixture, async () => { throw new Error('Home must not run'); }), {},
+  );
+  const payload = await response.json();
+  assert.equal(payload.outcome, 'success');
+  assert.equal(payload.probes[0].classification, 'invalid-xml');
+  assert.equal(payload.probes[1].classification, 'valid-feed');
 });
 
 test('enabled but invalid authority fails mutations and internal controls closed while reads remain available', async () => {
@@ -291,6 +486,72 @@ test('cutover invalidation can explicitly clear a previously probed seed', async
   assert.equal(status.payload.replication.recordCount, 0);
 });
 
+test('coordinator defaults to a 900 publication cap with a 50-write API reserve', async () => {
+  const fixture = coordinatorFixture({ alpha: 'one', beta: 'one' });
+  await seedCoordinator(fixture);
+
+  let status = await callCoordinator(fixture.coordinator, '/status', undefined, 'GET');
+  assert.deepEqual(status.payload.quota.limits, {
+    total: 950,
+    publication: 900,
+    apiReserve: 50,
+  });
+
+  await fixture.storage.put('authority:quota', {
+    day: new Date().toISOString().slice(0, 10),
+    kvWrites: 899,
+    publicationWrites: 899,
+    apiWrites: 0,
+    kvReads: 0,
+    kvLists: 0,
+    doRequests: 0,
+  });
+  await callCoordinator(fixture.coordinator, '/acquire', {
+    leaseId: 'default-publication-limit-0900', kind: 'publication',
+  });
+  let result = await callCoordinator(fixture.coordinator, '/commit', {
+    leaseId: 'default-publication-limit-0900',
+    deltas: [{
+      key: 'alpha', operation: 'put', value: 'two', options: {},
+      baseHash: await authoritySha256('one'), nextHash: await authoritySha256('two'),
+    }],
+  });
+  assert.equal(result.response.status, 200);
+  assert.equal(result.payload.deferred, false);
+  assert.equal(fixture.kv.values.get('alpha'), 'two');
+
+  await callCoordinator(fixture.coordinator, '/acquire', {
+    leaseId: 'default-publication-limit-0901', kind: 'publication',
+  });
+  result = await callCoordinator(fixture.coordinator, '/commit', {
+    leaseId: 'default-publication-limit-0901',
+    deltas: [{
+      key: 'beta', operation: 'put', value: 'two', options: {},
+      baseHash: await authoritySha256('one'), nextHash: await authoritySha256('two'),
+    }],
+  });
+  assert.equal(result.response.status, 200);
+  assert.equal(result.payload.deferred, true);
+  assert.equal(result.payload.reason, 'publication-cap');
+  assert.equal(fixture.kv.values.get('beta'), 'one');
+
+  status = await callCoordinator(fixture.coordinator, '/status', undefined, 'GET');
+  assert.equal(status.payload.quota.publicationWrites, 900);
+  assert.equal(status.payload.pendingBackupKeys, 1);
+});
+
+test('configured publication cap cannot exceed the total hard cap', async () => {
+  const fixture = coordinatorFixture();
+  fixture.coordinator.env.TUBEPULSE_AUTHORITY_KV_PUBLICATION_CAP = '1200';
+  fixture.coordinator.env.TUBEPULSE_AUTHORITY_KV_WRITE_HARD_CAP = '950';
+  const status = await callCoordinator(fixture.coordinator, '/status', undefined, 'GET');
+  assert.deepEqual(status.payload.quota.limits, {
+    total: 950,
+    publication: 950,
+    apiReserve: 0,
+  });
+});
+
 test('coordinator reserves Cloudflare KV headroom for app mutations and defers backup publication at its cap', async () => {
   const fixture = coordinatorFixture({ alpha: 'one', profile: 'old' });
   fixture.coordinator.env.TUBEPULSE_AUTHORITY_KV_PUBLICATION_CAP = '1';
@@ -328,7 +589,7 @@ test('coordinator reserves Cloudflare KV headroom for app mutations and defers b
   assert.equal(status.payload.pendingBackupKeys, 1, 'unrelated deferred backup remains coalesced');
 });
 
-test('same-key /seen mutation flushes a deferred scheduler value before canonical execution and keeps Home current', async () => {
+test('Home-first /seen coalesces over a deferred scheduler value without touching Cloudflare KV', async () => {
   const stateKey = `device:${DEVICE}:state:UCsamekey0000000000000000`;
   const canonicalOld = JSON.stringify({ unwatched: ['old-video'], lastNagAt: null, nagCount: 0 });
   const schedulerNew = JSON.stringify({ unwatched: ['new-video', 'old-video'], lastNagAt: null, nagCount: 0 });
@@ -348,40 +609,39 @@ test('same-key /seen mutation flushes a deferred scheduler value before canonica
   assert.equal(result.payload.deferred, true);
   assert.equal(fixture.kv.values.get(stateKey), canonicalOld);
 
-  let homeValue = schedulerNew;
+  const readsBeforeMutation = fixture.kv.reads;
+  const writesBeforeMutation = fixture.kv.writes;
   const homeFetch = async (request) => {
     const path = new URL(request.url).pathname;
-    if (path.endsWith('/preflight')) return Response.json({ ok: true });
-    if (path.endsWith('/commit')) {
-      const body = await request.json();
-      assert.equal(body.deltas.length, 1);
-      assert.equal(body.deltas[0].baseHash, await authoritySha256(schedulerNew));
-      homeValue = body.deltas[0].value;
-      return Response.json({ ok: true });
-    }
-    if (path.endsWith('/cancel')) return Response.json({ ok: true });
-    throw new Error(`unexpected Home path ${path}`);
+    assert.equal(path, '/_tubepulse/authority/mutation');
+    const body = await request.json();
+    assert.equal(body.path, '/seen');
+    return Response.json({
+      ok: true,
+      response: { status: 200, headers: { 'content-type': 'application/json' }, body: '{"ok":true,"unwatchedCount":1}' },
+      deltas: [{
+        key: stateKey, operation: 'put', value: appFinal, options: {},
+        baseHash: await authoritySha256(schedulerNew), nextHash: await authoritySha256(appFinal),
+      }],
+    });
   };
   const appWorker = {
-    async fetch(request, env) {
-      const body = await request.json();
-      const current = await env.TUBEPULSE_KV.get(`device:${DEVICE}:state:${body.channelId}`, 'json');
-      assert.deepEqual(current.unwatched, ['new-video', 'old-video']);
-      current.unwatched = current.unwatched.filter((id) => id !== 'old-video');
-      await env.TUBEPULSE_KV.put(stateKey, JSON.stringify(current));
-      return Response.json({ ok: true });
-    },
+    async fetch() { throw new Error('Cloudflare app handler must not run for Home-primary mutations'); },
   };
   const worker = createAuthorityWorker(appWorker);
   const response = await worker.fetch(appRequest('/seen', {
     channelId: 'UCsamekey0000000000000000', videoIds: ['old-video'],
   }), authorityEnv(fixture, homeFetch), {});
   assert.equal(response.status, 200);
-  assert.equal(fixture.kv.values.get(stateKey), appFinal);
-  assert.equal(homeValue, appFinal);
+  assert.equal(fixture.kv.values.get(stateKey), canonicalOld);
+  assert.equal(fixture.kv.reads, readsBeforeMutation);
+  assert.equal(fixture.kv.writes, writesBeforeMutation);
   const status = await callCoordinator(fixture.coordinator, '/status', undefined, 'GET');
   assert.equal(status.payload.replication.status, 'current');
-  assert.equal(status.payload.pendingBackupKeys, 0);
+  assert.equal(status.payload.pendingBackupKeys, 1);
+  const pending = [...fixture.storage.values.values()].find((value) => value?.delta?.key === stateKey)?.delta;
+  assert.equal(pending.baseHash, await authoritySha256(canonicalOld));
+  assert.equal(pending.nextHash, await authoritySha256(appFinal));
 });
 
 test('partial canonical batch is durably resumed before another lease is admitted', async () => {
@@ -550,35 +810,47 @@ test('feed seqlock discards a response spanning a canonical version change and r
   assert.equal(appCalls, 2);
 });
 
-test('all authenticated devices use Cloudflare-first exact delta replication', async () => {
+test('authenticated mutations use Home responses and durably defer exact Cloudflare backup', async () => {
   const fixture = coordinatorFixture({ 'device:one:settings': '{"old":true}' });
   await seedCoordinator(fixture);
+  const readsBefore = fixture.kv.reads;
+  const writesBefore = fixture.kv.writes;
+  fixture.kv.get = async () => { throw new Error('KV get() limit exceeded for the day'); };
   const events = [];
   const appWorker = {
-    async fetch(request, env) {
-      events.push('canonical-handler');
-      assert.match(request.headers.get('Authorization'), /^Bearer /);
-      await env.TUBEPULSE_KV.put('device:one:settings', '{"old":false}');
-      await env.TUBEPULSE_KV.put('device:one:channels', '["UC1"]');
-      return Response.json({ ok: true });
-    },
+    async fetch() { events.push('cloudflare-handler'); throw new Error('Cloudflare handler must not run'); },
   };
   const homeFetch = async (input) => {
     const request = input instanceof Request ? input : new Request(input);
     const body = await request.json();
-    events.push(new URL(request.url).pathname.endsWith('/preflight') ? 'home-preflight' : 'home-commit');
-    if (body.deltas) assert.deepEqual(body.deltas.map((delta) => delta.key), ['device:one:channels', 'device:one:settings']);
-    return Response.json({ ok: true });
+    events.push('home-mutation');
+    assert.equal(new URL(request.url).pathname, '/_tubepulse/authority/mutation');
+    assert.equal(body.path, '/settings');
+    return Response.json({
+      ok: true,
+      response: { status: 200, headers: { 'content-type': 'application/json' }, body: '{"ok":true}' },
+      deltas: [{
+        key: 'device:one:settings', operation: 'put', value: '{"old":false}', options: {},
+        baseHash: await authoritySha256('{"old":true}'), nextHash: await authoritySha256('{"old":false}'),
+      }, {
+        key: 'device:one:channels', operation: 'put', value: '["UC1"]', options: {},
+        baseHash: null, nextHash: await authoritySha256('["UC1"]'),
+      }],
+    });
   };
   const worker = createAuthorityWorker(appWorker, { logger: { warn() {} } });
   const response = await worker.fetch(appRequest('/settings'), authorityEnv(fixture, homeFetch), {});
   assert.equal(response.status, 200);
-  assert.deepEqual(events, ['home-preflight', 'canonical-handler', 'home-commit']);
-  assert.equal(fixture.kv.values.get('device:one:settings'), '{"old":false}');
-  assert.equal(fixture.kv.values.get('device:one:channels'), '["UC1"]');
+  assert.deepEqual(events, ['home-mutation']);
+  assert.equal(fixture.kv.values.get('device:one:settings'), '{"old":true}');
+  assert.equal(fixture.kv.values.has('device:one:channels'), false);
+  assert.equal(fixture.kv.reads, readsBefore);
+  assert.equal(fixture.kv.writes, writesBefore);
+  const status = await callCoordinator(fixture.coordinator, '/status', undefined, 'GET');
+  assert.equal(status.payload.pendingBackupKeys, 2);
 });
 
-test('Home preflight outage does not break canonical mutation but makes authority globally stale', async () => {
+test('Home mutation outage fails closed without changing Cloudflare or authority health', async () => {
   const fixture = coordinatorFixture({ value: 'old' });
   await seedCoordinator(fixture);
   const worker = createAuthorityWorker({
@@ -587,15 +859,16 @@ test('Home preflight outage does not break canonical mutation but makes authorit
   const response = await worker.fetch(appRequest('/register'), authorityEnv(fixture, async () => {
     throw new Error('Home offline');
   }), {});
-  assert.equal(response.status, 200);
-  assert.equal(fixture.kv.values.get('value'), 'new');
+  assert.equal(response.status, 503);
+  assert.equal(fixture.kv.values.get('value'), 'old');
   const status = await callCoordinator(fixture.coordinator, '/status', undefined, 'GET');
-  assert.equal(status.payload.replication.status, 'stale');
-  assert.equal(status.payload.replication.reason, 'home-preflight-unavailable');
+  assert.equal(status.payload.replication.status, 'current');
+  assert.equal(status.payload.lease, null);
   const publication = await callCoordinator(fixture.coordinator, '/acquire', {
-    leaseId: 'publication-while-stale', kind: 'publication',
+    leaseId: 'publication-after-outage', kind: 'publication',
   });
-  assert.equal(publication.response.status, 409);
+  assert.equal(publication.response.status, 200);
+  await callCoordinator(fixture.coordinator, '/release', { leaseId: 'publication-after-outage' });
 });
 
 test('failure to durably mark Home stale aborts before the canonical handler and releases the lease', async () => {
@@ -629,30 +902,34 @@ test('failure to durably mark Home stale aborts before the canonical handler and
   assert.equal(status.payload.lease, null);
 });
 
-test('semantic errors and failed waitUntil work discard buffered writes', async (t) => {
+test('Home semantic errors are returned without queueing backup deltas', async (t) => {
   await t.test('semantic error', async () => {
     const fixture = coordinatorFixture({ value: 'old' });
     await seedCoordinator(fixture);
-    const worker = createAuthorityWorker({
-      async fetch(_request, env) { await env.TUBEPULSE_KV.put('value', 'hidden'); return Response.json({ error: 'bad' }, { status: 422 }); },
-    }, { logger: { warn() {} } });
-    const response = await worker.fetch(appRequest('/settings'), authorityEnv(fixture, async () => Response.json({ ok: true })), {});
+    const worker = createAuthorityWorker({ async fetch() { throw new Error('must not run'); } }, { logger: { warn() {} } });
+    const response = await worker.fetch(appRequest('/settings'), authorityEnv(fixture, async () => Response.json({
+      ok: true,
+      response: { status: 422, headers: { 'content-type': 'application/json' }, body: '{"error":"bad"}' },
+      deltas: [],
+    })), {});
     assert.equal(response.status, 422);
     assert.equal(fixture.kv.values.get('value'), 'old');
+    const status = await callCoordinator(fixture.coordinator, '/status', undefined, 'GET');
+    assert.equal(status.payload.pendingBackupKeys, 0);
+    assert.equal(status.payload.lease, null);
   });
-  await t.test('waitUntil rejection', async () => {
+  await t.test('Home execution failure', async () => {
     const fixture = coordinatorFixture({ value: 'old' });
     await seedCoordinator(fixture);
-    const worker = createAuthorityWorker({
-      async fetch(_request, env, ctx) {
-        await env.TUBEPULSE_KV.put('value', 'hidden');
-        ctx.waitUntil(Promise.reject(new Error('background-write-intent-failed')));
-        return Response.json({ ok: true });
-      },
-    }, { logger: { warn() {} } });
-    const response = await worker.fetch(appRequest('/register'), authorityEnv(fixture, async () => Response.json({ ok: true })), {});
-    assert.equal(response.status, 500);
+    const worker = createAuthorityWorker({ async fetch() { throw new Error('must not run'); } }, { logger: { warn() {} } });
+    const response = await worker.fetch(appRequest('/register'), authorityEnv(
+      fixture,
+      async () => Response.json({ error: 'Home mutation failed' }, { status: 500 }),
+    ), {});
+    assert.equal(response.status, 503);
     assert.equal(fixture.kv.values.get('value'), 'old');
+    const status = await callCoordinator(fixture.coordinator, '/status', undefined, 'GET');
+    assert.equal(status.payload.lease, null);
   });
 });
 

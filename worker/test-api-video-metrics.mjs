@@ -37,27 +37,6 @@ class MemoryKV {
 const DEVICE_ID = 'secure:metrics-device';
 const CHANNEL_ID = 'UC_metrics_channel';
 
-function rssFeed({ likes }) {
-  const rating = likes == null
-    ? ''
-    : `<media:starRating count="${likes}" average="5.00" min="1" max="5"/>`;
-  return `<?xml version="1.0" encoding="UTF-8"?>
-    <feed xmlns:yt="http://www.youtube.com/xml/schemas/2015" xmlns:media="http://search.yahoo.com/mrss/">
-      <yt:channelId>${CHANNEL_ID}</yt:channelId>
-      <author><name>Metrics channel</name></author>
-      <entry>
-        <yt:videoId>video-latest</yt:videoId>
-        <title>Latest video</title>
-        <link rel="alternate" href="https://www.youtube.com/watch?v=video-latest"/>
-        <published>2026-10-04T07:00:00+00:00</published>
-        <updated>2026-10-04T07:30:00+00:00</updated>
-        <media:thumbnail url="https://images.test/video.jpg"/>
-        <media:statistics views="1234"/>
-        ${rating}
-      </entry>
-    </feed>`;
-}
-
 function subscribeRequest() {
   return new Request('https://pilot.test/subscribe-channel', {
     method: 'POST',
@@ -69,7 +48,7 @@ function subscribeRequest() {
   });
 }
 
-async function subscribeWithRss(likes) {
+async function subscribeWithDataApi(likes) {
   const kv = new MemoryKV({
     [`device:${DEVICE_ID}:profile`]: { createdAt: 1 },
     [`device:${DEVICE_ID}:channels`]: [],
@@ -78,11 +57,20 @@ async function subscribeWithRss(likes) {
   const pending = [];
   globalThis.fetch = async (url) => {
     const requestUrl = String(url);
-    if (requestUrl.includes('youtube.com/feeds/videos.xml')) {
-      return new Response(rssFeed({ likes }), {
-        status: 200,
-        headers: { 'content-type': 'application/atom+xml' },
-      });
+    if (requestUrl.includes('/youtube/v3/channels')) {
+      const url = new URL(requestUrl);
+      if (url.searchParams.get('part') === 'snippet') return Response.json({ items: [{ id: CHANNEL_ID, snippet: { title: 'Metrics channel' } }] });
+      return Response.json({ items: [{ contentDetails: { relatedPlaylists: { uploads: 'UU_metrics_channel' } } }] });
+    }
+    if (requestUrl.includes('/youtube/v3/playlistItems')) {
+      return Response.json({ items: [{
+        snippet: { title: 'Latest video', publishedAt: '2026-10-04T07:00:00Z', thumbnails: { high: { url: 'https://images.test/video.jpg' } } },
+        contentDetails: { videoId: 'video-latest', videoPublishedAt: '2026-10-04T07:00:00Z' },
+        status: { privacyStatus: 'public' },
+      }] });
+    }
+    if (requestUrl.includes('/youtube/v3/videos')) {
+      return Response.json({ items: [{ id: 'video-latest', statistics: { viewCount: '1234', ...(likes == null ? {} : { likeCount: likes }) } }] });
     }
     if (requestUrl.startsWith('https://pubsubhubbub.appspot.com/')) {
       return new Response('', { status: 202 });
@@ -93,7 +81,7 @@ async function subscribeWithRss(likes) {
   try {
     const response = await apiWorker.fetch(
       subscribeRequest(),
-      { TUBEPULSE_KV: kv },
+      { TUBEPULSE_KV: kv, YOUTUBE_API_KEY: 'synthetic-key' },
       { waitUntil(promise) { pending.push(promise); } }
     );
     await Promise.all(pending);
@@ -107,8 +95,8 @@ async function subscribeWithRss(likes) {
   }
 }
 
-test('RSS bootstrap preserves a real public like count', async () => {
-  const { response, body, stored } = await subscribeWithRss('42');
+test('uploads playlist bootstrap preserves a real public like count', async () => {
+  const { response, body, stored } = await subscribeWithDataApi('42');
 
   assert.equal(response.status, 200);
   assert.equal(body.channel.recent[0].views, '1234');
@@ -119,8 +107,8 @@ test('RSS bootstrap preserves a real public like count', async () => {
   assert.equal(Number.isInteger(stored[0].likesLastCheckedHour), true);
 });
 
-test('RSS bootstrap keeps a hidden or unavailable like count unknown', async () => {
-  const { response, body, stored } = await subscribeWithRss(null);
+test('uploads playlist bootstrap keeps a hidden or unavailable like count unknown', async () => {
+  const { response, body, stored } = await subscribeWithDataApi(null);
 
   assert.equal(response.status, 200);
   assert.equal(body.channel.recent[0].likes, null);
