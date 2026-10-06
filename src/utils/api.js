@@ -18,6 +18,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Application from 'expo-application';
 import * as SecureStore from 'expo-secure-store';
+import appConfig from '../../app.json';
 import {
   fetchWithEndpointFailover,
 } from './apiEndpointPolicy.mjs';
@@ -26,6 +27,7 @@ import {
   resetApiEndpointPolicy,
 } from './apiEndpointConfig';
 import { createDeviceIdResolver } from './deviceIdentity.mjs';
+import { buildRegistrationPayload } from './appRegistration.mjs';
 
 const DEVICE_ID_KEY = 'tubepulse_device_id'; // AsyncStorage (fallback)
 const SECURE_DEVICE_ID_KEY = 'tubepulse_device_id_v1'; // Keystore/Keychain (primary)
@@ -142,11 +144,16 @@ export function resetApiFailoverEndpoint() {
  * Called on app launch and token refresh.
  * Only sends profile data (FCM token) — channels and settings are separate.
  */
-export async function registerDevice(deviceId, fcmToken, platform = 'android', appVersion = null) {
+export async function registerDevice(
+  deviceId,
+  fcmToken,
+  platform = 'android',
+  appVersion = appConfig?.expo?.version || null,
+) {
   return await apiFetch('/register', {
     method: 'POST',
     deviceId,
-    body: { fcmToken, platform, appVersion },
+    body: buildRegistrationPayload({ fcmToken, platform, appVersion }),
   });
 }
 

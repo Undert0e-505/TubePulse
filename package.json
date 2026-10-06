@@ -24,6 +24,7 @@
     "test:device-id": "node --test test/device-id.test.mjs",
     "test:channel-bootstrap": "node --test test/channel-bootstrap.test.mjs",
     "test:app-initialization": "node --test test/app-initialization.test.mjs",
+    "test:app-registration": "node --test test/app-registration.test.mjs",
     "test:video-metrics": "node --test test/video-metrics.test.mjs",
     "test:seen-persistence": "node --test test/seen-persistence.test.mjs",
     "test:channel-ordering": "node --test test/channel-ordering.test.mjs",

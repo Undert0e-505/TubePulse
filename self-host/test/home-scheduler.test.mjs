@@ -12,6 +12,7 @@ import {
   RecordingKv,
   WorkerKvFacade,
   createHomeSchedulerStateFile,
+  mutationKeyFamily,
   mutationReason,
 } from '../src/home-scheduler.mjs';
 import {
@@ -1145,6 +1146,14 @@ test('predicted write accounting separates metric-only churn and redacts key ide
     ),
     'community-content-cache',
   );
+});
+
+test('mutation classification supports colon-containing device IDs', () => {
+  assert.equal(mutationKeyFamily('device:android:synthetic:profile'), 'device-record');
+  assert.equal(mutationKeyFamily('device:android:synthetic:channels'), 'device-record');
+  assert.equal(mutationKeyFamily('device:android:synthetic:state:UCsynthetic'), 'device-state');
+  assert.equal(mutationKeyFamily('device:android:synthetic:override:UCsynthetic'), 'device-record');
+  assert.equal(mutationReason('device:android:synthetic:state:UCsynthetic', '{}', '{"unwatched":[]}'), 'notification-state');
 });
 
 test('community post cache ignores only rotating YouTube thumbnail delivery parameters', () => {

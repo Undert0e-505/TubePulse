@@ -285,8 +285,12 @@ export function mutationKeyFamily(name) {
   if (/^channel:[^:]+:meta$/.test(name)) return 'channel-meta';
   if (/^channel:[^:]+:firstPollAt:posts$/.test(name)) return 'channel-post-first-poll';
   if (/^channel:[^:]+:subscribers$/.test(name)) return 'channel-subscribers';
-  if (/^device:[^:]+:state:/.test(name)) return 'device-state';
-  if (/^device:[^:]+:/.test(name)) return 'device-record';
+  if (typeof name === 'string' && name.startsWith('device:')) {
+    const payload = name.slice('device:'.length);
+    const stateMarker = payload.lastIndexOf(':state:');
+    if (stateMarker > 0 && stateMarker + ':state:'.length < payload.length) return 'device-state';
+    if (payload.length > 0 && payload.includes(':')) return 'device-record';
+  }
   return 'other';
 }
 
