@@ -1,0 +1,145 @@
+# TubePulse user guide
+
+TubePulse is an Android app for following selected YouTube channels through a focused Home feed,
+home-screen widget and configurable notifications. It has no TubePulse account or cross-device
+sync: each installation manages its own channels and settings.
+
+## Install and update
+
+1. Download the signed APK from the [latest GitHub release](https://github.com/Undert0e-505/TubePulse/releases/latest).
+2. Open the APK on the Android device and allow installation from that file source if Android asks.
+3. Allow notifications if you want upload, post, reminder and livestream alerts. TubePulse still
+   provides its feed when notification permission is denied.
+
+A newer signed release can be installed over the existing app. The local channel list, settings,
+unseen state and pending seen updates should remain in place.
+
+## Manage channels
+
+Open **Channels** to add a creator by `@handle` or YouTube channel ID. TubePulse resolves the stable
+channel identity and starts with recent cached content without treating the whole history as new.
+Removing a channel stops that installation from following it.
+
+With **Auto-order channels** off, drag channels into the order you want. With it on, the app orders
+channel sections by newest cached video, and the widget applies automatic ordering to the content it
+displays, without overwriting the saved manual order. Turning it off restores that manual order.
+
+Long-press a channel when per-channel controls are enabled to override its notification mode, quiet
+hours, community-post preference or livestream prewarning. **Save** applies the changes; **Cancel**
+leaves the existing override untouched.
+
+## Home feed and seen state
+
+The Home feed groups recent videos and community posts by channel. A blue dot marks unseen content.
+Video rows include the available thumbnail, publication age and engagement figures; post cards show
+the available text, image or poll summary.
+
+Use **Videos shown per channel** in Settings to show one, two or three recent videos in each Home
+section. A per-channel display override can inherit or replace that global choice without changing
+the backend's detection or notification behavior.
+
+- Tap a video to follow the configured **Tap action**.
+- Tap a community post to open that channel's community surface.
+- Long-press a video to copy its link.
+- Pull to refresh to request the current feed.
+
+TubePulse updates seen state locally first. If the service or network is unavailable, exact content
+IDs remain in a durable local queue and retry later on normal app lifecycle and refresh
+opportunities. The app does not restore a blue dot merely because a remote save failed.
+
+## Notification taps
+
+For a notification about one video, **Tap action** controls the destination:
+
+- **Video** opens that specific video and marks it seen.
+- **Channel** opens the channel and marks the content represented at that moment seen.
+
+A stacked notification containing multiple items always opens the channel and marks the exact
+bundled items seen. Delayed retries never use an unbounded clear-all operation, so newer content
+that arrived after the tap is not consumed accidentally. Opening YouTube is not blocked by remote
+seen persistence.
+
+Community-post notifications open the channel's community surface. A livestream prewarning opens
+the scheduled video but does not consume the later live-time notification.
+
+## Notification settings
+
+### Tap action
+
+Choose whether ordinary single-video taps open the video or its channel. The choice is used by
+notifications, the Home feed and the widget where applicable; the special batch and post rules
+above still apply.
+
+### Reminder mode and interval
+
+- **Chill** sends the initial video notification and can nudge again after a longer interval while
+  the video remains unseen.
+- **Relentless** can repeat at the selected nag interval while the video remains unseen.
+- Available nag intervals are 5, 15, 30, 60 and 120 minutes.
+
+Community posts do not enter the video reminder cycle.
+
+### Do not disturb
+
+Enable DND and choose **From** and **Until** times to silence eligible notifications overnight or
+across any other daily window. TubePulse evaluates the window in the device's reported time zone.
+Multiple pending items from one channel can be delivered as a channel summary after DND ends rather
+than as a burst of individual alerts.
+
+Ordinary uploads, community posts and prewarnings are held during DND. A livestream notification
+can bypass DND so the live event is not missed. Use per-channel controls when a creator needs
+different quiet hours from the global settings.
+
+### Livestream prewarning
+
+Choose how early TubePulse warns about a scheduled livestream or premiere: 15 or 30 minutes, 1, 2
+or 4 hours, or 1 day. A regular notification can still arrive when the scheduled item becomes
+current. A channel override can inherit or replace the global lead time.
+
+### Community posts
+
+Enable **Community posts** to include supported text, image and poll posts in the feed and initial
+notification flow. A per-channel override can inherit, enable or disable the global choice.
+Community posts are not YouTube comments, and detection depends on an unofficial YouTube web
+surface that may change.
+
+## Channel ordering
+
+The default order is the saved manual channel order. Automatic ordering changes display order only;
+it does not rewrite that saved list. Channels without dated cached content remain in stable manual
+order after channels with current content.
+
+## Android home-screen widget
+
+Add the TubePulse widget through Android's widget picker. It shows at most one content item per
+displayed channel: the newest published cached video or community post, whether seen or unseen.
+Seen items are dimmed and unseen items retain their blue marker. Taps preserve the selected item's
+video, channel or post behavior, and automatic channel ordering follows the app setting.
+
+Widget refresh timing is subject to Android launcher and battery policies. Open or refresh the app
+if the widget remains stale after connectivity returns.
+
+## Data and privacy
+
+TubePulse creates a pseudonymous installation identifier for its service authentication and sends a
+Firebase token when push permission is available. It stores the channel list, settings and seen
+state needed to provide the product. It does not provide a TubePulse account or cross-device sync.
+
+Operational dashboards use aggregate service measurements and are designed not to expose raw
+installation/channel identifiers, tokens, titles or content. See the repository's
+[security guidance](../SECURITY.md) and [service contracts](../worker/CONTRACTS.md) for the technical
+boundary.
+
+## Troubleshooting
+
+- **No push notifications:** confirm Android notification permission, battery/background policy and
+  network access, then open the app so registration can refresh.
+- **Feed or seen state is temporarily stale:** refresh later. Local seen changes remain optimistic
+  and retry silently rather than blocking YouTube.
+- **A community post is missing:** the unofficial post surface may be unavailable or may have
+  changed; videos use a separate official API path.
+- **Widget is stale:** open/refresh TubePulse, then ask the launcher to redraw the widget by resizing
+  or re-adding it if necessary.
+
+For current service limitations, consult [STATUS.md](../STATUS.md). For build and operator material,
+return to the [project README](../README.md#documentation).
