@@ -12,6 +12,8 @@ import { getSettings, saveSettings } from '../utils/storage';
 import { updateSettings, getDeviceId } from '../utils/api';
 import { IS_TUBEPULSE_PREVIEW } from '../utils/apiEndpointConfig';
 
+const FOOTER_VISUAL_PADDING = 8;
+
 // ── Main Screen ───────────────────────────────────────────────────────────────
 export default function SettingsScreen() {
   const navigation = useNavigation();
@@ -259,7 +261,7 @@ export default function SettingsScreen() {
       ) : null}
 
       </ScrollView>
-      <View style={[styles.footer, { paddingBottom: Math.max(insets.bottom, 8) }]}>
+      <View style={[styles.footer, { paddingBottom: FOOTER_VISUAL_PADDING + insets.bottom }]}>
         <Text style={styles.footerVersion}>Version {appConfig.expo.version}</Text>
         <TouchableOpacity
           onPress={() => Linking.openURL('https://github.com/Undert0e-505/TubePulse')}
@@ -413,7 +415,7 @@ const styles = StyleSheet.create({
   },
   footer: {
     minHeight: 36,
-    paddingTop: 7,
+    paddingTop: FOOTER_VISUAL_PADDING,
     paddingHorizontal: 16,
     borderTopWidth: StyleSheet.hairlineWidth,
     borderTopColor: COLORS.border,

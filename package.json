@@ -31,6 +31,7 @@
     "test:settings-cog": "node --test test/settings-cog.test.mjs",
     "test:settings-footer": "node --test test/settings-footer.test.mjs",
     "test:channel-dnd-settings": "node --test test/channel-dnd-settings.test.mjs",
+    "test:widget-presentation": "node --test test/widget-presentation.test.mjs",
     "check:self-host": "npm --prefix self-host run check",
     "build:android:selfhost": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/Build-SelfHostApk.ps1"
   },

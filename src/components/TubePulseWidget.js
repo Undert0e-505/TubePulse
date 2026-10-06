@@ -320,20 +320,9 @@ function PostRow({ post, avatar, handle, tapAction }) {
 }
 
 function ChannelSection({ channel }) {
-  // Merge videos and posts into a single chronological list (newest first)
-  const now = Date.now();
-  const allItems = [
-    ...channel.videos.map(v => ({
-      ...v,
-      _sort: v.publishedAt ? now - new Date(v.publishedAt).getTime() : (v.published ? now - new Date(v.published).getTime() : Infinity),
-      _type: 'video',
-    })),
-    ...channel.posts.map(p => ({
-      ...p,
-      _sort: p.publishedAt ? now - new Date(p.publishedAt).getTime() : Infinity,
-      _type: 'post',
-    })),
-  ].sort((a, b) => a._sort - b._sort);
+  const item = channel.videos[0]
+    ? { ...channel.videos[0], _type: 'video' }
+    : (channel.posts[0] ? { ...channel.posts[0], _type: 'post' } : null);
 
   return (
     <FlexWidget style={{ marginTop: 2, width: 'match_parent' }}>
@@ -372,30 +361,22 @@ function ChannelSection({ channel }) {
         />
       </FlexWidget>
 
-      {/* Mixed video + post rows, newest first */}
-      {allItems.map((item, i) => {
-        if (item._type === 'post') {
-          return (
-            <PostRow
-              key={`post-${item.postId}-${i}`}
-              post={item}
-              avatar={channel.avatar}
-              handle={channel.handle}
-              tapAction={channel.tapAction}
-            />
-          );
-        }
-        return (
+      {item?._type === 'post' ? (
+        <PostRow
+          post={item}
+          avatar={channel.avatar}
+          handle={channel.handle}
+          tapAction={channel.tapAction}
+        />
+      ) : item ? (
           <VideoRow
-            key={`video-${item.videoId}-${i}`}
             video={item}
             seen={item.seen}
             avatar={channel.avatar}
             handle={channel.handle}
             tapAction={channel.tapAction}
           />
-        );
-      })}
+      ) : null}
     </FlexWidget>
   );
 }
@@ -431,7 +412,7 @@ export function TubePulseWidget({ channels = [] }) {
         />
       </FlexWidget>
 
-      {/* Channel sections */}
+      {/* Channel sections: one newest combined item per channel. */}
       {channels.length === 0 ? (
         <FlexWidget style={{ padding: 14 }}>
           <TextWidget

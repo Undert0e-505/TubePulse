@@ -5,15 +5,16 @@ import { TubePulseWidget } from './TubePulseWidget';
 import { getChannels, getSettings, getLastSeen, saveLastSeen, getChannelCache, saveChannelCache } from '../utils/storage';
 import { fetchFeed, getDeviceId, markSeen } from '../utils/api';
 import {
-  chooseLatestChannelContent,
   formatCompactAge,
   getPostSeenId,
   resolveOptionalMetric,
-  sortPostsNewestFirst,
-  sortVideosNewestFirst,
 } from '../utils/feedPresentation';
 import { orderChannels } from '../utils/channelOrdering.mjs';
 import { enqueueSeenMutation, flushSeenMutationQueue } from '../utils/seenPersistence.mjs';
+import {
+  projectWidgetOrderingCache,
+  selectWidgetChannelPresentation,
+} from '../utils/widgetPresentation.mjs';
 const nameToWidget = {
   TubePulseWidget: TubePulseWidget,
 };
@@ -43,23 +44,6 @@ function normalizePost(post = {}) {
     kind: post.kind || 'community',
     type: 'post',
   };
-}
-
-function isVideoUnwatched(video, seenIds) {
-  if (video?.unwatched === true) return true;
-  if (video?.unwatched === false) return false;
-  return Boolean(video?.videoId) && !seenIds.includes(video.videoId);
-}
-
-function isPostUnwatched(post, seenIds) {
-  if (post?.unwatched === true) return true;
-  if (post?.unwatched === false) return false;
-  const postKey = getPostSeenId(post);
-  return Boolean(postKey) && !seenIds.includes(postKey);
-}
-
-function selectPersistentLatestContent(videos, posts) {
-  return chooseLatestChannelContent(videos[0] || null, posts[0] || null);
 }
 
 function getChannelId(handle, channels, cache) {
@@ -154,57 +138,42 @@ async function buildWidgetData(fetchFresh = false) {
     }
 
     // Build widget channel data with videos and posts
-    const displayedChannels = orderChannels(channels, activeCache, settings.autoOrderChannels === true);
+    const widgetOrderingCache = projectWidgetOrderingCache(activeCache);
+    const displayedChannels = orderChannels(
+      channels,
+      widgetOrderingCache,
+      settings.autoOrderChannels === true,
+    );
     const widgetChannels = displayedChannels.map((ch) => {
       const cached = activeCache[ch.handle];
       const seenIds = lastSeen[ch.handle]?.seenIds || [];
 
-      // All videos sorted newest-first
-      const allVideos = sortVideosNewestFirst(
-        cached?.videos?.length ? cached.videos.map(normalizeVideo) : (cached?.latestVideo ? [normalizeVideo(cached.latestVideo)] : [])
-      );
-
-      // All posts sorted newest-first
-      const allPosts = sortPostsNewestFirst((cached?.posts || []).map(normalizePost));
-      const latestVideo = allVideos[0] || null;
-      const persistent = selectPersistentLatestContent(allVideos, allPosts);
-
-      // Unseen videos
-      const unseenVideos = allVideos.filter(v => isVideoUnwatched(v, seenIds));
-      // Unseen posts (post IDs are namespaced with post: in seenIds,
-      // matching the app's convention)
-      const unseenPosts = allPosts.filter((post) => (
-        isPostUnwatched(post, seenIds)
-        && chooseLatestChannelContent(latestVideo, post)?.type === 'post'
-      ));
-
-      const unseenCount = unseenVideos.length + unseenPosts.length;
+      const allVideos = cached?.videos?.length
+        ? cached.videos.map(normalizeVideo)
+        : (cached?.latestVideo ? [normalizeVideo(cached.latestVideo)] : []);
+      const allPosts = (cached?.posts || []).map(normalizePost);
+      const { selected, unseenCount } = selectWidgetChannelPresentation({
+        videos: allVideos,
+        posts: allPosts,
+        seenIds,
+      });
       const hasNew = unseenCount > 0;
 
-      // Build video rows â€” show only the latest video (matching the
-      // bootstrap behaviour of 1 video per channel). Seen videos
-      // are dimmed; only genuinely new uploads appear as "New".
-      const videosToShow = unseenVideos.length > 0
-        ? [...unseenVideos].reverse()
-        : (persistent?.type === 'video' ? [persistent.item] : []);
-      const videoRows = videosToShow.map((v) => ({
-        ...v,
-        timeAgo: formatCompactAge(v.published || v.publishedAt),
-        seen: !isVideoUnwatched(v, seenIds),
+      const videoRows = selected?.type === 'video' ? [{
+        ...selected.item,
+        timeAgo: formatCompactAge(selected.item.published || selected.item.publishedAt),
+        seen: selected.seen,
         handle: ch.handle,
-      }));
-
-      // Build post rows â€” show only the latest post (if any)
-      const postsToShow = unseenPosts.length > 0
-        ? unseenPosts
-        : (persistent?.type === 'post' ? [persistent.item] : []);
-      const postRows = postsToShow.map((p) => ({
-        ...p,
-        postId: p.activityId || p.postId,
-        timeAgo: p.publishedAt ? formatCompactAge(p.publishedAt) : (p.publishedText || ''),
-        seen: !isPostUnwatched(p, seenIds),
+      }] : [];
+      const postRows = selected?.type === 'post' ? [{
+        ...selected.item,
+        postId: selected.item.activityId || selected.item.postId,
+        timeAgo: selected.item.publishedAt
+          ? formatCompactAge(selected.item.publishedAt)
+          : (selected.item.publishedText || ''),
+        seen: selected.seen,
         handle: ch.handle,
-      }));
+      }] : [];
 
       return {
         handle: ch.handle,

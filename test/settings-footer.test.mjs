@@ -14,7 +14,10 @@ test('Settings footer uses configured version and the exact source link contract
   assert.match(source, /https:\/\/github\.com\/Undert0e-505\/TubePulse/);
 });
 
-test('Settings footer is rendered after the ScrollView and keeps safe bottom spacing', () => {
+test('Settings footer is rendered after the ScrollView with balanced visual padding plus safe area', () => {
   assert.ok(source.indexOf('</ScrollView>') < source.indexOf('styles.footer'));
-  assert.match(source, /Math\.max\(insets\.bottom, 8\)/);
+  assert.match(source, /const FOOTER_VISUAL_PADDING = 8;/);
+  assert.match(source, /paddingTop: FOOTER_VISUAL_PADDING/);
+  assert.match(source, /paddingBottom: FOOTER_VISUAL_PADDING \+ insets\.bottom/);
+  assert.doesNotMatch(source, /Math\.max\(insets\.bottom/);
 });
