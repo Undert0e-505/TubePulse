@@ -56,6 +56,25 @@ function serializableIntent(intent) {
   };
 }
 
+function isTransientIntent(intent) {
+  return intent?.kind === 'nag';
+}
+
+function expirePendingTransientRecords(state, now, reason = 'transient-nag-expired') {
+  let expired = 0;
+  for (const record of Object.values(state.records || {})) {
+    if (record.status !== 'pending' || !isTransientIntent(record.intent)) continue;
+    record.status = 'resolved';
+    record.delivery = 'expired';
+    record.suppressionReason = reason;
+    record.completedAt = now;
+    record.updatedAt = now;
+    record.callbackApplied = true;
+    expired++;
+  }
+  return expired;
+}
+
 export class DurableNotificationIntentStore {
   constructor(dataDir, { now = Date.now, maxRecords = 2000 } = {}) {
     this.stateFile = new JsonStateFile(path.join(dataDir, 'home-notification-intents.json'), {
@@ -69,24 +88,37 @@ export class DurableNotificationIntentStore {
   async stage(intents) {
     const state = await this.stateFile.read();
     state.records ||= {};
+    const now = this.now();
+    // Reminder notifications are regenerated from current canonical state on
+    // every aux cycle. Pending records written by older versions are retained
+    // for audit, but must never block or be replayed after this migration.
+    expirePendingTransientRecords(state, now);
     const staged = [];
     for (const intent of uniqueIntents(intents)) {
       const id = intentKey(intent);
       const existing = state.records[id];
+      if (isTransientIntent(intent)) {
+        // Preserve an already-claimed legacy record as at-most-once evidence
+        // so its callback can recover, but never create or refresh a nag.
+        if (existing && ['sending', 'sent'].includes(existing.status)) {
+          staged.push({ id, record: existing, intent });
+        }
+        continue;
+      }
       if (!existing) {
         state.records[id] = {
           id,
           status: 'pending',
           intent: serializableIntent(intent),
-          createdAt: this.now(),
-          updatedAt: this.now(),
+          createdAt: now,
+          updatedAt: now,
           callbackApplied: false,
         };
       } else if (existing.status === 'pending') {
         // Refresh expiring FCM credentials/payload only while no send has
         // started. A sending/sent record is immutable proof against replay.
         existing.intent = serializableIntent(intent);
-        existing.updatedAt = this.now();
+        existing.updatedAt = now;
       }
       staged.push({ id, record: state.records[id], intent });
     }
@@ -114,6 +146,7 @@ export class DurableNotificationIntentStore {
     const summary = {
       pending: 0, sending: 0, sent: 0, resolved: 0,
       callbackPending: 0, failed: 0, deadToken: 0, suppressed: 0,
+      transientExpired: 0,
     };
     for (const record of Object.values(state.records || {})) {
       if (Object.hasOwn(summary, record.status)) summary[record.status]++;
@@ -121,6 +154,9 @@ export class DurableNotificationIntentStore {
       if (record.delivery === 'indeterminate') summary.failed++;
       if (record.delivery === 'dead-token') summary.deadToken++;
       if (record.delivery === 'suppressed') summary.suppressed++;
+      if (record.delivery === 'expired' && record.suppressionReason === 'transient-nag-expired') {
+        summary.transientExpired++;
+      }
     }
     return summary;
   }
@@ -157,8 +193,17 @@ export class DurableNotificationIntentStore {
     return await this.update(id, (record) => { record.callbackApplied = true; });
   }
 
+  async expirePendingKind(kind, reason = 'transient-nag-expired') {
+    if (kind !== 'nag') return 0;
+    const state = await this.stateFile.read();
+    state.records ||= {};
+    const expired = expirePendingTransientRecords(state, this.now(), reason);
+    if (expired > 0) await this.stateFile.write(state);
+    return expired;
+  }
+
   async suppress(intents, reason) {
-    const staged = await this.stage(intents);
+    const staged = await this.stage(intents.filter((intent) => !isTransientIntent(intent)));
     for (const { id } of staged) {
       await this.update(id, (record) => {
         if (record.status !== 'pending') return;
@@ -255,13 +300,19 @@ export class ProductionNotificationCoordinator {
   }
 
   async suppress(intents, reason) {
-    const suppressed = await this.intentStore.suppress(uniqueIntents(intents), reason);
+    const unique = uniqueIntents(intents);
+    const transient = unique.filter(isTransientIntent);
+    const durable = unique.filter((intent) => !isTransientIntent(intent));
+    const transientExpired = await this.intentStore.expirePendingKind?.('nag', 'transient-nag-expired') || 0;
+    const durableSuppressed = await this.intentStore.suppress(durable, reason);
+    const suppressed = durableSuppressed + transient.length;
     return {
       queued: intents.length,
-      deduplicated: intents.length - suppressed,
+      deduplicated: intents.length - unique.length,
       sent: 0,
       failed: 0,
       suppressed,
+      transientExpired,
       barrier: 'suppressed',
       reason,
     };
@@ -367,6 +418,7 @@ export class ProductionNotificationCoordinator {
   }
 
   async flush(intents, workerEnv) {
+    const transientExpired = await this.intentStore.expirePendingKind?.('nag', 'transient-nag-expired') || 0;
     const liveIntents = uniqueIntents(intents);
     const liveById = new Map(liveIntents.map((intent) => [intentKey(intent), intent]));
     const persistedPending = await this.intentStore.pending();
@@ -380,10 +432,22 @@ export class ProductionNotificationCoordinator {
     const queued = [...liveById.values()];
     const deduplicated = intents.length - liveIntents.length;
     if (queued.length === 0) {
-      return { queued: 0, deduplicated, sent: 0, failed: 0, suppressed: 0, barrier: 'not-needed' };
+      return {
+        queued: 0, deduplicated, sent: 0, failed: 0, suppressed: 0,
+        transientExpired, barrier: 'not-needed',
+      };
     }
 
     const staged = await this.intentStore.stage(queued);
+    const stagedIds = new Set(staged.map(({ id }) => id));
+    // Nags deliberately bypass durable storage. They still travel through the
+    // same authority-route and public-feed visibility barrier in this cycle.
+    for (const intent of queued.filter(isTransientIntent)) {
+      const id = intentKey(intent);
+      if (!stagedIds.has(id)) {
+        staged.push({ id, intent, record: { status: 'pending' }, transient: true });
+      }
+    }
     let recovered = 0;
     let callbackFailures = 0;
     const pending = [];
@@ -407,7 +471,7 @@ export class ProductionNotificationCoordinator {
     if (pending.length === 0) {
       return {
         queued: queued.length, deduplicated, recovered, sent: 0, failed: 0,
-        suppressed: recovered, barrier: 'already-claimed', callbackFailures,
+        suppressed: recovered, transientExpired, barrier: 'already-claimed', callbackFailures,
       };
     }
 
@@ -416,7 +480,7 @@ export class ProductionNotificationCoordinator {
     if (!convergence.ok) {
       return {
         queued: queued.length, deduplicated, recovered, sent: 0, failed: 0, suppressed: pending.length,
-        barrier: 'failed', reason: convergence.reason, convergenceAttempts: convergence.attempts,
+        transientExpired, barrier: 'failed', reason: convergence.reason, convergenceAttempts: convergence.attempts,
       };
     }
     const visibility = await this.verifyProductionFeeds(pendingIntents);
@@ -426,7 +490,7 @@ export class ProductionNotificationCoordinator {
     if (deliverable.length === 0) {
       return {
         queued: queued.length, deduplicated, recovered, sent: 0, failed: 0, suppressed: pending.length,
-        barrier: 'failed', reason: visibility.reason, convergenceAttempts: convergence.attempts,
+        transientExpired, barrier: 'failed', reason: visibility.reason, convergenceAttempts: convergence.attempts,
         visibilityAttempts: visibility.attempts,
       };
     }
@@ -437,7 +501,7 @@ export class ProductionNotificationCoordinator {
     } catch {
       return {
         queued: queued.length, deduplicated, recovered, sent: 0, failed: 0, suppressed: pending.length,
-        barrier: blockedCount > 0 ? 'partial' : 'passed', reason: 'fcm-token-unavailable', convergenceAttempts: convergence.attempts,
+        transientExpired, barrier: blockedCount > 0 ? 'partial' : 'passed', reason: 'fcm-token-unavailable', convergenceAttempts: convergence.attempts,
         visibilityAttempts: visibility.attempts,
       };
     }
@@ -448,17 +512,19 @@ export class ProductionNotificationCoordinator {
       const intent = entry.intent;
       let result;
       try {
-        await this.intentStore.claim(entry.id);
+        if (!entry.transient) await this.intentStore.claim(entry.id);
         result = await this.sender(accessToken, intent.projectId, intent.fcmToken, intent.payload);
       } catch {
         result = { sent: false, deadToken: false };
       }
-      await this.intentStore.sent(entry.id, result || { sent: false, deadToken: false });
+      if (!entry.transient) {
+        await this.intentStore.sent(entry.id, result || { sent: false, deadToken: false });
+      }
       if (result?.sent) sent++;
       else failed++;
       try {
         await intent.onResult?.(result || { sent: false, deadToken: false });
-        await this.intentStore.callbackApplied(entry.id);
+        if (!entry.transient) await this.intentStore.callbackApplied(entry.id);
       } catch {
         callbackFailures++;
       }
@@ -467,6 +533,7 @@ export class ProductionNotificationCoordinator {
       queued: queued.length,
       deduplicated,
       recovered,
+      transientExpired,
       sent,
       failed,
       suppressed: recovered + blockedCount,

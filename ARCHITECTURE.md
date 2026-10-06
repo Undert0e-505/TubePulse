@@ -330,21 +330,22 @@ The shards therefore process up to three channels per five-minute tick. For `N` 
 - The same detection contract (new video → fan out to subscribers → FCM push) works identically
 - This rationale was superseded when production adopted batched `channels.list`, uploads-playlist reconciliation, and separate batched statistics.
 
-### 6.3 Nag cron — every 15 minutes
+### 6.3 Host aux reminders — every minute
 
-```
-*/15 * * * *
-```
+The production host reads `nag:active` and checks a bounded, time-rotated batch of at most five
+device/channel entries. The batch start advances deterministically each minute, so restart does not
+reset progress and scheduling fairness requires no canonical cursor write.
 
-Reads the `nag:` bucket key for the current 15-minute window. For each entry:
-- Read device profile + settings + per-channel override
-- Filter by DND, mode, etc. (override beats settings beats default)
-- Send FCM notification
-- Compute next nag time and schedule into the next bucket (chill: +4h; relentless: +nagInterval)
+For each due entry, the host applies DND, mode, mute and channel overrides, then derives a transient
+reminder from the channel's current app-visible top three videos plus settings-eligible community
+posts. The full `unwatched` history remains canonical so deleting a newer item can promote an older
+one back into eligibility. The reminder crosses the same public-feed and authority-route visibility
+barrier as one-off pushes. Success alone advances `lastNagAt` and `nagCount`; a failed or invisible
+attempt is discarded and recalculated from current state on a later cycle.
 
-Cost per tick: 1 read minimum, 4 reads + 2 writes per nag firing.
-
-15 minutes is fine for nags because nag frequency is configured in 5-min minimum increments — worst case a "5-minute" nag fires up to 15 minutes late. Document this in user-facing settings as "approximately every 5 minutes".
+Reminder nags never enter the durable notification-intent store. One-off upload, community-post and
+prewarn notifications retain durable at-most-once recovery. Pending nag records left by earlier
+versions are resolved as `transient-nag-expired` without FCM delivery or watermark changes.
 
 ### 6.4 WebSub lease renewal cron — every 6 hours (DORMANT)
 
@@ -357,7 +358,7 @@ Cost per tick: 1 read minimum, 4 reads + 2 writes per nag firing.
 ### 6.5 What's NOT in any cron
 
 - "Check channels for new videos" — done by the Data API poller (6.2), not by a device-iteration loop
-- "Iterate devices to find unwatched videos" — devices already have local state; nags are pre-scheduled
+- "Scan every device for unwatched videos" — `nag:active` is a bounded index and the host rotates through it fairly
 - "Refresh channel metadata" — done lazily on next poll or bootstrap
 
 ---
@@ -455,7 +456,7 @@ Logic:
 1. Read `device:{deviceId}:state:{channelId}`
 2. Remove specified videoIds (or all if `clearAll: true`)
 3. Write back
-4. Pending nag bucket entries are not actively cleaned up — instead, when the nag cron tries to fire, it re-checks state and skips videos that are no longer unwatched
+4. If no unwatched content remains, remove the device/channel pair from `nag:active`; otherwise a later transient reminder is rebuilt from current visible state
 
 ### 8.5 GET /feed
 
@@ -541,7 +542,7 @@ The production authority is local-first with coordinated D1 backup, not the hist
 
 Current startup performs exact reconciliation when either the local or coordinator status is stale, including after an expired unclean-stop lease makes Home stale. It does not yet prove a full local-versus-D1 manifest when both persisted markers say `current`. Reconciliation also refuses while coordinator backup work is pending, so proposed always-verify startup must drain/retry that work within bounds before taking a recovery snapshot. It must never clear an unverified journal.
 
-D1 covers the coordinated canonical key space, not host-only scheduler/quota JSON, notification-intent history, credentials, runtime configuration, or Windows startup policy. Notification delivery intentionally uses at-most-once behavior at an ambiguous FCM `sending` boundary: pending work can recover, but one push can be lost rather than duplicated after a crash. Upstream/network failure is a dependency outage, not permission for destructive restart or state reset.
+D1 covers the coordinated canonical key space, not host-only scheduler/quota JSON, one-off notification-intent history, credentials, runtime configuration, or Windows startup policy. One-off notification delivery intentionally uses at-most-once behavior at an ambiguous FCM `sending` boundary: pending work can recover, but one push can be lost rather than duplicated after a crash. Reminder nags are transient and are regenerated from canonical current state after recovery. Upstream/network failure is a dependency outage, not permission for destructive restart or state reset.
 
 The authoritative current-state audit, checked-in Windows startup supervisor, zero-local-backup reconstruction procedure, credential-rotation matrix, exact D1 reconcile sequence, failure branches, and safe activation checks are in [`self-host/RECOVERY.md`](self-host/RECOVERY.md). Sections 10.1–10.5 below document historical Worker-era failure assumptions and must not override that runbook.
 
@@ -660,7 +661,7 @@ v3.1 is a strict superset of v3.0 — the channel-first, zero-`KV.list()`, time-
   - Global `includeCommunityPosts` (boolean, default off, v3.1+). Toggled on in SettingsScreen.
   - Per-channel `includeCommunityPosts` override (tri-state null/true/false) — null inherits global.
 - **App**: new post card in HomeScreen with thumbnail (or speech-bubble placeholder for text-only posts). "Posts" mini-header above post cards. Post tap → mark seen + open community tab.
-- **Posts do NOT enter the nag cycle** — only the initial push fires. The plan did not require post nagging; adding it would need a parallel nag bucket and FCM payload differentiation. Flagged for v3.2.
+- **Historical v3.1 behavior:** posts initially did not enter reminders. Current host aux can include a currently visible unread post when the global/per-channel community-post setting permits it; the shared `post:` namespace needs no separate reminder bucket.
 
 ### 14.3 Prewarn for scheduled livestreams
 

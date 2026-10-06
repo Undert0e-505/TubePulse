@@ -6,6 +6,7 @@ import test from 'node:test';
 import {
   DurableNotificationIntentStore,
   ProductionNotificationCoordinator,
+  notificationCoordinatorTestHelpers,
 } from '../src/home-scheduler-notifications.mjs';
 
 const barrierConfig = {
@@ -56,6 +57,7 @@ test('notification intent summary exposes only aggregate backlog and outcome cou
   assert.deepEqual(summary, {
     pending: 1, sending: 1, sent: 0, resolved: 1,
     callbackPending: 1, failed: 1, deadToken: 0, suppressed: 0,
+    transientExpired: 0,
   });
   const serialized = JSON.stringify(summary);
   assert.doesNotMatch(serialized, /synthetic-device|UC-synthetic|synthetic-fcm|video-/);
@@ -303,7 +305,6 @@ test('durable sending claim prevents duplicate FCM and recovers callback waterma
   for (const [kind, overrides] of [
     ['video', {}],
     ['community-post', { contentIds: ['post:activity'], payload: { data: { type: 'post', notificationTag: 'post-activity' }, tag: 'post-activity' } }],
-    ['nag', { dedupeVersion: '0:0', payload: { data: { type: 'batch' }, tag: 'tubepulse-nag-UC-synthetic' } }],
     ['prewarn', { dedupeVersion: 'prewarn:30', payload: { data: { type: 'prewarn', prewarnMinutes: '30' }, tag: 'video-video-new' } }],
   ]) {
     await t.test(kind, async () => {
@@ -338,6 +339,170 @@ test('durable sending claim prevents duplicate FCM and recovers callback waterma
       assert.equal(callbacks, 1);
     });
   }
+});
+
+test('nags bypass durable storage and an invisible attempt can be reconsidered later', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'tubepulse-transient-nag-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const store = new DurableNotificationIntentStore(directory);
+  const nag = intent({
+    kind: 'nag',
+    dedupeVersion: '0:0',
+    payload: { data: { type: 'nag' }, tag: 'tubepulse-nag-UC-synthetic' },
+  });
+  assert.deepEqual(await store.stage([nag]), []);
+  assert.equal((await store.summary()).pending, 0);
+
+  let visible = false;
+  let sends = 0;
+  let callbacks = 0;
+  const coordinator = new ProductionNotificationCoordinator({
+    ...barrierConfig, gatewayConvergenceRequired: false,
+  }, {
+    intentStore: store,
+    fetchImpl: async () => jsonResponse({
+      channels: [{
+        channelId: 'UC-synthetic',
+        videos: visible ? [{ videoId: 'video-new', unwatched: true }] : [],
+        posts: [],
+      }],
+    }),
+    tokenProvider: async () => 'token',
+    sender: async () => { sends++; return { sent: true, deadToken: false }; },
+    sleep: async () => {},
+  });
+
+  const first = await coordinator.flush([{ ...nag, onResult: async () => { callbacks++; } }], {});
+  assert.equal(first.sent, 0);
+  assert.equal(first.reason, 'feed-not-visible');
+  assert.equal(sends, 0);
+  assert.equal(callbacks, 0);
+  assert.equal((await store.summary()).pending, 0);
+
+  visible = true;
+  const second = await coordinator.flush([{ ...nag, onResult: async () => { callbacks++; } }], {});
+  assert.equal(second.sent, 1);
+  assert.equal(sends, 1);
+  assert.equal(callbacks, 1);
+  assert.equal((await store.summary()).pending, 0);
+});
+
+test('a transient nag on the fallback route is discarded without a durable record', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'tubepulse-route-nag-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const store = new DurableNotificationIntentStore(directory);
+  let sends = 0;
+  let callbacks = 0;
+  const coordinator = new ProductionNotificationCoordinator({
+    ...barrierConfig,
+    gatewayConvergenceRequired: false,
+    requireHomeAuthorityRoute: true,
+  }, {
+    intentStore: store,
+    fetchImpl: async () => new Response(JSON.stringify({
+      channels: [{ channelId: 'UC-synthetic', videos: [{ videoId: 'video-new', unwatched: true }], posts: [] }],
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json', 'X-TubePulse-Authority-Route': 'cloudflare' },
+    }),
+    tokenProvider: async () => 'token',
+    sender: async () => { sends++; return { sent: true, deadToken: false }; },
+    sleep: async () => {},
+  });
+  const result = await coordinator.flush([intent({
+    kind: 'nag', dedupeVersion: '0:0',
+    payload: { data: { type: 'nag' }, tag: 'tubepulse-nag-UC-synthetic' },
+    onResult: async () => { callbacks++; },
+  })], {});
+  assert.equal(result.reason, 'feed-not-visible');
+  assert.equal(sends, 0);
+  assert.equal(callbacks, 0);
+  assert.equal((await store.summary()).pending, 0);
+});
+
+test('legacy pending nags expire without FCM or watermark callbacks', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'tubepulse-legacy-nag-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const store = new DurableNotificationIntentStore(directory, { now: () => 1234 });
+  const legacy = intent({
+    kind: 'nag',
+    dedupeVersion: '0:0',
+    payload: { data: { type: 'nag' }, tag: 'tubepulse-nag-UC-synthetic' },
+  });
+  const id = notificationCoordinatorTestHelpers.intentKey(legacy);
+  await store.stateFile.write({
+    schemaVersion: 1,
+    records: {
+      [id]: {
+        id,
+        status: 'pending',
+        intent: { ...legacy, onResult: undefined },
+        createdAt: 1,
+        updatedAt: 1,
+        callbackApplied: false,
+      },
+    },
+  });
+  let fetches = 0;
+  let sends = 0;
+  const coordinator = new ProductionNotificationCoordinator(barrierConfig, {
+    intentStore: store,
+    fetchImpl: async () => { fetches++; throw new Error('not expected'); },
+    sender: async () => { sends++; return { sent: true, deadToken: false }; },
+  });
+  const result = await coordinator.flush([], {});
+  assert.equal(result.barrier, 'not-needed');
+  assert.equal(result.transientExpired, 1);
+  assert.equal(fetches, 0);
+  assert.equal(sends, 0);
+  const state = await store.stateFile.read();
+  assert.equal(state.records[id].status, 'resolved');
+  assert.equal(state.records[id].delivery, 'expired');
+  assert.equal(state.records[id].suppressionReason, 'transient-nag-expired');
+  assert.equal(state.records[id].callbackApplied, true);
+  assert.equal((await store.summary()).transientExpired, 1);
+});
+
+test('an already-claimed legacy nag remains immutable and is never replayed', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'tubepulse-claimed-nag-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const store = new DurableNotificationIntentStore(directory);
+  const legacy = intent({
+    kind: 'nag', dedupeVersion: '0:0',
+    payload: { data: { type: 'nag' }, tag: 'tubepulse-nag-UC-synthetic' },
+  });
+  const id = notificationCoordinatorTestHelpers.intentKey(legacy);
+  await store.stateFile.write({
+    schemaVersion: 1,
+    records: {
+      [id]: {
+        id, status: 'sending', intent: legacy, createdAt: 1, updatedAt: 1,
+        claimedAt: 1, callbackApplied: false,
+      },
+    },
+  });
+  let sends = 0;
+  let callbacks = 0;
+  const coordinator = new ProductionNotificationCoordinator({
+    ...barrierConfig, gatewayConvergenceRequired: false,
+  }, {
+    intentStore: store,
+    fetchImpl: async () => { throw new Error('not expected'); },
+    sender: async () => { sends++; return { sent: true, deadToken: false }; },
+  });
+  const result = await coordinator.flush([{
+    ...legacy,
+    onResult: async (delivery) => {
+      assert.equal(delivery.recovered, true);
+      callbacks++;
+    },
+  }], {});
+  assert.equal(result.recovered, 1);
+  assert.equal(sends, 0);
+  assert.equal(callbacks, 1);
+  const state = await store.stateFile.read();
+  assert.equal(state.records[id].status, 'sending');
+  assert.equal(state.records[id].callbackApplied, true);
 });
 
 test('nag and prewarn dedupe versions distinguish legitimate future notifications', async () => {

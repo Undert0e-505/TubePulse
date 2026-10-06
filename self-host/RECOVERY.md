@@ -111,7 +111,7 @@ Frozen Workers KV also survives, but is only a historical point-in-time snapshot
 - Miniflare/local KV and the complete `data-authority` directory;
 - detector baselines, reconciliation clocks, adaptive metric/comment observations, and other host-only scheduler JSON;
 - local YouTube general/statistics quota reservations;
-- local notification-intent history, including claimed/sending ambiguity;
+- local one-off notification-intent history, including claimed/sending ambiguity; reminder nags are transient and are recalculated from canonical state;
 - Docker/WSL/Windows ACL, firewall, startup configuration, and local logs;
 - any unpushed source or generated artifacts.
 
@@ -284,7 +284,7 @@ docker compose --env-file .env.authority -f compose.authority.yaml run --rm --no
 
 Verify local/remote current on the same D1 generation/manifest, one scheduler lease, Data API source, a successful aligned cycle, no unexplained pending/transaction/error, unchanged public Worker health, Home-first authenticated feed matching D1 fallback, safe no-op mutation behavior if an existing inert canary exists, and no unexpected notification.
 
-Notification intent history cannot be reconstructed. Canonical recent/unwatched state prevents wholesale replay, but a lost local `sending` boundary cannot be proven sent/unsent. Accept the bounded possibility of one suppressed or duplicate push around failure; never mass-clear or resend backlog to compensate.
+One-off notification intent history cannot be reconstructed. Canonical recent/unwatched state prevents wholesale replay, but a lost local `sending` boundary cannot be proven sent/unsent. Accept the bounded possibility of one suppressed or duplicate one-off push around failure; never mass-clear or resend backlog to compensate. Reminder nags are not recovery backlog: the host rebuilds them from current unwatched and visible content on a later aux cycle.
 
 ### 9. Install unattended startup
 

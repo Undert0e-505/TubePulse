@@ -298,6 +298,7 @@ export async function collectAggregateMonitoring({
       callbackPending: finite(notificationIntents.callbackPending),
       retainedFailures: finite(notificationIntents.failed),
       retainedDeadTokens: finite(notificationIntents.deadToken),
+      transientNagsExpired: finite(notificationIntents.transientExpired),
     },
     authority: {
       remoteAvailable: Boolean(remoteStatus?.ok),

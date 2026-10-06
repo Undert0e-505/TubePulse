@@ -153,7 +153,8 @@
         { "expr": "tubepulse_notifications_recovered", "legendFormat": "recovered", "refId": "E" },
         { "expr": "tubepulse_notifications_durable_backlog", "legendFormat": "durable backlog", "refId": "F" },
         { "expr": "tubepulse_notifications_callback_pending", "legendFormat": "callback pending", "refId": "G" },
-        { "expr": "tubepulse_notifications_retained_failures", "legendFormat": "retained failures", "refId": "H" }
+        { "expr": "tubepulse_notifications_retained_failures", "legendFormat": "retained failures", "refId": "H" },
+        { "expr": "tubepulse_notifications_transient_nags_expired", "legendFormat": "expired legacy nags", "refId": "I" }
       ],
       "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
       "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } }

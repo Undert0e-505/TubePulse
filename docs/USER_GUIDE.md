@@ -77,7 +77,8 @@ above still apply.
 - **Relentless** can repeat at the selected nag interval while the video remains unseen.
 - Available nag intervals are 5, 15, 30, 60 and 120 minutes.
 
-Community posts do not enter the video reminder cycle.
+When community posts are enabled globally or for an individual channel, an unread currently visible
+post can be included in that channel's reminder. Disabling posts excludes them from later reminders.
 
 ### Do not disturb
 
