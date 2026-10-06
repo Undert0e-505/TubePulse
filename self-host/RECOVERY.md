@@ -36,8 +36,17 @@ It verifies more than HTTP success:
 - signed coordinator status through `home-authority-cli.mjs status`;
 - selected/ready D1 backend, remote current state, no transaction, and no pending backup keys;
 - active scheduler mode, a held scheduler lease, and recent aligned-cycle/minute progress (with a startup grace window).
+- once per Windows boot, a tunnel-sidecar restart only after those authority checks pass, followed by bounded proof that the connector registered.
 
 The Compose health check itself proves only HTTP success plus service identity. Docker can report healthy while authority is stale or scheduler progress is stuck. The supervisor never clears pending state or activates stale authority. It performs at most one bounded container restart for a proven liveness-health failure; readiness, coordinator, progress, or WAN failures are retried/reported without destructive restart loops.
+
+Docker daemon restart policy can resume the authority and tunnel concurrently without reapplying
+Compose dependency ordering. The supervisor records the current OS boot identity in ignored
+`data-authority/startup-cloudflared-boot.json`. After the host and signed coordinator are current and
+the scheduler is progressing, it restarts only `cloudflared` once for that boot, waits for a
+registered connector, and rechecks authority readiness. Re-running the supervisor in the same boot
+does not repeat the restart. Connector registration cannot by itself prove an authenticated public
+feed traverses the host; the notification visibility barrier remains the end-to-end route check.
 
 ### Install, inspect, or remove per-user startup
 
@@ -71,16 +80,16 @@ The Scheduled Task installer remains an optional administrator-controlled altern
 
 | Event | Expected behavior | Target recovery band |
 |---|---|---:|
-| Home process/container exits | Docker restarts it with the persistent bind mount; lease/transaction safeguards still apply. | At most 5 minutes |
+| Authority process/container exits | Docker restarts it with the persistent bind mount; lease/transaction safeguards still apply. | At most 5 minutes |
 | Docker is stopped at sign-in | Hidden per-user Startup launcher starts Docker Desktop minimized, waits for `docker info`, then applies Compose idempotently. | At most 10 minutes after sign-in |
-| Reboot or power restoration | Same at-logon flow; an unclean lease must expire naturally. | At most 10 minutes after sign-in/network |
+| Reboot or power restoration | Same at-logon flow; an unclean lease must expire naturally. Once authority/coordinator readiness is proven, the supervisor performs the once-per-boot tunnel restart so VPC routing is established against the ready origin. | At most 10 minutes after sign-in/network |
 | Sleep/hibernation | Docker/containers normally resume; cloudflared reconnects. A later task retry or manual dry status can reassert Compose without overlap. | At most 10 minutes after usable network |
 | Internet/Cloudflare outage | Containers remain intact; cloudflared and Home retry/back off. Supervisor classifies dependency failure and does not restart repeatedly. | At most 10 minutes after dependency return |
 | Container HTTP health is genuinely unhealthy | Supervisor may perform one bounded restart, then alerts/fails if liveness does not return. | At most 5 minutes when dependencies are healthy |
 | Authority stale, pending, or transaction fault | No destructive restart/clear/activation. The supervisor exits unsuccessfully after bounded observation so the fault remains actionable. | Manual integrity recovery |
 | Scheduler lease/progress stuck while HTTP remains healthy | Classified separately and surfaced; not treated as an upstream outage or automatic data reset. | Manual diagnosis after bounded alert |
 
-The current host has the per-user Startup shortcut installed and has passed an idempotent live invocation against the running authority without replacing the healthy container. A controlled sign-out/reboot test remains outstanding, so post-boot timing is not yet a measured guarantee.
+The current host has the per-user Startup shortcut installed. A real power-loss recovery proved Docker, authority, monitoring, and the tunnel process restarted, but also exposed that daemon-level concurrent container restart could leave public VPC reads on D1 fallback despite registered tunnel connections. Restarting only the tunnel after authority readiness restored host routing without replacing the authority container or touching state. The checked-in once-per-boot sequencing fix has passed a safe same-boot idempotence test; the next controlled reboot/power recovery must confirm it end to end.
 
 ## Total-loss recovery: what survives remotely
 

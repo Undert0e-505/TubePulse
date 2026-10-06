@@ -44,6 +44,21 @@ test('authority startup dry-run resolves its production files without host mutat
   assert.equal(result.MutatedHost, false);
   assert.match(result.ComposeFile, /compose\.authority\.yaml$/i);
   assert.match(result.EnvironmentFile, /\.env\.authority$/i);
+  assert.match(result.TunnelBootMarker, /data-authority[\\/]startup-cloudflared-boot\.json$/i);
+});
+
+test('startup supervisor performs tunnel recovery once per OS boot after authority readiness', () => {
+  const script = path.join(windowsDir, 'Start-HomeAuthority.ps1');
+  const source = runPowerShell([
+    '-Command',
+    `$ErrorActionPreference='Stop'; $text=[IO.File]::ReadAllText('${script.replaceAll("'", "''")}'); ` +
+      `if ($text -notmatch 'Get-CurrentBootIdentity' -or $text -notmatch 'startup-cloudflared-boot.json') { throw 'boot marker missing' }; ` +
+      `if ($text -notmatch 'UtcDateTime.Ticks' -or $text -notmatch 'InvariantCulture') { throw 'boot identity is not cross-PowerShell stable' }; ` +
+      `if (-not $text.Contains("Compose-Arguments -Tail @('restart', 'cloudflared')")) { throw 'targeted tunnel restart missing' }; ` +
+      `if ($text -notmatch 'CloudflaredRestartAttempted' -or $text -notmatch 'Registered tunnel connection') { throw 'bounded registration proof missing' }; ` +
+      `if ($text.LastIndexOf('Ensure-CloudflaredBootRecovery') -gt $text.IndexOf('if ($evaluation.Success)')) { 'ok' } else { throw 'tunnel recovery is not readiness-gated' }`,
+  ]);
+  assert.equal(source, 'ok');
 });
 
 test('Scheduled Task installer dry-run produces hidden non-overlapping logon plan', () => {
@@ -129,6 +144,16 @@ test('startup supervisor tolerates transient optional scheduler fields under str
     '-Command',
     `$ErrorActionPreference='Stop'; $text=[IO.File]::ReadAllText('${script.replaceAll("'", "''")}'); ` +
       `if ($text -notmatch 'function Get-OptionalProperty' -or $text -notmatch 'scheduler.currentSweep') { throw 'optional accessor missing' }; 'ok'`,
+  ]);
+  assert.equal(source, 'ok');
+});
+
+test('startup supervisor handles PowerShell date conversion without locale round-tripping', () => {
+  const script = path.join(windowsDir, 'Start-HomeAuthority.ps1');
+  const source = runPowerShell([
+    '-Command',
+    `$ErrorActionPreference='Stop'; $text=[IO.File]::ReadAllText('${script.replaceAll("'", "''")}'); ` +
+      `if (-not $text.Contains('$Value -is [DateTimeOffset]') -or -not $text.Contains('$Value -is [DateTime]')) { throw 'typed timestamp handling missing' }; 'ok'`,
   ]);
   assert.equal(source, 'ok');
 });

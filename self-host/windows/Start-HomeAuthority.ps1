@@ -32,10 +32,13 @@ $dataDirectory = [IO.Path]::GetFullPath((Join-Path $selfHostDirectory 'data-auth
 $logPath = [IO.Path]::GetFullPath((Join-Path $dataDirectory 'startup-supervisor.log'))
 $previousLogPath = [IO.Path]::GetFullPath((Join-Path $dataDirectory 'startup-supervisor.previous.log'))
 $lockPath = [IO.Path]::GetFullPath((Join-Path $dataDirectory 'startup-supervisor.lock'))
+$tunnelBootMarkerPath = [IO.Path]::GetFullPath((Join-Path $dataDirectory 'startup-cloudflared-boot.json'))
 $utf8NoBom = New-Object Text.UTF8Encoding($false)
 $script:DockerCommand = $null
 $script:DockerDesktopStarted = $false
 $script:ContainerRestarted = $false
+$script:CloudflaredRestartAttempted = $false
+$script:CloudflaredRestartedAt = $null
 $monitoringLauncher = [IO.Path]::GetFullPath((Join-Path $selfHostDirectory '..\monitoring\windows\Start-TubePulseMonitoring.ps1'))
 
 function Assert-ChildPath {
@@ -49,7 +52,7 @@ function Assert-ChildPath {
     }
 }
 
-foreach ($path in @($composePath, $environmentPath, $sourceDirectory, $dataDirectory, $logPath, $previousLogPath, $lockPath)) {
+foreach ($path in @($composePath, $environmentPath, $sourceDirectory, $dataDirectory, $logPath, $previousLogPath, $lockPath, $tunnelBootMarkerPath)) {
     Assert-ChildPath -Parent $selfHostDirectory -Child $path
 }
 if (-not (Test-Path -LiteralPath $composePath -PathType Leaf)) {
@@ -63,6 +66,7 @@ if ($DryRun) {
         EnvironmentFile = $environmentPath
         EnvironmentPresent = (Test-Path -LiteralPath $environmentPath -PathType Leaf)
         DataDirectory = $dataDirectory
+        TunnelBootMarker = $tunnelBootMarkerPath
         InitialDelaySeconds = $InitialDelaySeconds
         MaxAttempts = $MaxAttempts
         MutatedHost = $false
@@ -170,6 +174,89 @@ function Invoke-ComposeUp {
     return $true
 }
 
+function Get-CurrentBootIdentity {
+    $operatingSystem = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+    # Persist decimal UTC ticks rather than an ISO timestamp. PowerShell 7
+    # auto-converts ISO JSON strings to DateTime while Windows PowerShell 5
+    # leaves them as strings, which would make the same boot compare unequal.
+    return ([DateTimeOffset]$operatingSystem.LastBootUpTime).UtcDateTime.Ticks.ToString(
+        [Globalization.CultureInfo]::InvariantCulture
+    )
+}
+
+function Read-TunnelBootMarker {
+    if (-not (Test-Path -LiteralPath $tunnelBootMarkerPath -PathType Leaf)) { return $null }
+    try {
+        return (Get-Content -LiteralPath $tunnelBootMarkerPath -Raw | ConvertFrom-Json)
+    } catch {
+        Write-SupervisorLog -Level 'WARN' -Message 'Tunnel boot marker is unreadable; one bounded recovery will be attempted.'
+        return $null
+    }
+}
+
+function Write-TunnelBootMarker {
+    param([Parameter(Mandatory = $true)][string]$BootIdentity)
+    $temporaryPath = $tunnelBootMarkerPath + '.tmp'
+    $payload = [pscustomobject]@{
+        schemaVersion = 1
+        bootIdentity = $BootIdentity
+        recoveredAt = [DateTimeOffset]::UtcNow.ToString('o')
+    } | ConvertTo-Json -Compress
+    [IO.File]::WriteAllText($temporaryPath, $payload, $utf8NoBom)
+    Move-Item -LiteralPath $temporaryPath -Destination $tunnelBootMarkerPath -Force
+}
+
+function Get-CloudflaredRegistrationState {
+    param([Parameter(Mandatory = $true)][DateTimeOffset]$Since)
+    $ps = Invoke-Docker -Arguments (Compose-Arguments -Tail @('ps', '-q', 'cloudflared'))
+    if ($ps.ExitCode -ne 0 -or $ps.Output.Count -eq 0 -or [string]::IsNullOrWhiteSpace($ps.Output[0])) {
+        return [pscustomobject]@{ Running = $false; RegisteredConnections = 0 }
+    }
+    $containerId = $ps.Output[0].Trim()
+    $inspect = Invoke-Docker -Arguments @('inspect', '--format', '{{.State.Status}}', $containerId)
+    $logs = Invoke-Docker -Arguments @('logs', '--since', $Since.ToUniversalTime().ToString('o'), $containerId)
+    $registered = if ($logs.ExitCode -eq 0) {
+        @($logs.Output | Where-Object { $_ -like '*Registered tunnel connection*' }).Count
+    } else { 0 }
+    return [pscustomobject]@{
+        Running = $inspect.ExitCode -eq 0 -and $inspect.Output.Count -gt 0 -and $inspect.Output[0].Trim() -eq 'running'
+        RegisteredConnections = $registered
+    }
+}
+
+function Ensure-CloudflaredBootRecovery {
+    $bootIdentity = Get-CurrentBootIdentity
+    $marker = Read-TunnelBootMarker
+    if ($null -ne $marker -and [string]$marker.bootIdentity -eq $bootIdentity) {
+        return [pscustomobject]@{ Ready = $true; Restarted = $false }
+    }
+
+    if (-not $script:CloudflaredRestartAttempted) {
+        $script:CloudflaredRestartAttempted = $true
+        $script:CloudflaredRestartedAt = [DateTimeOffset]::UtcNow
+        $restart = Invoke-Docker -Arguments (Compose-Arguments -Tail @('restart', 'cloudflared'))
+        if ($restart.ExitCode -ne 0) {
+            Write-SupervisorLog -Level 'WARN' -Message 'Boot recovery could not restart the tunnel sidecar; authority remains untouched.'
+            return [pscustomobject]@{ Ready = $false; Restarted = $false }
+        }
+        Write-SupervisorLog -Level 'INFO' -Message 'Performed the once-per-boot tunnel restart after authority readiness.'
+    }
+
+    $deadline = [DateTimeOffset]::UtcNow.AddSeconds(45)
+    do {
+        $registration = Get-CloudflaredRegistrationState -Since $script:CloudflaredRestartedAt
+        if ($registration.Running -and $registration.RegisteredConnections -gt 0) {
+            Write-TunnelBootMarker -BootIdentity $bootIdentity
+            Write-SupervisorLog -Level 'INFO' -Message 'Tunnel sidecar registered after boot recovery.'
+            return [pscustomobject]@{ Ready = $true; Restarted = $true }
+        }
+        Start-Sleep -Seconds 2
+    } while ([DateTimeOffset]::UtcNow -lt $deadline)
+
+    Write-SupervisorLog -Level 'WARN' -Message 'Tunnel sidecar did not register within the bounded boot-recovery window.'
+    return [pscustomobject]@{ Ready = $false; Restarted = $false }
+}
+
 function Get-AuthorityContainerState {
     $ps = Invoke-Docker -Arguments (Compose-Arguments -Tail @('ps', '-q', 'home-authority'))
     if ($ps.ExitCode -ne 0 -or $ps.Output.Count -eq 0 -or [string]::IsNullOrWhiteSpace($ps.Output[0])) {
@@ -217,8 +304,14 @@ function Get-RemoteAuthorityStatus {
 function Test-FreshTimestamp {
     param([object]$Value, [int]$MaximumAgeMinutes)
     if ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)) { return $false }
-    $parsed = [DateTimeOffset]::MinValue
-    if (-not [DateTimeOffset]::TryParse([string]$Value, [ref]$parsed)) { return $false }
+    if ($Value -is [DateTimeOffset]) {
+        $parsed = [DateTimeOffset]$Value
+    } elseif ($Value -is [DateTime]) {
+        $parsed = [DateTimeOffset]([DateTime]$Value)
+    } else {
+        $parsed = [DateTimeOffset]::MinValue
+        if (-not [DateTimeOffset]::TryParse([string]$Value, [ref]$parsed)) { return $false }
+    }
     $age = [DateTimeOffset]::Now - $parsed
     return $age.TotalMinutes -ge -1 -and $age.TotalMinutes -le $MaximumAgeMinutes
 }
@@ -339,11 +432,34 @@ try {
                         $evaluation = Evaluate-Authority -Local $local -Remote $remote
                         $lastCategory = $evaluation.Category
                         if ($evaluation.Success) {
-                            Write-SupervisorLog -Level 'INFO' -Message $evaluation.Message
-                            Start-MonitoringBestEffort
-                            exit 0
+                            $tunnel = Ensure-CloudflaredBootRecovery
+                            if (-not $tunnel.Ready) {
+                                $lastCategory = 'tunnel-not-ready'
+                                Write-SupervisorLog -Level 'WARN' -Message "Attempt ${attempt}: tunnel boot recovery is not ready; preserving authority and retrying."
+                            } else {
+                                if ($tunnel.Restarted) {
+                                    $local = Get-LocalAuthorityStatus
+                                    $remote = Get-RemoteAuthorityStatus
+                                    if ($null -eq $local -or $null -eq $remote) {
+                                        $lastCategory = 'post-tunnel-status-unavailable'
+                                        Write-SupervisorLog -Level 'WARN' -Message "Attempt ${attempt}: post-tunnel authority status is unavailable."
+                                        continue
+                                    }
+                                    $evaluation = Evaluate-Authority -Local $local -Remote $remote
+                                    if (-not $evaluation.Success) {
+                                        $lastCategory = $evaluation.Category
+                                        Write-SupervisorLog -Level 'WARN' -Message "Attempt ${attempt}: post-tunnel authority verification failed."
+                                        continue
+                                    }
+                                }
+                                Write-SupervisorLog -Level 'INFO' -Message $evaluation.Message
+                                Start-MonitoringBestEffort
+                                exit 0
+                            }
                         }
-                        Write-SupervisorLog -Level 'WARN' -Message "Attempt ${attempt}: $($evaluation.Message)"
+                        if (-not $evaluation.Success) {
+                            Write-SupervisorLog -Level 'WARN' -Message "Attempt ${attempt}: $($evaluation.Message)"
+                        }
                     }
                 }
             }
