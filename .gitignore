@@ -39,6 +39,13 @@ self-host/secrets/
 self-host/.env.scheduler
 self-host/.env.authority
 
+# Local aggregate monitoring history/state. Keep only the operator entrypoints.
+/logs/*
+!/logs/README.md
+!/logs/Open-TubePulse-Operations.ps1
+!/logs/Open-TubePulse-Operations.cmd
+/monitoring/.env.local
+
 # Generated only while assembling the side-by-side local Android variant.
 android/app/src/selfhost/google-services.json
 

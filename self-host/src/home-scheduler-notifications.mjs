@@ -109,6 +109,22 @@ export class DurableNotificationIntentStore {
       .map((record) => ({ id: record.id, intent: structuredClone(record.intent) }));
   }
 
+  async summary() {
+    const state = await this.stateFile.read();
+    const summary = {
+      pending: 0, sending: 0, sent: 0, resolved: 0,
+      callbackPending: 0, failed: 0, deadToken: 0, suppressed: 0,
+    };
+    for (const record of Object.values(state.records || {})) {
+      if (Object.hasOwn(summary, record.status)) summary[record.status]++;
+      if (!record.callbackApplied && ['sending', 'sent'].includes(record.status)) summary.callbackPending++;
+      if (record.delivery === 'indeterminate') summary.failed++;
+      if (record.delivery === 'dead-token') summary.deadToken++;
+      if (record.delivery === 'suppressed') summary.suppressed++;
+    }
+    return summary;
+  }
+
   async update(id, updater) {
     const state = await this.stateFile.read();
     const record = state.records?.[id];

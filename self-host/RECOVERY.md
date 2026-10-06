@@ -314,3 +314,15 @@ Only after application recovery succeeds, dry-run and install the per-user Start
 ## Remaining hardening
 
 The repository now contains bounded host startup supervision, signed status, a hash-guarded pending-drain command, and exact D1-to-local reconstruction. It still cannot recover lost notification-intent history or YouTube request counters. Future work should add always-verify startup manifests and checksummed/fsynced local state generations. These limitations must fail closed rather than being hidden by retries.
+
+## Restore aggregate monitoring after recovery
+
+Monitoring is deliberately downstream of authority recovery. Restore and verify the authority first; monitoring must never become an activation gate.
+
+1. Recreate the ignored `self-host/secrets/cloudflare-read-token.txt` with a least-privilege token that has **Account Analytics Read** only. Do not reuse deploy/scheduler credentials.
+2. Dry-run `monitoring/windows/Start-TubePulseMonitoring.ps1 -DryRun` and validate `docker compose -f monitoring/compose.yaml config --quiet`.
+3. Start with `logs/Open-TubePulse-Operations.ps1`, then verify the loopback collector, Prometheus, and Grafana health URLs listed in [`../monitoring/README.md`](../monitoring/README.md).
+4. Confirm the collector has a successful aggregate host sample and Cloudflare sample, Prometheus reports the collector target up, and the provisioned dashboard loads. Do not use individual identities to validate it.
+5. Re-run the authority startup supervisor once; it should request monitoring best-effort only after authority readiness and must return the same authority success even if monitoring is stopped/broken.
+
+Prometheus, Grafana, collector state, and daily JSONL snapshots live only under ignored repo-root `logs/`. Git reconstructs configuration and dashboards, not historical observations. After total disk loss the stack starts a new history unless those directories were independently copied. Their loss does not change D1 canonical state, scheduler correctness, notification ordering, or the authority recovery sequence above.

@@ -36,6 +36,7 @@ $utf8NoBom = New-Object Text.UTF8Encoding($false)
 $script:DockerCommand = $null
 $script:DockerDesktopStarted = $false
 $script:ContainerRestarted = $false
+$monitoringLauncher = [IO.Path]::GetFullPath((Join-Path $selfHostDirectory '..\monitoring\windows\Start-TubePulseMonitoring.ps1'))
 
 function Assert-ChildPath {
     param(
@@ -275,6 +276,18 @@ function Evaluate-Authority {
     return [pscustomobject]@{ Success = $true; Category = 'active-current'; Message = 'Authority and scheduler are current and progressing.' }
 }
 
+function Start-MonitoringBestEffort {
+    if (-not (Test-Path -LiteralPath $monitoringLauncher -PathType Leaf)) { return }
+    try {
+        Start-Process -FilePath 'powershell.exe' -ArgumentList @(
+            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $monitoringLauncher), '-NoOpen', '-WaitSeconds', '0'
+        ) -WindowStyle Hidden | Out-Null
+        Write-SupervisorLog -Level 'INFO' -Message 'Requested best-effort aggregate monitoring startup.'
+    } catch {
+        Write-SupervisorLog -Level 'WARN' -Message 'Aggregate monitoring startup could not be requested; production authority remains unaffected.'
+    }
+}
+
 $lockStream = $null
 try {
     try {
@@ -327,6 +340,7 @@ try {
                         $lastCategory = $evaluation.Category
                         if ($evaluation.Success) {
                             Write-SupervisorLog -Level 'INFO' -Message $evaluation.Message
+                            Start-MonitoringBestEffort
                             exit 0
                         }
                         Write-SupervisorLog -Level 'WARN' -Message "Attempt ${attempt}: $($evaluation.Message)"

@@ -16,6 +16,7 @@ import {
 } from './home-scheduler.mjs';
 import { LocalKvAdapter } from './kv-adapters.mjs';
 import { TubePulseRuntime } from './runtime.mjs';
+import { collectAggregateMonitoring } from './aggregate-monitoring.mjs';
 
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
 const HOP_BY_HOP_HEADERS = new Set([
@@ -105,6 +106,7 @@ export class UnifiedHomeAuthorityService {
       await this.runtime.start();
       const namespace = await this.runtime.getLocalNamespace();
       const local = new LocalKvAdapter(namespace);
+      this.localAdapter = local;
       this.gate ||= new HomeAuthorityGate({
         adapter: local,
         stateFile: createHomeAuthorityStateFile(this.config.dataDir),
@@ -216,6 +218,30 @@ export class UnifiedHomeAuthorityService {
           publicAppRoutes: false,
           periodicCanonicalPull: false,
         },
+      }));
+    }
+    if (parsed.pathname === '/_tubepulse/monitoring') {
+      if (request.method !== 'GET') return await sendResponse(response, Response.json({ error: 'Method not allowed' }, { status: 405 }));
+      const [authority, scheduler, remoteResult] = await Promise.all([
+        this.gate.status(),
+        this.runner.status(),
+        this.client.status().then((value) => ({ value })).catch(() => ({ value: null })),
+      ]);
+      const localStatus = {
+        status: this.ready ? 'ready' : 'starting',
+        mode: this.config.mode,
+        authority,
+        scheduler: publicHomeSchedulerState(scheduler),
+        configuration: { videoSourceMode: this.config.videoSourceMode },
+      };
+      const aggregate = await collectAggregateMonitoring({
+        adapter: this.localAdapter,
+        localStatus,
+        remoteStatus: remoteResult.value,
+        config: this.config,
+      });
+      return await sendResponse(response, new Response(JSON.stringify(aggregate), {
+        headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
       }));
     }
     if (!parsed.pathname.startsWith('/_tubepulse/authority/')) {

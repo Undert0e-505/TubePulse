@@ -1,0 +1,107 @@
+name: tubepulse-monitoring
+
+services:
+  collector:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tubepulse-monitoring-collector:1
+    restart: unless-stopped
+    environment:
+      CLOUDFLARE_ACCOUNT_ID: ${TUBEPULSE_MONITORING_CF_ACCOUNT_ID:-77bb7769185bbfeb53feef16b9f72803}
+      CLOUDFLARE_D1_DATABASE_ID: ${TUBEPULSE_MONITORING_D1_DATABASE_ID:-bc49a996-5576-4000-8cf5-b104c2bb7e84}
+      CLOUDFLARE_WORKER_SCRIPT: ${TUBEPULSE_MONITORING_WORKER_SCRIPT:-tubepulse-api}
+      CLOUDFLARE_API_TOKEN_FILE: /run/secrets/cloudflare-read-token.txt
+      TUBEPULSE_HOST_MONITORING_URL: http://home-authority:8788/_tubepulse/monitoring
+      TUBEPULSE_SNAPSHOT_DIR: /data/snapshots
+      TUBEPULSE_COLLECTOR_STATE_FILE: /data/collector/state.json
+      TUBEPULSE_SNAPSHOT_RETENTION_DAYS: ${TUBEPULSE_MONITORING_SNAPSHOT_RETENTION_DAYS:-1095}
+      TUBEPULSE_D1_ROWS_WRITTEN_GUARDRAIL: ${TUBEPULSE_D1_ROWS_WRITTEN_GUARDRAIL:-100000}
+      TUBEPULSE_D1_ROWS_READ_GUARDRAIL: ${TUBEPULSE_D1_ROWS_READ_GUARDRAIL:-5000000}
+      TUBEPULSE_WORKER_REQUEST_GUARDRAIL: ${TUBEPULSE_WORKER_REQUEST_GUARDRAIL:-100000}
+    ports:
+      - "127.0.0.1:${TUBEPULSE_MONITORING_COLLECTOR_PORT:-9464}:9464"
+    volumes:
+      - ../self-host/secrets/cloudflare-read-token.txt:/run/secrets/cloudflare-read-token.txt:ro
+      - ../logs/snapshots:/data/snapshots
+      - ../logs/collector:/data/collector
+    networks:
+      - monitoring
+      - authority
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:9464/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    logging: &bounded-logging
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  prometheus:
+    image: prom/prometheus:v3.7.1@sha256:ff7e389acbe064a4823212a500393d40a28a8f362e4b05cbf6742a9a3ef736b2
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=5y
+      - --storage.tsdb.retention.size=5GB
+      - --web.enable-lifecycle
+    ports:
+      - "127.0.0.1:${TUBEPULSE_MONITORING_PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules.yml:/etc/prometheus/rules.yml:ro
+      - ../logs/prometheus:/prometheus
+    networks:
+      - monitoring
+    depends_on:
+      collector:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:9090/-/ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    logging: *bounded-logging
+
+  grafana:
+    image: grafana/grafana:12.2.0@sha256:74144189b38447facf737dfd0f3906e42e0776212bf575dc3334c3609183adf7
+    restart: unless-stopped
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/tubepulse-operations.json
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    ports:
+      - "${TUBEPULSE_MONITORING_GRAFANA_BIND_ADDRESS:-127.0.0.1}:${TUBEPULSE_MONITORING_GRAFANA_PORT:-3000}:3000"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/etc/grafana/dashboards:ro
+      - ../logs/grafana:/var/lib/grafana
+    networks:
+      - monitoring
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      # A new persistent directory runs Grafana's full SQLite migration set.
+      start_period: 5m
+    logging: *bounded-logging
+
+networks:
+  monitoring:
+    driver: bridge
+  authority:
+    external: true
+    name: ${TUBEPULSE_AUTHORITY_NETWORK:-tubepulse-home-authority_home-private}

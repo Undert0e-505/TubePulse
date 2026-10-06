@@ -32,6 +32,8 @@
     "test:settings-footer": "node --test test/settings-footer.test.mjs",
     "test:channel-dnd-settings": "node --test test/channel-dnd-settings.test.mjs",
     "test:widget-presentation": "node --test test/widget-presentation.test.mjs",
+    "test:monitoring": "node --test monitoring/test/*.test.mjs",
+    "check:monitoring": "node --check monitoring/src/cloudflare.mjs && node --check monitoring/src/collector.mjs && node --check monitoring/src/prometheus.mjs && node --check monitoring/src/snapshots.mjs && npm run test:monitoring",
     "check:self-host": "npm --prefix self-host run check",
     "build:android:selfhost": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/Build-SelfHostApk.ps1"
   },

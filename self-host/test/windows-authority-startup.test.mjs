@@ -24,6 +24,18 @@ for (const name of ['Start-HomeAuthority.ps1', 'Install-HomeAuthorityStartupTask
   });
 }
 
+test('monitoring launcher parses and dry-runs without host mutation', () => {
+  const script = path.resolve(selfHostDir, '..', 'monitoring', 'windows', 'Start-TubePulseMonitoring.ps1');
+  const escaped = script.replaceAll("'", "''");
+  assert.equal(runPowerShell(['-Command', `$ErrorActionPreference='Stop'; [void][scriptblock]::Create([IO.File]::ReadAllText('${escaped}')); 'ok'`]), 'ok');
+  const result = JSON.parse(runPowerShell(['-ExecutionPolicy', 'Bypass', '-File', script, '-DryRun']));
+  assert.equal(result.DryRun, true);
+  assert.equal(result.MutatedHost, false);
+  assert.ok(['127.0.0.1', '0.0.0.0'].includes(result.GrafanaBindAddress));
+  assert.equal(result.LoopbackOnly, result.GrafanaBindAddress === '127.0.0.1');
+  assert.match(result.ComposeFile, /monitoring[\\/]compose\.yaml$/i);
+});
+
 test('authority startup dry-run resolves its production files without host mutation', () => {
   const script = path.join(windowsDir, 'Start-HomeAuthority.ps1');
   const output = runPowerShell(['-ExecutionPolicy', 'Bypass', '-File', script, '-DryRun', '-InitialDelaySeconds', '0']);

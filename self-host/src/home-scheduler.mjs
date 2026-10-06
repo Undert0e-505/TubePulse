@@ -1812,7 +1812,11 @@ export class HomeSchedulerRunner {
   }
 
   async status() {
-    return await this.stateFile.read();
+    const state = await this.stateFile.read();
+    if (typeof this.notificationCoordinator?.intentStore?.summary === 'function') {
+      state.notificationIntents = await this.notificationCoordinator.intentStore.summary();
+    }
+    return state;
   }
 
   async close() {

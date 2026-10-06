@@ -1,0 +1,58 @@
+groups:
+  - name: tubepulse-operations
+    interval: 30s
+    rules:
+      - record: tubepulse:d1_rows_written_day
+        expr: tubepulse_cloudflare_d1_rows_written{period="day"}
+      - record: tubepulse:d1_rows_read_day
+        expr: tubepulse_cloudflare_d1_rows_read{period="day"}
+      - record: tubepulse:worker_requests_day
+        expr: sum(tubepulse_cloudflare_worker_requests{period="day"})
+      - record: tubepulse:d1_write_budget_ratio
+        expr: tubepulse:d1_rows_written_day / on() tubepulse_guardrail{resource="d1_rows_written_day"}
+      - record: tubepulse:d1_read_budget_ratio
+        expr: tubepulse:d1_rows_read_day / on() tubepulse_guardrail{resource="d1_rows_read_day"}
+      - record: tubepulse:worker_request_budget_ratio
+        expr: tubepulse:worker_requests_day / on() tubepulse_guardrail{resource="worker_requests_day"}
+      - record: tubepulse:d1_write_projected_end_of_day
+        expr: tubepulse:d1_rows_written_day / scalar(clamp_min(vector((time() % 86400) / 86400), 0.0416667))
+      - alert: TubePulseCollectorDown
+        expr: up{job="tubepulse-aggregate-collector"} == 0
+        for: 10m
+        labels: { severity: critical }
+        annotations: { summary: "TubePulse aggregate collector is unavailable" }
+      - alert: TubePulseCollectionStale
+        expr: time() - tubepulse_collector_last_success_timestamp_seconds > 1200
+        for: 5m
+        labels: { severity: warning }
+        annotations: { summary: "TubePulse aggregate collection is stale" }
+      - alert: TubePulseHostNotReady
+        expr: tubepulse_host_ready == 0 or tubepulse_host_authority_current == 0
+        for: 10m
+        labels: { severity: critical }
+        annotations: { summary: "TubePulse host authority is not ready/current" }
+      - alert: TubePulseSchedulerStale
+        expr: tubepulse_host_scheduler_progress_age_seconds > 900
+        for: 5m
+        labels: { severity: warning }
+        annotations: { summary: "TubePulse hosted scheduler progress is stale" }
+      - alert: TubePulsePendingBackup
+        expr: tubepulse_authority_pending_backup_keys > 0
+        for: 15m
+        labels: { severity: warning }
+        annotations: { summary: "TubePulse canonical backup queue is pending" }
+      - alert: TubePulseSubscriptionIndexDrift
+        expr: tubepulse_subscription_integrity_consistent == 0
+        for: 15m
+        labels: { severity: warning }
+        annotations: { summary: "TubePulse canonical subscription indexes disagree" }
+      - alert: TubePulseD1WriteBudgetWarning
+        expr: tubepulse:d1_write_budget_ratio > 0.75
+        for: 10m
+        labels: { severity: warning }
+        annotations: { summary: "TubePulse D1 daily write usage exceeds 75% of the configured guardrail" }
+      - alert: TubePulseWorkerRequestBudgetWarning
+        expr: tubepulse:worker_request_budget_ratio > 0.75
+        for: 10m
+        labels: { severity: warning }
+        annotations: { summary: "TubePulse Worker daily requests exceed 75% of the configured guardrail" }

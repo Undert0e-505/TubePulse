@@ -83,6 +83,8 @@ Production uses the **unified host authority**: one process/store owns signed al
 
 Start with the [self-host guide](self-host/README.md) for setup and operation. The [production recovery runbook](self-host/RECOVERY.md) covers both the checked-in hidden Windows startup supervisor and a complete zero-local-backup rebuild from GitHub, active D1/Durable Object state, and the existing cloud projects. The task installer is not assumed to be installed until the host is explicitly configured and reboot-tested.
 
+Local aggregate operations history is available through the provisioned [Prometheus/Grafana monitoring stack](monitoring/README.md). Double-click `logs/Open-TubePulse-Operations.cmd` to start missing monitoring services and open the localhost-only dashboard. It records aggregate counts and service health only—never installation/channel identifiers, tokens, titles, or content.
+
 ---
 
 ## Detailed Architecture

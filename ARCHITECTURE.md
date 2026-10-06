@@ -775,6 +775,8 @@ The final subscriber leaving removes the channel from `channels:active`, which s
 
 Host availability and disaster recovery are deliberately separate from this data-plane design. Compose health proves only HTTP liveness/service identity—not authority readiness/current state or scheduler progress. The checked-in Windows supervisor starts Docker minimized, applies Compose idempotently, and separately evaluates signed coordinator/D1 readiness and scheduler progress without clearing stale/pending state or restarting for dependency outages. A verified per-user Startup shortcut now invokes it at interactive sign-in; the idempotent live test passed without replacing the healthy container, while a real reboot test remains outstanding. The elevated Scheduled Task route is optional because cross-account UAC task ACLs can exclude the auto-login profile. After total disk loss, GitHub plus active D1/DO and the existing cloud projects reconstruct canonical service; secrets rotate and host-only scheduler/quota/notification state follows conservative loss rules. See [`self-host/RECOVERY.md`](self-host/RECOVERY.md).
 
+Operational monitoring is a separate, non-authoritative Compose project. A bounded aggregate-only host endpoint and read-only Cloudflare GraphQL collector feed localhost Prometheus/Grafana; they cannot mutate canonical state and carry no authority credential. Five-minute UTC snapshots and time series remain under ignored repo-root `logs/`, with explicit retention limits. Monitoring startup is asynchronous/best-effort after authority readiness, so observability failure cannot block or restart production. See [`monitoring/README.md`](monitoring/README.md).
+
 ---
 
 ## Appendix A: Glossary

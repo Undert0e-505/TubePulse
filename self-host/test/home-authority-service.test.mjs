@@ -82,7 +82,9 @@ test('unified service exposes only status and signed authority ingress over the 
   const namespace = new MemoryNamespace({ setting: 'old' });
   const runner = new FakeRunner();
   const service = new UnifiedHomeAuthorityService(config(dataDir), {
-    runtime: new FakeRuntime(namespace), runner, host: '127.0.0.1', port: 0,
+    runtime: new FakeRuntime(namespace), runner,
+    client: { status: async () => ({ ok: true, replication: { status: 'current' }, pendingBackupKeys: 0, backend: { selected: 'd1', ready: true } }) },
+    host: '127.0.0.1', port: 0,
   });
   await service.start();
   t.after(() => service.close());
@@ -93,6 +95,13 @@ test('unified service exposes only status and signed authority ingress over the 
   const status = await response.json();
   assert.equal(status.configuration.publicAppRoutes, false);
   assert.equal(status.configuration.periodicCanonicalPull, false);
+  response = await fetch(`${base}/_tubepulse/monitoring`);
+  assert.equal(response.status, 200);
+  const monitoring = await response.json();
+  assert.equal(monitoring.privacy, 'aggregate-only');
+  assert.equal(Object.hasOwn(monitoring, 'deviceId'), false);
+  response = await fetch(`${base}/_tubepulse/monitoring`, { method: 'POST' });
+  assert.equal(response.status, 405);
   response = await fetch(`${base}/feed`);
   assert.equal(response.status, 404);
 

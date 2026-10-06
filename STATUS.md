@@ -1,6 +1,6 @@
 # TubePulse - Project Status
 
-**Last updated:** 2026-10-05
+**Last updated:** 2026-10-06
 **Current repo branch:** `master`
 **Current app version in repo:** `4.0.0`
 **Android versionCode/versionName in repo:** `400` / `4.0.0`
@@ -28,6 +28,12 @@ Repo evidence as of this document update:
 | Legacy resolver archive | `worker/archive/tubepulse-resolver/` preserves the old `tubepulse-resolver` source/config for reference only |
 
 Live verification after the 2026-10-05 D1 cutover confirmed Cloudflare still serves the app-facing API at the unchanged `workers.dev` URL and routes current authenticated feeds through Home while it is healthy.
+
+The repository also contains an aggregate-only localhost operations stack under `monitoring/`. It provisions Prometheus and Grafana, stores bounded ignored history under `logs/`, and uses only a read-only Account Analytics token. Its host endpoint and Cloudflare collector expose service/count distributions without installation/channel identifiers or content. Startup is best-effort after authority readiness and cannot block or restart the production authority. See [`monitoring/README.md`](monitoring/README.md).
+
+The stack was activated locally on 2026-10-06. Live validation proved a successful real aggregate host/Cloudflare sample, an up Prometheus target, provisioned Grafana datasource/dashboard, safe listener defaults, privacy-safe generated snapshots, and monitoring-only restart recovery without replacing or interrupting the authority container. Historical monitoring begins at activation; it is not reconstructed from Cloudflare.
+
+Same-LAN anonymous Viewer access is enabled for Grafana on the production host through ignored host configuration plus a Windows Firewall rule restricted to the active physical interface, the Private profile, `LocalSubnet`, and TCP port 3000. Prometheus, the collector, and authority status remain loopback-only. The tracked default for a fresh clone is still loopback-only; [`monitoring/README.md`](monitoring/README.md) documents inspection, DHCP/address caveats, and removal.
 
 ---
 
