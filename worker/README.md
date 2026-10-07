@@ -203,7 +203,7 @@ Home keeps the current working copy in its persistent local store. D1 generation
 
 **`fcm:lookup:*` is the deviceId-migration index.** When the same FCM token registers with a new `deviceId` (e.g. a v3.0.18 UUID-based install upgrades to v3.0.19's Android-ID-based install), the server uses this index to find the old device and migrate its state. See §11.1.
 
-**Key lifecycle (cleanup):** channel and device keys are cleaned by two helpers, `cleanupDeadChannel()` and `cleanupDeadDevice()` — see §11. When the last subscriber leaves, the channel is removed from `channels:active`, polling stops, and display/subscriber/post caches are deleted; `channel:{id}:known:videos` is deliberately retained so resubscription cannot replay old uploads. Device keys (`profile`/`settings`/`channels`/`state:*`/`override:*`) are deleted only when the FCM token is reported dead. The API cleanup path deletes `fcm:lookup:*`; the cron cleanup path has known drift documented in [CONTRACTS.md](CONTRACTS.md).
+**Key lifecycle (cleanup):** channel and device keys are cleaned by two helpers, `cleanupDeadChannel()` and `cleanupDeadDevice()` — see §11. When the last subscriber leaves, the channel is removed from `channels:active`, polling stops, and display/subscriber/post caches plus `channel:{id}:known:videos` are deleted. A later re-add starts a fresh lifecycle and silently seeds the then-current uploads rather than replaying everything since the old watermark. Device keys (`profile`/`settings`/`channels`/`state:*`/`override:*`) are deleted only when the FCM token is reported dead. The API cleanup path deletes `fcm:lookup:*`; remaining cleanup differences are documented in [CONTRACTS.md](CONTRACTS.md).
 
 ---
 

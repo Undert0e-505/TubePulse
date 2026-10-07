@@ -74,6 +74,7 @@ const key = {
   channelRecentPosts: (channelId) => `channel:${channelId}:recent:posts`,
   firstPollAtPosts: (channelId) => `channel:${channelId}:firstPollAt:posts`,
   channelKnownPosts: (channelId) => `channel:${channelId}:known:posts`,
+  channelKnownVideos: (channelId) => `channel:${channelId}:known:videos`,
   deviceProfile:    (deviceId)  => `device:${deviceId}:profile`,
   deviceSettings:   (deviceId)  => `device:${deviceId}:settings`,
   deviceChannels:   (deviceId)  => `device:${deviceId}:channels`,
@@ -167,6 +168,11 @@ async function cleanupDeadChannel(channelId, env, reason = 'unsubscribe_last') {
   await kv.delete(key.firstPollAtPosts(channelId));
   deletedKeys++;
   await kv.delete(key.channelKnownPosts(channelId));
+  deletedKeys++;
+  // A known-video watermark belongs to one active-subscription lifecycle.
+  // Retaining it after the final subscriber leaves turns a later re-add into
+  // a historical catch-up notification rather than a silent first seed.
+  await kv.delete(key.channelKnownVideos(channelId));
   deletedKeys++;
   await kv.delete(key.channelWebsub(channelId));
   deletedKeys++;

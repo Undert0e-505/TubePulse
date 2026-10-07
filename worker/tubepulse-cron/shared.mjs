@@ -608,6 +608,7 @@ export async function cleanupDeadChannel(channelId, env, reason = 'last_subscrib
   await kv.delete(key.channelRecentPosts(channelId));
   await kv.delete(key.firstPollAtPosts(channelId));
   await kv.delete(key.channelKnownPosts(channelId));
+  await kv.delete(key.channelKnownVideos(channelId));
   await kv.delete(key.channelWebsub(channelId));
   await kv.delete(key.channelSubs(channelId));
   const active = await getKV(kv, key.channelsActive()) || [];
