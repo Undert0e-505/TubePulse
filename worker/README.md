@@ -8,7 +8,7 @@ The [self-host runtime](../self-host/README.md) executes these same source files
 
 `self-host/compose.authority.yaml` is the production successor to the earlier scheduler shadow. One local runtime/store combines signed all-device mutation execution and scheduled work, publishes exact changed-key journals through a SQLite Durable Object coordinator, and serves all authenticated feeds over Workers VPC while current. It performs no periodic full pull. D1 commits are atomic and content-hash guarded. The coordinator conservatively caps scheduler publication at 45,000 estimated rows/day and total coordinated D1 writes at 50,000 estimated rows/day, leaving a 5,000-row app reserve; deferred keys are coalesced and later drained by the existing publication path. App mutations no longer depend on cloud canonical read availability. Semantic `4xx`/`5xx` responses discard the buffered overlay, Home transport failures fail closed, and deferred scheduler batches still suppress FCM. WebSub is acknowledged but suppressed while authority traffic owns detection. RSS0/1/2, posts, and aux deployments are retained but all five Cron Trigger lists are empty and their handlers require an explicit frozen-KV rollback latch.
 
-The current app-facing Worker deployment is version `23a053f8-e258-4ce4-b460-46965c335a5f`. Deployment authentication is intentionally external to the repository.
+The current app-facing Worker deployment is version `0b654d00-ba60-4381-94fb-fedf78ffbdd7`. Deployment authentication is intentionally external to the repository.
 
 ---
 
@@ -138,7 +138,7 @@ For each new video, the cron does the standard fan-out (which is identical to wh
 | Method | Path | Auth | Purpose |
 |--------|------|------|---------|
 | `GET`  | `/` | none | Health check returning the Worker status/contract label. The health `version` is independent from the Android app release version. |
-| `POST` | `/register` | Bearer | `handleRegister` — create/update device profile (FCM token optional). Two-phase deviceId migration for cross-version upgrades (see §11.1). |
+| `POST` | `/register` | Bearer | `handleRegister` — create/update device profile (FCM token optional). New clients advertise `notificationCapability: "local-v1"`; missing/unknown values preserve legacy FCM rendering. Two-phase deviceId migration handles cross-version upgrades (see §11.1). |
 | `POST` | `/subscribe-channel` | Bearer | `handleSubscribeChannel` — add a channel, fetch cached metadata if needed, and bootstrap recent uploads through `channels.list` → uploads playlist → `playlistItems.list` |
 | `POST` | `/unsubscribe` | Bearer | `handleUnsubscribe` — remove a channel and subscriber state; the final subscriber removes it from `channels:active`, stops polling, cleans display caches, and retains the known-video watermark for safe resubscribe |
 | `POST` | `/seen` | Bearer | `handleSeen` — mark videos / posts as watched. `ids: [videoId, "post:activityId", ...]` for individual marks; `clearAll: true` for channel-tap (clears all videos and posts for that channel) |
@@ -186,7 +186,7 @@ Home keeps the current working copy in its persistent local store. D1 generation
 | `channel:{channelId}:recent` | JSON array | `[{ videoId, title, publishedAt, thumbnail, type, link, views, likes, comments, dislikes, viewsLastCheckedHour?, likesLastCheckedHour? }]` — metrics are decimal strings when known and `null` when hidden/unavailable; persistence clocks gate canonical metric writes | Home Data API scheduler | API (feed, bootstrap), API (subscribe for first-time populate) |
 | `channel:{channelId}:recent:posts` | JSON array | `[{ activityId, kind, text, thumbnail, link, publishedAt, fetchedAt, likeCount, viewCount }, ...]`; normalized known engagement changes persist at most once per UTC hour, with hydration and a 24-hour forced refresh | Home posts sweep | API (feed) |
 | `channel:{channelId}:firstPollAt:posts` | string | ISO timestamp of the first posts sweep for this channel — drives the first-run guard (**v3.1**) | Home posts sweep | Home posts sweep |
-| `device:{deviceId}:profile` | JSON | `{ fcmToken, platform, appVersion, createdAt, lastSeenAt }` | API (register) | API (any auth call), Home (FCM fan-out) |
+| `device:{deviceId}:profile` | JSON | `{ fcmToken, platform, appVersion, notificationCapability, createdAt, lastSeenAt }`; capability is `"local-v1"` or `null` | API (register) | API (any auth call), Home (FCM fan-out) |
 | `device:{deviceId}:settings` | JSON | `{ mode, nagInterval, dndEnabled, dndStart, dndEnd, dndTimezone, dndBypass, tapAction, includeCommunityPosts (v3.1), prewarnMinutes (v3.1), ... }` | API (settings) | Home (FCM fan-out filter) |
 | `device:{deviceId}:channels` | JSON array | `[channelId, ...]` | API (subscribe, unsubscribe) | API (feed filter) |
 | `device:{deviceId}:override:{channelId}` | JSON | per-channel notification override. May include `mode?`, `nagInterval?`, `dndBypass?`, `muted?`, `includeCommunityPosts?` (**v3.1**, tri-state null/true/false), `prewarnMinutes?` (**v3.1**, tri-state null/number) | API (channel-override) | Home (FCM fan-out filter) |
@@ -474,21 +474,32 @@ The active Home authority uses FCM v1 for notification fan-out through the share
 3. Build a JWT with header `{alg: 'RS256', typ: 'JWT'}` and payload `{ iss, scope: 'https://www.googleapis.com/auth/firebase.messaging', aud, iat, exp }`
 4. Sign with the private key using RSA-SHA256
 5. POST to `https://oauth2.googleapis.com/token` with `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion={jwt}` → get an OAuth access token
-6. POST to `https://fcm.googleapis.com/v1/projects/{projectId}/messages:send` with the access token as a Bearer and the message payload:
+6. POST to `https://fcm.googleapis.com/v1/projects/{projectId}/messages:send` with the access token as a Bearer. The normalized profile capability selects one of two compatible message shapes:
    ```json
    {
      "message": {
        "token": "<device FCM token>",
        "notification": { "title": "...", "body": "..." },
        "data": { "videoId": "...", "channelId": "...", "channelName": "...", "videoLink": "..." },
-       "android": { "priority": "HIGH", "notification": { "click_action": "OPEN_VIDEO" } }
+       "android": { "priority": "high", "notification": { "channel_id": "new-videos", "tag": "video-..." } }
      }
    }
    ```
+   Profiles advertising `notificationCapability: "local-v1"` instead receive a high-priority
+   data-only message with string `notificationTitle`, `notificationBody`, `notificationTag` and
+   `localRender: "1"` fields. Existing/no-capability profiles continue to receive the legacy shape.
 
 **The FCM token can be null on `/register`.** The server accepts null tokens because the user might have denied notification permission. The device profile is still created so `/feed` and `/subscribe-channel` work. Push delivery is just disabled until a real token arrives via `onTokenRefresh`.
 
-**Background push handler** (Android side, in `App.js`): when a push arrives while the app is in the background or killed, the handler re-fetches `/feed` and updates the local channel cache, then calls `requestWidgetUpdate` so the home-screen widget re-renders. Without this, the widget stays stale until the user opens the app.
+**Background push handler** (Android side, in `App.js`): capable data-only pushes are displayed immediately from their payload through the locally selected audible/silent channel, then the handler re-fetches `/feed`, updates local cache and requests a widget render best-effort. Legacy clients retain Android auto-display. The three mute actions alter only device-local sound state; they do not call this API, write D1, change unseen state or replace host-side DND.
+
+**Capability activation is an API + active-host cutover.** The deployed `/register` handler must
+persist `local-v1`, and the running Home authority image must pass that profile field through its
+durable intent into `sendFCMPush`. Until both are active, an upgraded client intentionally keeps
+receiving legacy background notifications without local action categories; a foreground legacy
+message may still show actions because the app locally presents foreground messages. Activate and
+verify both components together rather than diagnosing that mixed transitional behavior as random
+Android action loss.
 
 **Dead-token detection and cleanup:** FCM returns a structured error when a token is no longer valid (user uninstalled, app data cleared, token rotated without our knowledge). The error code is `UNREGISTERED` (HTTP 404) or `NotRegistered` in the body. When `sendFCMPush` sees this, it returns `{ sent: false, deadToken: true }` to the caller, which then calls `cleanupDeadDevice()` to remove the device's full state. Other error codes (`INVALID_ARGUMENT`, `INTERNAL`, `UNAVAILABLE`, `SENDER_ID_MISMATCH`) are transient or config errors and do **not** trigger cleanup — see §11 for the full policy.
 

@@ -1,5 +1,9 @@
 import { createGatewayWorker } from './gateway.mjs';
 import { createAuthorityWorker, TubePulseAuthorityCoordinator } from './authority.mjs';
+import {
+  buildFcmMessage,
+  normalizeNotificationCapability,
+} from '../tubepulse-cron/shared.mjs';
 
 export { TubePulseAuthorityCoordinator };
 
@@ -775,7 +779,7 @@ async function getGoogleAccessToken(serviceAccountJson) {
   return tokenData.access_token;
 }
 
-async function sendFCMPush(accessToken, projectId, fcmToken, payload) {
+async function sendFCMPush(accessToken, projectId, fcmToken, payload, notificationCapability = null) {
   const url = `https://fcm.googleapis.com/v1/projects/${projectId}/messages:send`;
 
   const resp = await fetch(url, {
@@ -785,22 +789,7 @@ async function sendFCMPush(accessToken, projectId, fcmToken, payload) {
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
-      message: {
-        token: fcmToken,
-        notification: {
-          title: payload.title,
-          body: payload.body,
-        },
-        data: payload.data,
-        android: {
-          priority: 'high',
-          notification: {
-            channel_id: payload.silent ? 'new-videos-silent' : 'new-videos',
-            sound: payload.silent ? null : 'default',
-            tag: payload.tag || 'tubepulse',
-          },
-        },
-      },
+      message: buildFcmMessage(fcmToken, payload, notificationCapability),
     }),
   });
 
@@ -855,6 +844,7 @@ async function handleRegister(request, env) {
   try { body = await request.json(); } catch { return errorResponse('Invalid JSON body'); }
 
   const { fcmToken, platform, appVersion } = body;
+  const notificationCapability = normalizeNotificationCapability(body.notificationCapability);
   // fcmToken is optional — the device profile is what subscribes channels and
   // serves /feed. Push delivery is a separate concern, addressed by the
   // /register call when the user grants notification permission, and by
@@ -930,6 +920,7 @@ async function handleRegister(request, env) {
     fcmToken: effectiveFcmToken,
     platform: platform || existing?.platform || 'android',
     appVersion: appVersion || existing?.appVersion || null,
+    notificationCapability,
     createdAt: existing?.createdAt || now,
     lastSeenAt: existing?.lastSeenAt || now,
   };
@@ -937,6 +928,7 @@ async function handleRegister(request, env) {
     || existing.fcmToken !== baseProfile.fcmToken
     || existing.platform !== baseProfile.platform
     || existing.appVersion !== baseProfile.appVersion
+    || existing.notificationCapability !== baseProfile.notificationCapability
     || existing.createdAt !== baseProfile.createdAt;
   const lastSeenAgeMs = now - (Number(existing?.lastSeenAt) || 0);
   const shouldRefreshLastSeen = !existing || profileFieldsChanged || lastSeenAgeMs >= 60 * 60 * 1000;
@@ -1726,7 +1718,9 @@ async function handleWebSubPush(request, env, ctx) {
           };
         }
 
-        const result = await sendFCMPush(accessToken, projectId, fcmToken, notifPayload);
+        const result = await sendFCMPush(
+          accessToken, projectId, fcmToken, notifPayload, deviceProfile.notificationCapability,
+        );
 
         if (result.sent) {
           // Initialise the nag clock so runNagCron doesn't immediately

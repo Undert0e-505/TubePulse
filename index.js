@@ -1,4 +1,5 @@
 import { registerRootComponent } from 'expo';
+import './src/utils/notificationBackgroundTask';
 import App from './App';
 
 registerRootComponent(App);

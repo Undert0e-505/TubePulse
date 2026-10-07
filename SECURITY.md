@@ -87,6 +87,11 @@ The public self-host status endpoint omits secret values, filesystem paths, conf
 
 Client fallback URLs are Expo public build-time configuration, not secrets. The `X-TubePulse-Failover` header is likewise only a signal. Optional automatic takeover additionally requires a successful app route for an unchanged device profile whose hash is represented in the durable Cloudflare sync baseline; new local registration alone cannot activate standby scheduling.
 
+The Settings update indicator makes a public, unauthenticated request to GitHub's releases API at
+most once per 12 hours per installation. It sends no TubePulse device ID, FCM token, channel list or
+backend credential. Responses are size/time bounded and fail closed unless a stable tag and exact
+repository release URL validate. ETags and dismissed tags are stored only in app-local storage.
+
 The former single-device canary gateway is disabled. Production uses the fail-closed unified Home authority: all app traffic still enters the existing Cloudflare API, authenticated feeds reach the single local store only through the private VPC binding, and the same HMAC protocol protects exact mutation preflight/commit traffic. Signed requests bind timestamp, one-time request ID, operation, method, path/query, authorization digest, and body digest; replay, expiry, unknown routes, oversized bodies, and divergent baselines are rejected. The local listener exposes only loopback status plus signed authority paths, while the digest-pinned Tunnel sidecar publishes no host port. Secrets remain in ignored ACL-restricted files and encrypted Worker configuration; logs must never contain bearers, authorization headers, Tunnel tokens, FCM tokens, or snapshot values. A global stale transition stops Home publication/notification and makes the API fall back to Cloudflare reads until a fresh exact reconciliation succeeds. WebSub is acknowledged but suppressed while Home owns detection, preventing a second notification writer.
 
 ### LAN and local Android test controls

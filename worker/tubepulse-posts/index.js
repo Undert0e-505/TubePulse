@@ -198,7 +198,9 @@ export async function pollSingleCommunityChannel(env, ctx, channelId, debugEnabl
     };
 
     try {
-      const sendResult = await sendFCMPush(accessToken, projectId, profile.fcmToken, notifPayload);
+      const sendResult = await sendFCMPush(
+        accessToken, projectId, profile.fcmToken, notifPayload, profile.notificationCapability,
+      );
       if (sendResult.shadow) {
         const deferred = env.TUBEPULSE_NOTIFICATION_DEFERRED === true;
         await env.TUBEPULSE_SHADOW_NOTIFICATION_OBSERVER?.({
@@ -208,6 +210,7 @@ export async function pollSingleCommunityChannel(env, ctx, channelId, debugEnabl
             deviceId,
             projectId,
             fcmToken: profile.fcmToken,
+            notificationCapability: profile.notificationCapability || null,
             payload: notifPayload,
             contentIds: [postKey],
             requireUnwatched: true,

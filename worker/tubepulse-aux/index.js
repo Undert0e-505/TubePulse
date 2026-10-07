@@ -299,7 +299,9 @@ async function runNag(env, ctx, now) {
     }
 
     try {
-      const result = await sendFCMPush(accessToken, projectId, profile.fcmToken, notifPayload);
+      const result = await sendFCMPush(
+        accessToken, projectId, profile.fcmToken, notifPayload, profile.notificationCapability,
+      );
       if (result.shadow) {
         const deferred = env.TUBEPULSE_NOTIFICATION_DEFERRED === true;
         await env.TUBEPULSE_SHADOW_NOTIFICATION_OBSERVER?.({
@@ -309,6 +311,7 @@ async function runNag(env, ctx, now) {
             deviceId,
             projectId,
             fcmToken: profile.fcmToken,
+            notificationCapability: profile.notificationCapability || null,
             payload: notifPayload,
             contentIds: [...selectedContentIds],
             dedupeVersion: `${state.lastNagAt || 0}:${state.nagCount || 0}`,
@@ -461,7 +464,9 @@ async function runPrewarn(env, ctx, now) {
       };
 
       try {
-        const result = await sendFCMPush(accessToken, projectId, profile.fcmToken, notifPayload);
+        const result = await sendFCMPush(
+          accessToken, projectId, profile.fcmToken, notifPayload, profile.notificationCapability,
+        );
         if (result.shadow) {
           const deferred = env.TUBEPULSE_NOTIFICATION_DEFERRED === true;
           await env.TUBEPULSE_SHADOW_NOTIFICATION_OBSERVER?.({
@@ -471,6 +476,7 @@ async function runPrewarn(env, ctx, now) {
               deviceId,
               projectId,
               fcmToken: profile.fcmToken,
+              notificationCapability: profile.notificationCapability || null,
               payload: notifPayload,
               contentIds: [ev.videoId],
               dedupeVersion: `prewarn:${effectiveMinutes}`,

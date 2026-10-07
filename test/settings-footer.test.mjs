@@ -6,7 +6,7 @@ const source = readFileSync(new URL('../src/screens/SettingsScreen.js', import.m
 const appConfig = JSON.parse(readFileSync(new URL('../app.json', import.meta.url), 'utf8'));
 
 test('Settings footer uses configured version and the exact source link contract', () => {
-  assert.equal(appConfig.expo.version, '4.0.0');
+  assert.equal(appConfig.expo.version, '4.1.0');
   assert.match(source, /Version \{appConfig\.expo\.version\}/);
   assert.doesNotMatch(source, /Version 3\.5\.2/);
   assert.match(source, />Link to Source<\/Text>/);

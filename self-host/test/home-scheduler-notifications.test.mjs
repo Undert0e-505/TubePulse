@@ -135,6 +135,34 @@ test('canonical production API visibility can gate FCM without a canary gateway'
   assert.equal(result.convergenceAttempts, 0);
 });
 
+test('durable notification intents preserve the local-render capability through FCM send', async () => {
+  let sentArguments;
+  const coordinator = new ProductionNotificationCoordinator({
+    ...barrierConfig,
+    gatewayConvergenceRequired: false,
+    gatewayAdminUrl: null,
+    gatewayAdminToken: null,
+    gatewayReconcileUrl: null,
+  }, {
+    fetchImpl: async () => jsonResponse({
+      channels: [{
+        channelId: 'UC-synthetic',
+        videos: [{ videoId: 'video-new', unwatched: true }],
+        posts: [],
+      }],
+    }),
+    tokenProvider: async () => 'access-token',
+    sender: async (...args) => {
+      sentArguments = args;
+      return { sent: true, deadToken: false };
+    },
+  });
+
+  const result = await coordinator.flush([intent({ notificationCapability: 'local-v1' })], {});
+  assert.equal(result.sent, 1);
+  assert.equal(sentArguments[4], 'local-v1');
+});
+
 test('missing production feed visibility suppresses FCM after bounded retries', async () => {
   let feedReads = 0;
   let sends = 0;

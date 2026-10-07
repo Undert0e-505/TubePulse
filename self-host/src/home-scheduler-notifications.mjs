@@ -49,6 +49,7 @@ function serializableIntent(intent) {
     channelId: intent.channelId,
     projectId: intent.projectId,
     fcmToken: intent.fcmToken,
+    notificationCapability: intent.notificationCapability || null,
     payload: intent.payload,
     contentIds: intent.contentIds,
     requireUnwatched: intent.requireUnwatched,
@@ -513,7 +514,13 @@ export class ProductionNotificationCoordinator {
       let result;
       try {
         if (!entry.transient) await this.intentStore.claim(entry.id);
-        result = await this.sender(accessToken, intent.projectId, intent.fcmToken, intent.payload);
+        result = await this.sender(
+          accessToken,
+          intent.projectId,
+          intent.fcmToken,
+          intent.payload,
+          intent.notificationCapability || null,
+        );
       } catch {
         result = { sent: false, deadToken: false };
       }

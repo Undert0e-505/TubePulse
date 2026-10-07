@@ -1,5 +1,18 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { STORAGE_KEYS, DEFAULT_CHANNELS, DEFAULT_SETTINGS } from './constants';
+import { createSettingsWarmCache } from './settingsWarmCache.mjs';
+
+const settingsWarmCache = createSettingsWarmCache({
+  readRaw: () => AsyncStorage.getItem(STORAGE_KEYS.SETTINGS),
+  writeRaw: (value) => AsyncStorage.setItem(STORAGE_KEYS.SETTINGS, value),
+  defaults: DEFAULT_SETTINGS,
+});
+
+// Begin the only settings disk read while the application modules are loading,
+// before a user can navigate to Settings. Consumers can synchronously peek the
+// actual snapshot once it resolves, or share this promise during an extreme
+// cold-start race.
+settingsWarmCache.preload().catch(() => {});
 
 // gentleState shape: { [handle]: { videoId, firstNotifiedAt, lastRemindedAt } }
 export async function getGentleNotifState() {
@@ -40,23 +53,17 @@ export async function saveChannels(channels) {
 }
 
 export async function getSettings() {
-  const data = await AsyncStorage.getItem(STORAGE_KEYS.SETTINGS);
-  if (data) {
-    const settings = JSON.parse(data);
-    // Migrate pollInterval → nagInterval
-    if (settings.pollInterval && !settings.nagInterval) {
-      settings.nagInterval = settings.pollInterval;
-      delete settings.pollInterval;
-      await saveSettings(settings);
-    }
-    return { ...DEFAULT_SETTINGS, ...settings };
-  }
-  await saveSettings(DEFAULT_SETTINGS);
-  return { ...DEFAULT_SETTINGS };
+  return await settingsWarmCache.preload();
+}
+
+export function peekSettings() {
+  return settingsWarmCache.peek();
 }
 
 export async function saveSettings(settings) {
-  await AsyncStorage.setItem(STORAGE_KEYS.SETTINGS, JSON.stringify(settings));
+  // The in-memory snapshot is updated synchronously before persistence. A
+  // screen opened during the write therefore cannot regress to older values.
+  await settingsWarmCache.save(settings);
 }
 
 export async function getLastSeen() {

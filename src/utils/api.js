@@ -28,6 +28,7 @@ import {
 } from './apiEndpointConfig';
 import { createDeviceIdResolver } from './deviceIdentity.mjs';
 import { buildRegistrationPayload } from './appRegistration.mjs';
+import { LOCAL_NOTIFICATION_CAPABILITY } from './localNotificationSilence.mjs';
 
 const DEVICE_ID_KEY = 'tubepulse_device_id'; // AsyncStorage (fallback)
 const SECURE_DEVICE_ID_KEY = 'tubepulse_device_id_v1'; // Keystore/Keychain (primary)
@@ -149,11 +150,14 @@ export async function registerDevice(
   fcmToken,
   platform = 'android',
   appVersion = appConfig?.expo?.version || null,
+  notificationCapability = LOCAL_NOTIFICATION_CAPABILITY,
 ) {
   return await apiFetch('/register', {
     method: 'POST',
     deviceId,
-    body: buildRegistrationPayload({ fcmToken, platform, appVersion }),
+    body: buildRegistrationPayload({
+      fcmToken, platform, appVersion, notificationCapability,
+    }),
   });
 }
 

@@ -10,7 +10,7 @@ YouTube channels into a focused feed, widget and configurable notification flow.
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 [Download the latest release](https://github.com/Undert0e-505/TubePulse/releases/latest) ·
-[What’s new in v4.0.0](RELEASE_NOTES_v4.0.0.md) · [User guide](docs/USER_GUIDE.md)
+[What’s new in v4.1.0](RELEASE_NOTES_v4.1.0.md) · [User guide](docs/USER_GUIDE.md)
 
 ## See your channels at a glance
 
@@ -99,7 +99,7 @@ See [SECURITY.md](SECURITY.md) for security reporting and the
 - [Aggregate monitoring](monitoring/README.md) — privacy boundary, dashboard and retention
 - [Cloud services](worker/README.md) and [Worker contracts](worker/CONTRACTS.md) — implementation,
   endpoints and canonical storage contracts
-- [Release process](RELEASE.md) and [release notes](RELEASE_NOTES_v4.0.0.md)
+- [Release process](RELEASE.md) and [release notes](RELEASE_NOTES_v4.1.0.md)
 - [Historical plans](MIGRATION_PLAN.md) — retained for context, not current operating instructions
 
 ## Build from source

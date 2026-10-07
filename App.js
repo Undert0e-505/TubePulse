@@ -13,6 +13,16 @@ import { getChannels, getSettings, getLastSeen, saveLastSeen, getChannelCache, s
 import { requestPermissionAndGetToken, onTokenRefresh, onForegroundMessage, onNotificationOpenedApp, getInitialNotification, setBackgroundMessageHandler } from './src/utils/fcm';
 import { registerDevice, markSeen, getDeviceId, subscribeChannel, updateSettings, bootstrapChannel } from './src/utils/api';
 import { setupNotificationChannel } from './src/utils/notifications';
+import {
+  presentRemoteMessageLocally,
+  setupLocalNotificationPresentation,
+} from './src/utils/notificationPresentation';
+import {
+  LOCAL_NOTIFICATION_CAPABILITY,
+  notificationResponseRoute,
+} from './src/utils/localNotificationSilence.mjs';
+import { processLocalNotificationActionResponse } from './src/utils/notificationActionRuntime';
+import { ensureNotificationResponseTaskRegistered } from './src/utils/notificationBackgroundTask';
 import { ConfirmHost } from './src/components/Confirm';
 import SettingsCogIcon from './src/components/SettingsCogIcon';
 import { updateWidget } from './src/components/widgetTaskHandler';
@@ -44,10 +54,10 @@ import {
 try {
   const Notifications = require('expo-notifications');
   Notifications.setNotificationHandler({
-    handleNotification: async () => ({
+    handleNotification: async (notification) => ({
       shouldShowBanner: true,
       shouldShowList: true,
-      shouldPlaySound: true,
+      shouldPlaySound: notification?.request?.content?.data?.localSilent !== '1',
       shouldSetBadge: false,
     }),
   });
@@ -91,6 +101,11 @@ function HeaderButton({ title, children, onPress, style, textStyle, accessibilit
 // Without this, the widget stays stale until the user opens the app.
 if (PREVIEW_PUSH_ENABLED) setBackgroundMessageHandler(async (remoteMessage) => {
   console.log('Background push received:', remoteMessage?.messageId, remoteMessage?.data?.videoId);
+  // High-priority capable-client messages are data-only. Present immediately
+  // from their self-contained payload before any feed/network work.
+  try { await presentRemoteMessageLocally(remoteMessage); } catch (e) {
+    console.warn('Background notification display failed:', e);
+  }
   try {
     const { getDeviceId, fetchFeed } = require('./src/utils/api');
     const deviceId = await getDeviceId();
@@ -161,6 +176,7 @@ if (PREVIEW_PUSH_ENABLED) setBackgroundMessageHandler(async (remoteMessage) => {
 function TubePulseApplication() {
   const fcmTokenRef = useRef(null);
   const deviceIdRef = useRef(null);
+  const notificationCapabilityRef = useRef(null);
   const [initializationMarker] = useState(() => createAppInitializationMarker());
   const processedTapKeysRef = useRef(new Map());
 
@@ -169,6 +185,16 @@ function TubePulseApplication() {
       try {
         // Set up Android notification channels
         await setupNotificationChannel();
+        try {
+          await Promise.all([
+            setupLocalNotificationPresentation(),
+            ensureNotificationResponseTaskRegistered(),
+          ]);
+          notificationCapabilityRef.current = LOCAL_NOTIFICATION_CAPABILITY;
+        } catch (e) {
+          notificationCapabilityRef.current = null;
+          console.warn('Notification actions setup failed:', e);
+        }
 
         // Get persistent device ID
         const deviceId = await getDeviceId();
@@ -181,7 +207,13 @@ function TubePulseApplication() {
         // the device profile is what the preseed channel bootstrap subscribes against.
         // FCM token is a separate field on the profile and is set/updated below.
         try {
-          await registerDevice(deviceId, fcmToken || null);
+          await registerDevice(
+            deviceId,
+            fcmToken || null,
+            'android',
+            undefined,
+            notificationCapabilityRef.current,
+          );
         } catch (e) {
           console.warn('Device register failed:', e);
         }
@@ -358,67 +390,32 @@ function TubePulseApplication() {
       fcmTokenRef.current = newToken;
       try {
         const deviceId = deviceIdRef.current || await getDeviceId();
-        await registerDevice(deviceId, newToken);
+        await registerDevice(
+          deviceId,
+          newToken,
+          'android',
+          undefined,
+          notificationCapabilityRef.current,
+        );
       } catch (e) {
         console.warn('Token refresh re-register failed:', e);
       }
     }) : () => {};
 
-    // Handle foreground messages
-    // When the app is in the foreground, FCM does NOT automatically show
-    // a system notification. We must explicitly display one using
-    // expo-notifications' scheduleNotificationAsync.
+    // Capable data-only and legacy notification+data foreground messages both
+    // use the same local presentation path. Legacy messages are adapted here;
+    // background legacy messages remain auto-displayed by Android.
     const foregroundUnsubscribe = PREVIEW_PUSH_ENABLED ? onForegroundMessage(async (remoteMessage) => {
       console.log('Foreground push:', remoteMessage?.data?.videoId || remoteMessage?.data?.activityId);
       try {
-        const Notifications = require('expo-notifications');
         const data = remoteMessage?.data || {};
-        const title = remoteMessage?.notification?.title || 'TubePulse';
-        const body = remoteMessage?.notification?.body || '';
-        const channelId = 'new-videos';
-        // Use the notificationTag from the FCM payload if provided.
-        const notifTag = data.notificationTag
-          || (data.videoId ? `video-${data.videoId}` : null)
-          || (data.activityId ? `post-${data.activityId}` : null)
-          || null;
-        const notifId = notifTag ? `fg-${notifTag}` : `fg-${remoteMessage?.messageId || Date.now()}`;
-
-        // Dismiss any already-delivered TubePulse notifications for the
-        // same item before scheduling the replacement. Without this,
-        // each foreground reminder creates a new row in the notification
-        // shade because scheduleNotificationAsync's identifier only
-        // dedupes pending (not yet delivered) notifications.
-        try {
-          const presented = await Notifications.getPresentedNotificationsAsync();
-          for (const n of presented) {
-            const nData = n?.request?.content?.data || {};
-            const nTag = nData.notificationTag
-              || (nData.videoId ? `video-${nData.videoId}` : null)
-              || (nData.activityId ? `post-${nData.activityId}` : null)
-              || null;
-            // Dismiss if same item tag, or if both are TubePulse
-            // notifications with the same channelId (catches batch/nag
-            // replacements for the same channel).
-            if (nTag && notifTag && nTag === notifTag) {
-              await Notifications.dismissNotificationAsync(n.request.identifier);
-            }
-          }
-        } catch (e) {
-          // Non-critical — continue with scheduling
-        }
-
-        await Notifications.scheduleNotificationAsync({
-          identifier: notifId,
-          content: {
-            title,
-            body,
-            data,
-            sound: 'default',
-          },
-          trigger: {
-            channelId,
-            type: Notifications.SchedulableTriggerInputTypes.TIME_INTERVAL,
-            seconds: 1,
+        await presentRemoteMessageLocally({
+          ...remoteMessage,
+          data: {
+            ...data,
+            localRender: '1',
+            notificationTitle: data.notificationTitle || remoteMessage?.notification?.title || 'TubePulse',
+            notificationBody: data.notificationBody || remoteMessage?.notification?.body || '',
           },
         });
       } catch (e) {
@@ -429,6 +426,16 @@ function TubePulseApplication() {
     // Firebase-delivered notifications and foreground notifications re-published
     // through expo-notifications both enter this one path.
     const handleNotificationTap = async (messageOrResponse) => {
+      const actionIdentifier = messageOrResponse?.actionIdentifier;
+      if (actionIdentifier) {
+        const Notifications = require('expo-notifications');
+        const route = notificationResponseRoute(actionIdentifier, Notifications.DEFAULT_ACTION_IDENTIFIER);
+        if (route === 'silence') {
+          await processLocalNotificationActionResponse(messageOrResponse);
+          return;
+        }
+        if (route === 'ignore') return;
+      }
       const data = messageOrResponse?.data
         || messageOrResponse?.notification?.request?.content?.data
         || null;
@@ -522,7 +529,9 @@ function TubePulseApplication() {
     let expoTapSubscription;
     try {
       const Notifications = require('expo-notifications');
-      expoTapSubscription = Notifications.addNotificationResponseReceivedListener(handleNotificationTap);
+      expoTapSubscription = Notifications.addNotificationResponseReceivedListener((response) => {
+        handleNotificationTap(response).catch((error) => console.warn('Notification response failed:', error));
+      });
       Notifications.getLastNotificationResponseAsync?.().then(async (response) => {
         if (!response) return;
         try { await Notifications.clearLastNotificationResponseAsync?.(); } catch {}

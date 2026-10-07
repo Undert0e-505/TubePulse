@@ -237,7 +237,9 @@ export async function processChannelUploads(env, ctx, channelId, source, options
           tag: 'tubepulse-batch',
         };
       }
-      const pushResult = await sendFCMPush(accessToken, projectId, profile.fcmToken, notifPayload);
+      const pushResult = await sendFCMPush(
+        accessToken, projectId, profile.fcmToken, notifPayload, profile.notificationCapability,
+      );
       if (pushResult.shadow) {
         const deferred = env.TUBEPULSE_NOTIFICATION_DEFERRED === true;
         await env.TUBEPULSE_SHADOW_NOTIFICATION_OBSERVER?.({
@@ -247,6 +249,7 @@ export async function processChannelUploads(env, ctx, channelId, source, options
             deviceId,
             projectId,
             fcmToken: profile.fcmToken,
+            notificationCapability: profile.notificationCapability || null,
             payload: notifPayload,
             contentIds: notifyEntries.map((video) => video.videoId),
             requireUnwatched: true,

@@ -510,15 +510,56 @@ export async function getCachedFcmAccessToken(env) {
 
 // ─── FCM push ──────────────────────────────────────────────────────────
 
-export async function sendFCMPush(accessToken, projectId, fcmToken, payload) {
+export const LOCAL_NOTIFICATION_CAPABILITY = 'local-v1';
+
+export function normalizeNotificationCapability(value) {
+  return value === LOCAL_NOTIFICATION_CAPABILITY ? LOCAL_NOTIFICATION_CAPABILITY : null;
+}
+
+function stringData(data) {
+  return Object.fromEntries(Object.entries(data || {})
+    .filter(([, value]) => value !== undefined && value !== null)
+    .map(([name, value]) => [name, typeof value === 'string' ? value : JSON.stringify(value)]));
+}
+
+export function buildFcmMessage(fcmToken, payload, notificationCapability = null) {
+  const notification = payload.notification || {};
+  const title = payload.title ?? notification.title ?? 'TubePulse';
+  const body = payload.body ?? notification.body ?? '';
+  const data = stringData(payload.data);
+  if (normalizeNotificationCapability(notificationCapability)) {
+    return {
+      token: fcmToken,
+      data: {
+        ...data,
+        localRender: '1',
+        notificationTitle: String(title),
+        notificationBody: String(body),
+        notificationTag: String(payload.tag || data.notificationTag || 'tubepulse'),
+      },
+      android: { priority: 'high' },
+    };
+  }
+  return {
+    token: fcmToken,
+    notification: { title, body },
+    data: payload.data,
+    android: {
+      priority: 'high',
+      notification: {
+        channel_id: payload.silent ? 'new-videos-silent' : 'new-videos',
+        sound: payload.silent ? null : 'default',
+        tag: payload.tag || 'tubepulse',
+      },
+    },
+  };
+}
+
+export async function sendFCMPush(accessToken, projectId, fcmToken, payload, notificationCapability = null) {
   if (accessToken === SHADOW_FCM_ACCESS_TOKEN) {
     return { sent: false, deadToken: false, shadow: true };
   }
   const url = `https://fcm.googleapis.com/v1/projects/${projectId}/messages:send`;
-  const notification = payload.notification || {};
-  const title = payload.title ?? notification.title ?? 'TubePulse';
-  const body = payload.body ?? notification.body ?? '';
-
   const resp = await fetch(url, {
     method: 'POST',
     headers: {
@@ -526,19 +567,7 @@ export async function sendFCMPush(accessToken, projectId, fcmToken, payload) {
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
-      message: {
-        token: fcmToken,
-        notification: { title, body },
-        data: payload.data,
-        android: {
-          priority: 'high',
-          notification: {
-            channel_id: payload.silent ? 'new-videos-silent' : 'new-videos',
-            sound: payload.silent ? null : 'default',
-            tag: payload.tag || 'tubepulse',
-          },
-        },
-      },
+      message: buildFcmMessage(fcmToken, payload, notificationCapability),
     }),
   });
 

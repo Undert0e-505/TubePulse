@@ -1,31 +1,129 @@
-import React, { useState, useCallback } from 'react';
+import React, {
+  useState, useCallback, useLayoutEffect, useRef,
+} from 'react';
 import {
   View, Text, TouchableOpacity, StyleSheet,
   Switch, ScrollView, Linking,
 } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useFocusEffect, useNavigation } from '@react-navigation/native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import appConfig from '../../app.json';
-import { COLORS, DEFAULT_SETTINGS, NAG_INTERVALS, PREWARN_OPTIONS, VIDEOS_PER_CHANNEL_OPTIONS } from '../utils/constants';
+import { COLORS, NAG_INTERVALS, PREWARN_OPTIONS, VIDEOS_PER_CHANNEL_OPTIONS } from '../utils/constants';
 import TimeSpinner from '../components/TimeSpinner';
-import { getSettings, saveSettings } from '../utils/storage';
+import { getSettings, peekSettings, saveSettings } from '../utils/storage';
 import { updateSettings, getDeviceId } from '../utils/api';
 import { IS_TUBEPULSE_PREVIEW } from '../utils/apiEndpointConfig';
+import UpdateAvailablePill from '../components/UpdateAvailablePill';
+import {
+  cachedAvailableUpdate,
+  dismissUpdate,
+  refreshUpdateIfDue,
+} from '../utils/appUpdate.mjs';
+import {
+  UPDATE_INDICATOR_DEMO,
+  UPDATE_INDICATOR_DEMO_TAG,
+} from '../utils/updateDemoConfig';
+import {
+  updatesMatch,
+} from '../utils/settingsBootstrap.mjs';
 
 const FOOTER_VISUAL_PADDING = 8;
+const UPDATE_ARGS = {
+  storage: AsyncStorage,
+  installedVersion: appConfig.expo.version,
+  demoEnabled: UPDATE_INDICATOR_DEMO,
+  demoTag: UPDATE_INDICATOR_DEMO_TAG,
+};
+
+// SettingsScreen is imported during application startup. Warm the auxiliary
+// local state then, but never make either read a prerequisite for controls.
+let warmedAvailableUpdate = null;
+let warmedUpdatePromise = cachedAvailableUpdate(UPDATE_ARGS).then((value) => {
+  warmedAvailableUpdate = value;
+  return value;
+});
 
 // ── Main Screen ───────────────────────────────────────────────────────────────
 export default function SettingsScreen() {
   const navigation = useNavigation();
   const insets = useSafeAreaInsets();
-  const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [scrollEnabled, setScrollEnabled] = useState(true);
+  const [settings, setSettings] = useState(() => peekSettings());
+  const [availableUpdate, setAvailableUpdate] = useState(() => warmedAvailableUpdate);
+  const [settingsVisitId, setSettingsVisitId] = useState(0);
+  const visitSequence = useRef(0);
+  const hasFocused = useRef(false);
+  const updateRequestSequence = useRef(0);
 
   useFocusEffect(
     useCallback(() => {
-      getSettings().then(setSettings);
+      let active = true;
+      const visitId = ++visitSequence.current;
+      const firstFocus = !hasFocused.current;
+      hasFocused.current = true;
+      setSettingsVisitId(visitId);
+
+      // This is normally a synchronous warm-cache hit. Only an unusually fast
+      // tap during cold launch waits for the settings-only preload promise.
+      const warmSettings = peekSettings();
+      if (warmSettings) setSettings(warmSettings);
+      else getSettings().then((value) => {
+        if (active) setSettings(value);
+      }).catch(() => {});
+
+      const updateRequest = ++updateRequestSequence.current;
+      const cachedPromise = firstFocus
+        ? warmedUpdatePromise
+        : cachedAvailableUpdate(UPDATE_ARGS);
+      cachedPromise.then((update) => {
+        if (!active || updateRequestSequence.current !== updateRequest) return;
+        warmedAvailableUpdate = update;
+        warmedUpdatePromise = Promise.resolve(update);
+        setAvailableUpdate((current) => (updatesMatch(current, update) ? current : update));
+      }).catch(() => {});
+
+      // The network path is deliberately independent from control rendering
+      // and the local auxiliary reads above.
+      refreshUpdateIfDue(UPDATE_ARGS).then((update) => {
+        if (!active || updateRequestSequence.current !== updateRequest) return;
+        warmedAvailableUpdate = update;
+        warmedUpdatePromise = Promise.resolve(update);
+        setAvailableUpdate((current) => (updatesMatch(current, update) ? current : update));
+      }).catch(() => {});
+
+      return () => { active = false; };
     }, [])
   );
+
+  const openUpdate = async (update) => {
+    updateRequestSequence.current += 1;
+    await dismissUpdate({
+      storage: AsyncStorage,
+      tagName: update.tagName,
+      demo: UPDATE_INDICATOR_DEMO,
+    });
+    warmedAvailableUpdate = null;
+    warmedUpdatePromise = Promise.resolve(null);
+    setAvailableUpdate(null);
+    Linking.openURL(update.releaseUrl).catch(() => {});
+  };
+
+  useLayoutEffect(() => {
+    navigation.setOptions({
+      headerRight: () => (
+        <View style={styles.updateHeaderSlot} pointerEvents="box-none">
+          {availableUpdate ? (
+          <UpdateAvailablePill
+            update={availableUpdate}
+            visitId={settingsVisitId}
+            onPress={openUpdate}
+          />
+          ) : null}
+        </View>
+      ),
+    });
+  }, [availableUpdate, navigation, settingsVisitId]);
 
   const updateSetting = async (key, value) => {
     const updated = { ...settings, [key]: value };
@@ -41,10 +139,11 @@ export default function SettingsScreen() {
     }
   };
 
-  const mode = settings.notificationMode || 'relentless';
+  const mode = settings?.notificationMode || 'relentless';
 
   return (
     <View style={styles.container}>
+      {settings ? (
       <ScrollView
         style={styles.scroll}
         contentContainerStyle={styles.content}
@@ -141,7 +240,7 @@ export default function SettingsScreen() {
       {settings.dndEnabled && (
         <>
           <Text style={styles.guidance}>
-            During DND, all notifications are held. They'll come through when DND ends.
+            DND acts on the host: notifications are held and arrive when DND ends. Notification action muting is different — it is local and notifications still arrive silently.
           </Text>
           <View style={styles.timeRow}>
             <View style={styles.timeField}>
@@ -244,7 +343,7 @@ export default function SettingsScreen() {
       <Text style={styles.guidance}>
         {IS_TUBEPULSE_PREVIEW
           ? 'Push is disabled in this pilot APK. API, feed and subscription testing uses a null push token.'
-          : 'TubePulse uses WebSub — YouTube pushes to us the instant a video drops, then we push to you. Your phone never polls. No battery drain.'}
+          : 'TubePulse receives updates from the host and pushes them to your phone. Your phone never polls. Notification action muting stays on this device and creates no backend state.'}
       </Text>
 
       {IS_TUBEPULSE_PREVIEW ? (
@@ -261,6 +360,12 @@ export default function SettingsScreen() {
       ) : null}
 
       </ScrollView>
+      ) : (
+        <View
+          style={styles.coldSettingsPlaceholder}
+          accessibilityLabel="Loading saved settings"
+        />
+      )}
       <View style={[styles.footer, { paddingBottom: FOOTER_VISUAL_PADDING + insets.bottom }]}>
         <Text style={styles.footerVersion}>Version {appConfig.expo.version}</Text>
         <TouchableOpacity
@@ -283,6 +388,16 @@ const styles = StyleSheet.create({
   },
   scroll: {
     flex: 1,
+  },
+  coldSettingsPlaceholder: {
+    flex: 1,
+    backgroundColor: COLORS.bg,
+  },
+  updateHeaderSlot: {
+    width: 142,
+    minHeight: 48,
+    alignItems: 'flex-end',
+    justifyContent: 'center',
   },
   content: {
     paddingHorizontal: 16,

@@ -1,7 +1,7 @@
 # TubePulse — Architecture Specification
 
 **Version:** Current architecture reference for the v4.x app line. See [STATUS.md](STATUS.md) for current checked-in version and operational caveats.
-**Date:** 2026-04-19 (initial), updated through the Home Data API and D1 canonical-backup cutovers on 2026-10-05
+**Date:** 2026-04-19 (initial), updated through local notification rendering design on 2026-10-07
 **Status:** Architecture reference. Explicitly labelled historical sections retain RSS/WebSub/KV design context; §15.6 and [STATUS.md](STATUS.md) describe current production.
 
 ---
@@ -180,7 +180,7 @@ channel:{channelId}:recent
 
 ```
 device:{deviceId}:profile
-  → JSON { fcmToken, createdAt, lastSeenAt, appVersion, platform }
+  → JSON { fcmToken, createdAt, lastSeenAt, appVersion, platform, notificationCapability }
   Read on:  every notification send to this device
   Written:  on /register, on token rotation
 
@@ -422,7 +422,7 @@ All endpoints accept `deviceId` as authentication (device-generated UUID, regist
 
 Initial device registration or FCM token refresh.
 
-Request: `{ deviceId, fcmToken, platform, appVersion }`
+Request body: `{ fcmToken, platform, appVersion, notificationCapability }` (device ID remains the bearer)
 Response: `{ ok: true }`
 
 Writes `device:{deviceId}:profile`. Idempotent — safe to call on every app launch.
@@ -507,6 +507,19 @@ Writes `device:{deviceId}:override:{channelId}` (or deletes it if the override i
 - Calls `/register` on first launch and on FCM token rotation
 - Calls `/feed` on pull-to-refresh and initial app load (after register)
 - Receives FCM pushes and updates local cache + UI
+- For capability `local-v1`, immediately renders self-contained data-only pushes and selects the
+  audible or silent Android channel from device-local silence state before any network refresh
+- Stores temporary per-channel and indefinite global sound-only mute state in AsyncStorage
+- Stores global-mute audible channel exceptions in the same versioned record. Legacy records
+  normalize to no exceptions; enabling global mute again clears prior exceptions, while clearing
+  global mute removes them as meaningless.
+- Registers the Expo response task before advertising `local-v1`; foreground and headless action
+  handling share one persist-before-dismiss path. Locally rendered notifications select normal
+  mute actions, channel `Unmute channel`, or global `Unmute channel` plus `Unmute all` from the same
+  expiry-normalized local state
+  that chooses their audible/silent Android channel. Home exposes `Silent until HH:MM` with `Unmute`
+  per timed channel and `Silent` with `Unmute all` for the global state, refreshing on action,
+  focus/resume and the nearest saved expiry without backend traffic.
 
 ### 9.2 What the app does NOT do
 
@@ -525,12 +538,38 @@ The app should feel instant. That means:
 
 ### 9.4 Notification handling
 
-When an FCM push arrives:
+FCM presentation is capability-gated for release compatibility:
 
-1. Update `state:{channelId}` in AsyncStorage to reflect new unwatched video
-2. Update the local channel cache to include the new video in recent
-3. If app is in foreground, refresh the visible UI silently
-4. The notification itself is shown by Android regardless of app state
+1. A profile with no recognized capability receives the legacy notification+data payload, which
+   Android auto-displays in the background exactly as released clients expect.
+2. A `local-v1` profile receives a high-priority data-only payload containing string title, body,
+   tag and navigation data. The app immediately posts the visible notification from that payload,
+   before any feed request, through the audible or silent channel.
+3. Foreground and background receipt reuse one presentation function. The existing tag is dismissed
+   before replacement, and the notification retains the same tap/seen semantics.
+4. Notification action responses update only local sound state. Body taps alone enter navigation and
+   seen-state handling. A headless Expo task handles mute actions while backgrounded/terminated and
+   ignores receipt events because RNFirebase owns message receipt.
+5. Feed/cache/widget refresh remains best effort after presentation.
+
+The capability cutover requires both sides. The API registration path must persist `local-v1` and
+the active host sender must consume it before a preview/release can receive interactive notifications
+while backgrounded. Deploying only the client deliberately leaves it on the legacy background
+auto-display path; foreground legacy messages are still locally rendered and can therefore appear
+interactive during that transitional state. Android may also automatically group four or more
+notifications: the system summary has no app actions, while each expanded child retains its actions.
+
+Local silence is not backend DND. It never prevents delivery or changes canonical state. DND remains
+host-side and can hold/suppress an eligible push until the configured window ends.
+
+### 9.5 Update indicator
+
+On each Settings visit the app first evaluates a validated cached GitHub release, then refreshes only
+when the persisted 12-hour attempt cadence permits. Attempts are recorded before network access;
+requests use ETag/304, a five-second timeout and a 64 KiB response bound. Only stable semantic tags
+and exact `https://github.com/Undert0e-505/TubePulse/releases/tag/{tag}` URLs are accepted. Tapping
+dismisses that exact tag before opening it, while a newer stable tag can appear later. The optional
+Expo build-time demo flag is off by default and has separate dismissal state.
 
 ---
 

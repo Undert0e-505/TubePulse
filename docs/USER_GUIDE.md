@@ -14,6 +14,11 @@ sync: each installation manages its own channels and settings.
 A newer signed release can be installed over the existing app. The local channel list, settings,
 unseen state and pending seen updates should remain in place.
 
+When a newer stable GitHub release is available, Settings shows **Update available**. TubePulse
+checks the public GitHub releases API at most once every 12 hours per installation, uses a cached
+validated result while offline, and hides that exact release after the button is tapped. The button
+opens the matching GitHub release page; TubePulse does not download or install an APK itself.
+
 ## Manage channels
 
 Open **Channels** to add a creator by `@handle` or YouTube channel ID. TubePulse resolves the stable
@@ -24,9 +29,9 @@ With **Auto-order channels** off, drag channels into the order you want. With it
 channel sections by newest cached video, and the widget applies automatic ordering to the content it
 displays, without overwriting the saved manual order. Turning it off restores that manual order.
 
-Long-press a channel when per-channel controls are enabled to override its notification mode, quiet
-hours, community-post preference or livestream prewarning. **Save** applies the changes; **Cancel**
-leaves the existing override untouched.
+Long-press a channel to inspect its local sound state. When per-channel controls are enabled, the
+same panel can override notification mode, quiet hours, community-post preference or livestream
+prewarning. **Save** applies those controls; **Cancel** leaves the existing override untouched.
 
 ## Home feed and seen state
 
@@ -91,6 +96,33 @@ Ordinary uploads, community posts and prewarnings are held during DND. A livestr
 can bypass DND so the live event is not missed. Use per-channel controls when a creator needs
 different quiet hours from the global settings.
 
+### Temporarily mute notification sound
+
+Expand a TubePulse notification to use **Mute channel 1hr**, **Mute channel 8hr** or **Mute all**.
+These controls are device-local and affect sound only: later notifications still arrive, remain in
+the Android notification shade, update the feed/widget, and keep their ordinary unseen/reminder
+state. Pressing a mute action does not open YouTube or mark anything seen.
+After the local mute is saved, the notification you acted on is dismissed as acknowledgement. If
+local storage fails, the notification remains visible instead of pretending the mute succeeded.
+While that channel is locally silent, later notifications offer **Unmute channel** instead of more
+mute actions. During **Mute all**, a still-silent channel offers **Unmute channel** and **Unmute
+all**. The first makes only that channel audible while global silence remains active; the second
+clears global silence, timed channel mutes and audible exceptions. Successful unmute actions also
+dismiss only the notification used for the action.
+
+Android can collapse several TubePulse alerts under an automatic summary. The summary itself is
+system-generated and does not carry TubePulse controls; expand the group and then the individual
+notification to reveal its mute actions.
+
+Temporary channel mutes expire automatically using their saved end time and survive an app or phone
+restart. While a channel is muted, its Home feed heading shows **Silent until HH:MM** and **Unmute**.
+During **Mute all**, each still-silent channel instead shows **Silent** and **Unmute**; unmuting a row
+makes that channel an audible exception without disabling global silence. **Mute all** lasts until
+**Unmute all** is pressed at the top of Home; that button clears both global and channel-specific
+local mutes. No local sound action is sent to the host or stored in Cloudflare/D1. This is
+intentionally different from DND, which is evaluated by the host and holds eligible notifications
+until the DND window ends.
+
 ### Livestream prewarning
 
 Choose how early TubePulse warns about a scheduled livestream or premiere: 15 or 30 minutes, 1, 2
@@ -125,6 +157,8 @@ if the widget remains stale after connectivity returns.
 TubePulse creates a pseudonymous installation identifier for its service authentication and sends a
 Firebase token when push permission is available. It stores the channel list, settings and seen
 state needed to provide the product. It does not provide a TubePulse account or cross-device sync.
+The update indicator sends a rate-limited request to GitHub's public releases API; it sends no
+TubePulse installation identifier, channels or notification state.
 
 Operational dashboards use aggregate service measurements and are designed not to expose raw
 installation/channel identifiers, tokens, titles or content. See the repository's

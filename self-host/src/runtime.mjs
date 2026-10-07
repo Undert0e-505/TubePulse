@@ -30,7 +30,9 @@ export class TubePulseRuntime {
         modulePaths.push(path.join(workerRoot, 'tubepulse-api', 'authority.mjs'));
         modulePaths.push(path.join(workerRoot, 'tubepulse-api', 'd1-kv.mjs'));
       }
-      if (worker.scheduled) modulePaths.push(path.join(workerRoot, 'tubepulse-cron', 'shared.mjs'));
+      if (worker.scheduled || worker.name === 'api') {
+        modulePaths.push(path.join(workerRoot, 'tubepulse-cron', 'shared.mjs'));
+      }
       if (worker.name === 'posts') modulePaths.push(path.join(workerRoot, 'tubepulse-posts', 'community-posts.mjs'));
       return {
         name: worker.name,

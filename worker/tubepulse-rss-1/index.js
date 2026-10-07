@@ -216,7 +216,9 @@ async function pollSingleRssChannel(env, ctx, channelId) {
           tag: 'tubepulse-batch',
         };
       }
-      const pushResult = await sendFCMPush(accessToken, projectId, profile.fcmToken, notifPayload);
+      const pushResult = await sendFCMPush(
+        accessToken, projectId, profile.fcmToken, notifPayload, profile.notificationCapability,
+      );
       if (pushResult.deadToken) deadDevices.push(deviceId);
       if (pushResult.sent) {
         state.lastNagAt = now;

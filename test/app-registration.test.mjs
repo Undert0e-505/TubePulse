@@ -16,9 +16,11 @@ test('registration payload uses the configured application version', () => {
     fcmToken: 'synthetic-token',
     platform: 'android',
     appVersion: appConfig.expo.version,
+    notificationCapability: 'local-v1',
   });
   assert.match(apiSource, /appVersion = appConfig\?\.expo\?\.version \|\| null/);
-  assert.match(apiSource, /buildRegistrationPayload\(\{ fcmToken, platform, appVersion \}\)/);
+  assert.match(apiSource, /notificationCapability = LOCAL_NOTIFICATION_CAPABILITY/);
+  assert.match(apiSource, /fcmToken, platform, appVersion, notificationCapability/);
 });
 
 test('registration preserves null-token semantics without inventing a version', () => {
@@ -26,5 +28,11 @@ test('registration preserves null-token semantics without inventing a version', 
     fcmToken: null,
     platform: 'android',
     appVersion: null,
+    notificationCapability: 'local-v1',
   });
+});
+
+test('registration capability is explicit and rejects unknown values', () => {
+  assert.equal(buildRegistrationPayload({ notificationCapability: 'future-v2' }).notificationCapability, null);
+  assert.equal(buildRegistrationPayload({ notificationCapability: null }).notificationCapability, null);
 });

@@ -90,7 +90,7 @@ export default function ChannelsScreen() {
     try { await updateWidget('channel-order-setting'); } catch {}
   };
 
-  const openChannelNotifSettings = (handle) => {
+  const openChannelNotifSettings = async (handle) => {
     const existing = channelNotifSettings[handle] || DEFAULT_CHANNEL_NOTIF;
     const existingDisplay = channelDisplaySettings[handle] || {};
     setEditingNotif({
@@ -390,10 +390,7 @@ export default function ChannelsScreen() {
       <ScaleDecorator>
         <TouchableOpacity
           onLongPress={() => {
-            if (perChannelEnabled) {
-              openChannelNotifSettings(item.handle);
-            }
-            // Long press on row body = open settings (if enabled) or do nothing
+            openChannelNotifSettings(item.handle);
           }}
           delayLongPress={200}
           style={[styles.channelRow, isActive && styles.channelRowActive]}
@@ -431,7 +428,7 @@ export default function ChannelsScreen() {
               {hasOverride && <View style={styles.overrideDot} />}
             </View>
             <Text style={styles.channelHandle}>
-              @{item.handle}{perChannelEnabled ? '  · long-press to configure' : ''}
+              @{item.handle}  · long-press to configure
             </Text>
           </View>
 

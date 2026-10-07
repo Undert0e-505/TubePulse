@@ -41,6 +41,19 @@ import {
   readSeenMutationQueue,
 } from '../utils/seenPersistence.mjs';
 import { orderChannels } from '../utils/channelOrdering.mjs';
+import {
+  channelSilenceUntil,
+  emptySilenceState,
+  formatNotificationSilenceStatus,
+  nextNotificationSilenceExpiry,
+  notificationSilencePresentation,
+} from '../utils/localNotificationSilence.mjs';
+import {
+  readLocalNotificationSilence,
+  resumeAllNotificationSound,
+  resumeChannelNotificationSound,
+  subscribeLocalNotificationSilence,
+} from '../utils/localNotificationSilenceStorage';
 
 const THUMB_UP_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#666666" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
   <path d="M7 22V11" />
@@ -65,6 +78,7 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
   const [previewConnectionError, setPreviewConnectionError] = useState(null);
   const [previewInitializationPending, setPreviewInitializationPending] = useState(IS_TUBEPULSE_PREVIEW);
   const [nowMs, setNowMs] = useState(Date.now());
+  const [silenceState, setSilenceState] = useState(() => emptySilenceState());
   // Hold the latest cache in a ref so refresh() can be stable
   // (depending on `cache` directly caused an infinite re-render loop
   //  because setCache -> new refresh -> new useEffect -> new autoFetch -> new setCache)
@@ -92,6 +106,12 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
     setCache(ca);
     setChannelDisplaySettings(cds || {});
     setLoading(false);
+  }, []);
+
+  const refreshSilenceState = useCallback(async () => {
+    const state = await readLocalNotificationSilence();
+    setSilenceState(state);
+    return state;
   }, []);
 
   const refresh = useCallback(async () => {
@@ -339,6 +359,7 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
 
   useFocusEffect(
     useCallback(() => {
+      refreshSilenceState().catch(() => {});
       // autoFetch owns the first Preview load and waits for registration.
       // Later focus events retain the normal immediate refresh behaviour.
       if (IS_TUBEPULSE_PREVIEW && firstFocusRef.current) {
@@ -348,21 +369,34 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
       firstFocusRef.current = false;
       loadData().then(() => refresh());
       return undefined;
-    }, [loadData, refresh])
+    }, [loadData, refresh, refreshSilenceState])
   );
 
   useEffect(() => {
     autoFetch();
+    refreshSilenceState().catch(() => {});
 
     const sub = AppState.addEventListener('change', (state) => {
       if (state === 'active') {
         refresh();
+        refreshSilenceState().catch(() => {});
         try { updateWidget('app-active'); } catch {}
       }
     });
 
     return () => sub.remove();
-  }, [loadData, refresh, autoFetch]);
+  }, [loadData, refresh, autoFetch, refreshSilenceState]);
+
+  useEffect(() => subscribeLocalNotificationSilence(setSilenceState), []);
+
+  useEffect(() => {
+    const expiresAt = nextNotificationSilenceExpiry(silenceState);
+    if (!expiresAt) return undefined;
+    const timer = setTimeout(() => {
+      refreshSilenceState().catch(() => {});
+    }, Math.max(25, expiresAt - Date.now() + 25));
+    return () => clearTimeout(timer);
+  }, [silenceState, refreshSilenceState]);
 
   useEffect(() => {
     const interval = setInterval(() => {
@@ -635,6 +669,16 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
 
   const isNew = (handle) => unseenCount(handle) > 0 || getUnseenPosts(handle).length > 0;
 
+  const unmuteChannel = async (channelId) => {
+    const state = await resumeChannelNotificationSound(channelId);
+    setSilenceState(state);
+  };
+
+  const unmuteAll = async () => {
+    const state = await resumeAllNotificationSound();
+    setSilenceState(state);
+  };
+
   const timeAgo = (dateStr) => {
     return formatCompactAge(dateStr, nowMs);
   };
@@ -651,6 +695,11 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
     const effectiveCount = getEffectiveVideoCount(item.handle);
     const allVideos = getVideos(item.handle);
     const persistent = selectPersistentLatestContent(item.handle);
+    const silenceUntil = channelSilenceUntil(silenceState, item.channelId);
+    const localPresentation = notificationSilencePresentation(silenceState, item.channelId);
+    const silenceStatus = localPresentation.silent
+      ? formatNotificationSilenceStatus(silenceState.globalMuted ? null : silenceUntil)
+      : null;
 
     // Show the N latest videos, newest-first. Seen/unseen state does
     // not affect ordering — blue dots are applied independently per video.
@@ -680,10 +729,28 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
             )}
           </TouchableOpacity>
           <TouchableOpacity style={styles.channelNameBtn} onPress={() => handleChannelOpen(item)} activeOpacity={0.7}>
-            <Text style={[styles.channelName, hasNew && styles.channelNameNew]} numberOfLines={1}>
+            <Text
+              style={[styles.channelName, hasNew && styles.channelNameNew]}
+              numberOfLines={1}
+              ellipsizeMode="tail"
+            >
               {displayName}
             </Text>
           </TouchableOpacity>
+          {silenceStatus && (
+            <>
+              <Text style={styles.silenceStatus} numberOfLines={1}>{silenceStatus}</Text>
+              <TouchableOpacity
+                style={styles.unmuteLozenge}
+                onPress={() => unmuteChannel(item.channelId)}
+                accessibilityRole="button"
+                accessibilityLabel={`${silenceStatus}. Unmute ${displayName}`}
+                hitSlop={6}
+              >
+                <Text style={styles.unmuteLozengeText}>Unmute</Text>
+              </TouchableOpacity>
+            </>
+          )}
         </View>
 
         {posts.length > 0 && (
@@ -818,6 +885,25 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
     connectionError: previewConnectionError,
   });
   const displayedChannels = orderChannels(channels, cache, settings.autoOrderChannels === true);
+  const previewHeader = IS_TUBEPULSE_PREVIEW && previewConnectionPhase === 'connecting' ? (
+    <View style={styles.previewConnecting}>
+      <ActivityIndicator color={COLORS.accent} size="small" />
+      <Text style={styles.previewConnectingText}>Connecting to Preview server…</Text>
+    </View>
+  ) : IS_TUBEPULSE_PREVIEW && previewConnectionPhase === 'error' ? (
+    <View style={styles.previewError}>
+      <Text style={styles.previewErrorTitle}>Preview server unavailable</Text>
+      <Text style={styles.previewErrorText}>{previewConnectionError}</Text>
+      <View style={styles.previewErrorActions}>
+        <TouchableOpacity onPress={refresh} disabled={refreshing}>
+          <Text style={styles.previewErrorLink}>{refreshing ? 'Retrying…' : 'Retry'}</Text>
+        </TouchableOpacity>
+        <TouchableOpacity onPress={() => navigation.navigate('Settings')}>
+          <Text style={styles.previewErrorLink}>Server settings</Text>
+        </TouchableOpacity>
+      </View>
+    </View>
+  ) : null;
 
   return (
     <View style={styles.container}>
@@ -833,23 +919,25 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
             colors={[COLORS.accent]}
           />
         }
-        ListHeaderComponent={IS_TUBEPULSE_PREVIEW && previewConnectionPhase === 'connecting' ? (
-          <View style={styles.previewConnecting}>
-            <ActivityIndicator color={COLORS.accent} size="small" />
-            <Text style={styles.previewConnectingText}>Connecting to Preview server…</Text>
-          </View>
-        ) : IS_TUBEPULSE_PREVIEW && previewConnectionPhase === 'error' ? (
-          <View style={styles.previewError}>
-            <Text style={styles.previewErrorTitle}>Preview server unavailable</Text>
-            <Text style={styles.previewErrorText}>{previewConnectionError}</Text>
-            <View style={styles.previewErrorActions}>
-              <TouchableOpacity onPress={refresh} disabled={refreshing}>
-                <Text style={styles.previewErrorLink}>{refreshing ? 'Retrying…' : 'Retry'}</Text>
-              </TouchableOpacity>
-              <TouchableOpacity onPress={() => navigation.navigate('Settings')}>
-                <Text style={styles.previewErrorLink}>Server settings</Text>
-              </TouchableOpacity>
-            </View>
+        ListHeaderComponent={(silenceState.globalMuted || previewHeader) ? (
+          <View>
+            {silenceState.globalMuted && (
+              <View style={styles.globalMuteRow}>
+                <Text style={styles.globalMuteText} numberOfLines={1}>All notifications</Text>
+                <Text style={styles.silenceStatus} numberOfLines={1}>
+                  {formatNotificationSilenceStatus(null)}
+                </Text>
+                <TouchableOpacity
+                  style={styles.unmuteLozenge}
+                  onPress={unmuteAll}
+                  accessibilityRole="button"
+                  accessibilityLabel="Silent. Unmute all TubePulse notifications"
+                >
+                  <Text style={styles.unmuteLozengeText}>Unmute all</Text>
+                </TouchableOpacity>
+              </View>
+            )}
+            {previewHeader}
           </View>
         ) : null}
         ListEmptyComponent={
@@ -909,6 +997,45 @@ const styles = StyleSheet.create({
   },
   channelNameBtn: {
     flex: 1,
+    flexShrink: 1,
+    minWidth: 0,
+  },
+  unmuteLozenge: {
+    borderColor: COLORS.accent,
+    borderRadius: 14,
+    borderWidth: 1,
+    flexShrink: 0,
+    justifyContent: 'center',
+    minHeight: 28,
+    paddingHorizontal: 10,
+  },
+  unmuteLozengeText: {
+    color: COLORS.accent,
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  silenceStatus: {
+    color: COLORS.textDim,
+    flexShrink: 0,
+    fontSize: 11,
+    marginLeft: 6,
+    marginRight: 6,
+  },
+  globalMuteRow: {
+    alignItems: 'center',
+    borderBottomColor: COLORS.border,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    paddingHorizontal: 16,
+    paddingVertical: 9,
+  },
+  globalMuteText: {
+    color: COLORS.text,
+    flex: 1,
+    fontSize: 13,
+    fontWeight: '600',
+    minWidth: 0,
   },
   videoRow: {
     flexDirection: 'row',
