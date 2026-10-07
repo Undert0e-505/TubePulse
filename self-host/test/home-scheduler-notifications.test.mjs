@@ -44,7 +44,8 @@ function intent(overrides = {}) {
 test('notification intent summary exposes only aggregate backlog and outcome counts', async (t) => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'tubepulse-notification-summary-'));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
-  const store = new DurableNotificationIntentStore(directory);
+  let now = 100_000;
+  const store = new DurableNotificationIntentStore(directory, { now: () => now });
   const [sending, failed, pending] = await store.stage([
     intent({ contentIds: ['video-sending'] }),
     intent({ contentIds: ['video-failed'] }),
@@ -57,11 +58,17 @@ test('notification intent summary exposes only aggregate backlog and outcome cou
   assert.deepEqual(summary, {
     pending: 1, sending: 1, sent: 0, resolved: 1,
     callbackPending: 1, failed: 1, deadToken: 0, suppressed: 0,
-    transientExpired: 0,
+    transientExpired: 0, overduePending: 0, oldestPendingAgeSeconds: 0,
   });
   const serialized = JSON.stringify(summary);
   assert.doesNotMatch(serialized, /synthetic-device|UC-synthetic|synthetic-fcm|video-/);
   assert.equal(pending.record.status, 'pending');
+
+  now += 60_001;
+  const overdue = await store.summary();
+  assert.equal(overdue.pending, 1);
+  assert.equal(overdue.overduePending, 1);
+  assert.equal(overdue.oldestPendingAgeSeconds, 60.001);
 });
 
 test('canonical reconciliation and production feed visibility precede exactly one FCM send', async () => {

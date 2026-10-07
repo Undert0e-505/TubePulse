@@ -68,7 +68,7 @@ export function prometheusText({ snapshot, collector }) {
     metric('tubepulse_youtube_api_failures', host.youtube?.[quota]?.failures, { quota });
   }
   for (const field of ['queued', 'sent', 'failed', 'suppressed', 'recovered', 'deduplicated']) metric(`tubepulse_notifications_${field}`, host.notifications?.[field]);
-  for (const field of ['durableBacklog', 'ambiguousSending', 'callbackPending', 'retainedFailures', 'retainedDeadTokens', 'transientNagsExpired']) {
+  for (const field of ['pending', 'oldestPendingAgeSeconds', 'durableBacklog', 'ambiguousSending', 'callbackPending', 'retainedFailures', 'retainedDeadTokens', 'transientNagsExpired']) {
     metric(`tubepulse_notifications_${field.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`)}`, host.notifications?.[field]);
   }
   metric('tubepulse_notifications_barrier_healthy', bool(host.notifications?.barrierHealthy));

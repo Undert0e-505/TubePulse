@@ -61,6 +61,12 @@ function isTransientIntent(intent) {
   return intent?.kind === 'nag';
 }
 
+// A newly staged intent is normal in-flight work, not a durable backlog.
+// Monitoring samples five seconds into the scheduler cycle, so alert only
+// after an intent has remained pending long enough to miss the normal send
+// window. The raw pending count remains available for activity charts.
+const DURABLE_BACKLOG_GRACE_MS = 60_000;
+
 function expirePendingTransientRecords(state, now, reason = 'transient-nag-expired') {
   let expired = 0;
   for (const record of Object.values(state.records || {})) {
@@ -144,13 +150,19 @@ export class DurableNotificationIntentStore {
 
   async summary() {
     const state = await this.stateFile.read();
+    const now = this.now();
     const summary = {
       pending: 0, sending: 0, sent: 0, resolved: 0,
       callbackPending: 0, failed: 0, deadToken: 0, suppressed: 0,
-      transientExpired: 0,
+      transientExpired: 0, overduePending: 0, oldestPendingAgeSeconds: 0,
     };
     for (const record of Object.values(state.records || {})) {
       if (Object.hasOwn(summary, record.status)) summary[record.status]++;
+      if (record.status === 'pending') {
+        const ageMs = Math.max(0, now - Number(record.createdAt || now));
+        summary.oldestPendingAgeSeconds = Math.max(summary.oldestPendingAgeSeconds, ageMs / 1000);
+        if (ageMs >= DURABLE_BACKLOG_GRACE_MS) summary.overduePending++;
+      }
       if (!record.callbackApplied && ['sending', 'sent'].includes(record.status)) summary.callbackPending++;
       if (record.delivery === 'indeterminate') summary.failed++;
       if (record.delivery === 'dead-token') summary.deadToken++;

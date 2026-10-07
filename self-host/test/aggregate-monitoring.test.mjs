@@ -41,6 +41,7 @@ test('aggregate monitoring counts profiles and subscriptions without exposing re
       status: 'ready', mode: 'active', authority: { replication: { status: 'current' } },
       scheduler: {
         mode: 'active', lease: { state: 'held' }, lastMinuteJobs: { scheduledAt: now - 10_000 },
+        notificationIntents: { pending: 2, overduePending: 1, oldestPendingAgeSeconds: 75 },
         youtubeDataApi: {
           sourceMode: 'youtube-data-api', statsMethod: 'videos.list', lastGoodAt: now - 30_000,
           quota: { general: { units: 12, failures: 1 }, statistics: { units: 4, failures: 0 } },
@@ -69,6 +70,9 @@ test('aggregate monitoring counts profiles and subscriptions without exposing re
   assert.equal(payload.subscriptions.membershipMismatchCount, 0);
   assert.equal(payload.subscriptions.indexConsistent, true);
   assert.equal(payload.host.ready, true);
+  assert.equal(payload.notifications.pending, 2);
+  assert.equal(payload.notifications.durableBacklog, 1);
+  assert.equal(payload.notifications.oldestPendingAgeSeconds, 75);
   assert.equal(payload.authority.backendReady, true);
   assertAggregateMonitoringSafe(payload);
   const serialized = JSON.stringify(payload);

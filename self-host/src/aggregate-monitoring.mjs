@@ -214,6 +214,9 @@ export async function collectAggregateMonitoring({
   const youtubeQuota = youtube.quota || {};
   const lastDelivery = scheduler.lastNotificationDelivery || {};
   const notificationIntents = scheduler.notificationIntents || {};
+  const overduePending = Number.isFinite(Number(notificationIntents.overduePending))
+    ? finite(notificationIntents.overduePending)
+    : finite(notificationIntents.pending);
   const lastCycle = youtube.lastCycle || {};
   const lastSweep = scheduler.lastSweep || {};
   const remoteQuota = remoteStatus?.quota || {};
@@ -293,7 +296,9 @@ export async function collectAggregateMonitoring({
       recovered: finite(lastDelivery.recovered),
       deduplicated: finite(lastDelivery.deduplicated),
       barrierHealthy: ['passed', 'not-required', 'not-needed'].includes(lastDelivery.barrier),
-      durableBacklog: finite(notificationIntents.pending),
+      pending: finite(notificationIntents.pending),
+      oldestPendingAgeSeconds: finite(notificationIntents.oldestPendingAgeSeconds),
+      durableBacklog: overduePending,
       ambiguousSending: finite(notificationIntents.sending),
       callbackPending: finite(notificationIntents.callbackPending),
       retainedFailures: finite(notificationIntents.failed),

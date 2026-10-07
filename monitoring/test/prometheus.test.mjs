@@ -25,7 +25,9 @@ test('Prometheus exposition contains aggregate labels and excludes identifiers',
           },
           perInstall: { mean: 2, p50: 2, p95: 2, max: 2, zero: 0 },
         },
-        youtube: { general: {}, statistics: {} }, notifications: {}, authority: { estimatedRows: {}, limits: {} },
+        youtube: { general: {}, statistics: {} },
+        notifications: { pending: 2, oldestPendingAgeSeconds: 75, durableBacklog: 1 },
+        authority: { estimatedRows: {}, limits: {} },
       },
       cloudflare: {
         window: { workers: [{ script: 'tubepulse-api', status: 'success', requests: 5 }], d1: {}, durableObjects: {} },
@@ -41,5 +43,8 @@ test('Prometheus exposition contains aggregate labels and excludes identifiers',
   assert.match(metrics, /tubepulse_subscription_membership_mismatches\{direction="missing_from_subscriber_index"\} 0/);
   assert.match(metrics, /tubepulse_subscription_integrity_issues\{kind="active_channel_without_subscriber_index"\} 0/);
   assert.match(metrics, /tubepulse_cloudflare_worker_requests\{period="window",script="tubepulse-api",status="success"\} 5/);
+  assert.match(metrics, /tubepulse_notifications_pending 2/);
+  assert.match(metrics, /tubepulse_notifications_oldest_pending_age_seconds 75/);
+  assert.match(metrics, /tubepulse_notifications_durable_backlog 1/);
   assert.doesNotMatch(metrics, /deviceId|channelId|fcmToken|UC[A-Za-z0-9_-]{20}/);
 });
