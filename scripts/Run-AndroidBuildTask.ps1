@@ -83,8 +83,10 @@ try {
         throw 'Local master does not match origin/master.'
     }
 
-    $statusText = Invoke-GitText @('status', '--porcelain=v1')
-    $status = @($statusText -split "`r?`n" | Where-Object { $_ })
+    $status = @(& git -C $repo status --porcelain=v1 2>&1)
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Could not read repository status.'
+    }
     $unexpected = @($status | Where-Object {
         $path = $_.Substring(3).Replace('\', '/')
         -not ($path.StartsWith('monitoring/') -or $path.StartsWith('logs/'))
