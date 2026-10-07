@@ -8,6 +8,44 @@ Worker deployments are deliberately separate from app APK releases. Do not deplo
 
 ---
 
+## Non-elevated Windows build runner
+
+Codex desktop child processes on this host cannot create the Java loopback pipe Gradle uses, even
+when the checkout is inside the authorised workspace. The repository therefore provides a bounded,
+current-user Task Scheduler runner. It runs on demand with an interactive token at **Limited** run
+level; it is not an administrator task and normal builds show no UAC prompt.
+
+Register or repair the three fixed tasks once:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Install-AndroidBuildRunner.ps1
+```
+
+Prove the Java/Gradle path, then start an official or demo-update preview build:
+
+```powershell
+.\scripts\Start-AndroidBuildTask.ps1 -Mode Preflight
+.\scripts\Start-AndroidBuildTask.ps1 -Mode Official
+.\scripts\Start-AndroidBuildTask.ps1 -Mode Preview
+```
+
+The tasks accept only those three fixed modes and the fixed `D:\dev\TubePulse` checkout. The runner
+requires `master` to equal `origin/master`, validates the repository remote and version metadata,
+rejects source changes outside the local monitoring/log paths, clears public build overrides, and
+writes only ignored status/log files under `logs/build-runner/`. Preview mode enables the update-pill
+demo with the next patch tag; Official mode always disables it. Signing material stays at its existing
+path and is neither copied nor printed. Remove all three task registrations with:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Install-AndroidBuildRunner.ps1 -Remove
+```
+
+If task registration is lost after machine recovery, restore the repository and signing/Google files
+as documented below, then rerun the installer. Registration is per-user and requires no password or
+elevation.
+
+---
+
 ## Current Release Script
 
 The current local app release path is:
