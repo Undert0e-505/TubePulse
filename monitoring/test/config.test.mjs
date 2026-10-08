@@ -16,13 +16,13 @@ test('wallboard and diagnostics dashboards are valid, provisioned, and use one d
   assert.equal(wallboard.title, 'TubePulse Wallboard');
   assert.equal(diagnostics.uid, 'tubepulse-diagnostics');
   assert.equal(diagnostics.title, 'TubePulse Diagnostics');
-  assert.ok(wallboard.panels.length >= 10);
+  assert.ok(wallboard.panels.length >= 7);
   assert.ok(diagnostics.panels.length >= 10);
   assert.match(read('monitoring', 'grafana', 'provisioning', 'dashboards', 'default.yml'), /\/etc\/grafana\/dashboards/);
   assert.match(read('monitoring', 'grafana', 'provisioning', 'datasources', 'prometheus.yml'), /http:\/\/prometheus:9090/);
 });
 
-test('wallboard is a readable one-screen 24-column health overview', () => {
+test('wallboard is a readable one-screen calm health overview', () => {
   const dashboard = JSON.parse(read('monitoring', 'grafana', 'dashboards', 'tubepulse-operations.json'));
   assert.equal(dashboard.refresh, '30s');
   assert.deepEqual(dashboard.time, { from: 'now-24h', to: 'now' });
@@ -46,75 +46,96 @@ test('wallboard is a readable one-screen 24-column health overview', () => {
 
   const byTitle = new Map(dashboard.panels.map((panel) => [panel.title, panel]));
   for (const title of [
-    'Overall health', 'Data freshness', 'Host authority', 'Active risks',
-    'Active 24h', 'Active 7d', 'Registered', 'Push capable', 'Active channels',
-    'Memberships', 'Max / install', 'D1 writes today', 'D1 projected EOD', 'YouTube quota',
-    'Notifications', 'Worker requests / 5m', 'D1 rows / window',
-    'Notification outcomes', 'Actionable signals',
+    'TubePulse status', 'Data freshness', 'Host authority', 'Attention', 'Audience & scale', 'Capacity',
+    'Service traffic · 24h', 'Database activity · 24h', 'Notification delivery · 24h',
   ]) assert.ok(byTitle.has(title), `wallboard is missing ${title}`);
 
-  const overall = byTitle.get('Overall health');
-  assert.match(overall.targets[0].expr, /tubepulse_collector_collection_success/);
-  assert.match(overall.targets[0].expr, /tubepulse_host_authority_current/);
-  assert.equal(overall.fieldConfig.defaults.noValue, 'NO DATA');
-  assert.equal(overall.fieldConfig.defaults.mappings[0].options['0'].text, 'FAULT');
-  assert.equal(overall.fieldConfig.defaults.mappings[0].options['1'].text, 'ATTENTION');
-  assert.equal(overall.fieldConfig.defaults.mappings[0].options['2'].text, 'HEALTHY');
-  assert.deepEqual(overall.fieldConfig.defaults.thresholds.steps.map(({ color, value }) => ({ color, value })), [
-    { color: 'red', value: null },
-    { color: 'orange', value: 1 },
-    { color: 'green', value: 2 },
-  ]);
-  assert.equal(overall.targets[0].instant, true);
-  assert.equal(overall.targets[0].range, false);
-
-  const risks = byTitle.get('Active risks');
-  assert.equal(risks.fieldConfig.defaults.mappings[0].options['0'].text, 'CRITICAL');
-  assert.equal(risks.fieldConfig.defaults.mappings[0].options['1'].text, 'REVIEW BELOW');
-  assert.equal(risks.fieldConfig.defaults.mappings[0].options['2'].text, 'CLEAR');
+  const status = byTitle.get('TubePulse status');
+  assert.equal(status.options.colorMode, 'value', 'healthy status must not fill the panel background');
+  assert.equal(status.targets.length, 1);
+  assert.match(status.targets[0].expr, /tubepulse_collector_collection_success/);
+  assert.match(status.targets[0].expr, /tubepulse_authority_pending_backup_consecutive_samples < bool 2/);
+  assert.match(status.targets[0].expr, /tubepulse_authority_transaction_active_consecutive_samples < bool 2/);
+  assert.doesNotMatch(status.targets[0].expr, /tubepulse_youtube_api_failures/);
+  assert.ok(status.options.text.valueSize >= 30);
 
   const freshness = byTitle.get('Data freshness');
+  assert.equal(freshness.transparent, true);
+  assert.match(freshness.targets[0].expr, /last_success_timestamp_seconds/);
   assert.equal(freshness.fieldConfig.defaults.unit, 's');
-  assert.deepEqual(freshness.fieldConfig.defaults.thresholds.steps.map(({ value }) => value), [null, 660, 960]);
 
-  for (const title of ['Active 24h', 'Active 7d', 'Registered', 'Push capable', 'Active channels', 'Memberships', 'Max / install']) {
-    const audience = byTitle.get(title);
-    assert.equal(audience.targets.length, 1);
-    assert.equal(audience.targets[0].instant, true);
-    assert.equal(audience.options.textMode, 'value');
-    assert.ok(audience.options.text.valueSize >= 30);
-    assert.equal(audience.fieldConfig.defaults.thresholds, undefined, 'scale counts must not use danger thresholds');
-    assert.equal(audience.fieldConfig.defaults.color.fixedColor, 'blue');
+  const authority = byTitle.get('Host authority');
+  assert.equal(authority.transparent, true);
+  assert.match(authority.targets[0].expr, /tubepulse_host_authority_current/);
+  assert.ok(authority.fieldConfig.defaults.mappings.some(({ options }) => options['1']?.text === 'Current'));
+
+  const attention = byTitle.get('Attention');
+  assert.equal(attention.options.colorMode, 'value');
+  assert.match(attention.targets[0].expr, /tubepulse_subscription_integrity_consistent/);
+  assert.match(attention.targets[0].expr, /tubepulse_notifications_durable_backlog/);
+  assert.match(attention.targets[0].expr, /tubepulse_cloudflare_worker_errors/);
+  assert.doesNotMatch(attention.targets[0].expr, /tubepulse_youtube_api_failures/);
+  for (const required of ['Core availability', 'D1 queue', 'D1 transaction', 'YouTube error']) {
+    assert.ok(attention.targets.some(({ legendFormat }) => legendFormat === required));
   }
-
-  for (const title of ['D1 writes today', 'D1 projected EOD', 'YouTube quota']) {
-    const panel = byTitle.get(title);
-    assert.equal(panel.fieldConfig.defaults.unit, 'percent');
-    assert.equal(panel.fieldConfig.defaults.min, 0);
-    assert.equal(panel.fieldConfig.defaults.max, 100);
-    assert.deepEqual(panel.fieldConfig.defaults.thresholds.steps.map(({ value }) => value), [null, 70, 90]);
-  }
-
-  assert.match(byTitle.get('Actionable signals').targets[0].expr, /tubepulse_authority_pending_backup_consecutive_samples >= bool 2/);
-  assert.doesNotMatch(byTitle.get('Actionable signals').targets[0].expr, /tubepulse_youtube_api_failures/);
-  assert.match(byTitle.get('Overall health').targets[0].expr, /tubepulse_authority_pending_backup_consecutive_samples < bool 2/);
-  assert.match(byTitle.get('Overall health').targets[0].expr, /tubepulse_authority_transaction_active_consecutive_samples < bool 2/);
-  assert.doesNotMatch(byTitle.get('Overall health').targets[0].expr, /tubepulse_youtube_api_failures/);
-  assert.match(byTitle.get('Actionable signals').targets[0].expr, /tubepulse_subscription_integrity_consistent/);
-  assert.match(byTitle.get('Actionable signals').targets[0].expr, /tubepulse_notifications_durable_backlog/);
-  assert.match(byTitle.get('Actionable signals').targets[0].expr, /tubepulse_cloudflare_worker_errors/);
-  assert.deepEqual(byTitle.get('Actionable signals').fieldConfig.defaults.thresholds.steps.map(({ color, value }) => ({ color, value })), [
-    { color: 'green', value: null },
-    { color: 'orange', value: 1 },
-    { color: 'red', value: 1000 },
-  ]);
-  assert.ok(byTitle.get('Actionable signals').targets.some(({ legendFormat }) => legendFormat === 'core availability'));
-  assert.ok(byTitle.get('Actionable signals').targets.some(({ legendFormat }) => legendFormat === 'D1 persistent queue'));
-  assert.ok(byTitle.get('Actionable signals').targets.some(({ legendFormat }) => legendFormat === 'D1 persistent transaction'));
-  assert.ok(byTitle.get('Actionable signals').targets.some(({ legendFormat }) => legendFormat === 'YouTube current error'));
-  for (const target of byTitle.get('Actionable signals').targets) {
+  for (const target of attention.targets) {
     assert.equal(target.instant, true);
     assert.equal(target.range, false);
+  }
+
+  const audience = byTitle.get('Audience & scale');
+  assert.equal(audience.type, 'text');
+  assert.equal(audience.transparent, true);
+
+  const audienceTitles = [
+    'Active 24h', 'Active 7d', 'Registered', 'Push capable',
+    'Channels', 'Memberships', 'Max / install',
+  ];
+  const audiencePanels = audienceTitles.map((title) => {
+    const panel = byTitle.get(title);
+    assert.ok(panel, `audience overview is missing ${title}`);
+    return panel;
+  });
+  for (const panel of audiencePanels) {
+    assert.equal(panel.type, 'stat');
+    assert.equal(panel.transparent, true, `${panel.title} should read as part of one quiet group`);
+    assert.equal(panel.targets.length, 1, `${panel.title} must remain readable when mobile panels stack`);
+    assert.equal(panel.targets[0].instant, false);
+    assert.equal(panel.targets[0].range, true);
+    assert.equal(panel.options.graphMode, 'area', `${panel.title} must show its own history`);
+    assert.ok(panel.gridPos.h >= 4, `${panel.title} needs enough height for a visible sparkline`);
+    assert.equal(panel.options.textMode, 'value');
+    assert.equal(panel.fieldConfig.defaults.thresholds, undefined, 'scale counts must not use danger thresholds');
+    assert.equal(panel.fieldConfig.defaults.color.fixedColor, '#4FC3F7');
+  }
+  assert.deepEqual(
+    audiencePanels.map(({ targets }) => targets[0].expr),
+    [
+      'tubepulse_installs_active{window="h24"}',
+      'tubepulse_installs_active{window="d7"}',
+      'tubepulse_installs_total',
+      'tubepulse_installs_push_capable',
+      'tubepulse_channels_active',
+      'tubepulse_subscriptions_configured_memberships',
+      'tubepulse_channels_per_install{statistic="max"}',
+    ],
+  );
+
+  assert.equal(byTitle.has('Audience activity · 24h'), false, 'grouped audience history must not duplicate per-metric graphs');
+  assert.equal(byTitle.has('Channel scale · 24h'), false, 'grouped channel history must not duplicate per-metric graphs');
+
+  const capacity = byTitle.get('Capacity');
+  assert.equal(capacity.type, 'bargauge');
+  assert.equal(capacity.fieldConfig.defaults.unit, 'percent');
+  assert.deepEqual(capacity.fieldConfig.defaults.thresholds.steps.map(({ value }) => value), [null, 70, 90]);
+  assert.equal(capacity.targets.length, 4);
+
+  for (const title of ['Service traffic · 24h', 'Database activity · 24h', 'Notification delivery · 24h']) {
+    const trend = byTitle.get(title);
+    assert.equal(trend.type, 'timeseries');
+    assert.ok(trend.gridPos.h >= 10);
+    assert.equal(trend.fieldConfig.defaults.custom.axisGridShow, false);
+    assert.equal(trend.options.legend.placement, 'bottom');
   }
 
   const serialized = JSON.stringify(dashboard);
