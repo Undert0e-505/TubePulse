@@ -15,6 +15,18 @@ test('dashboard is valid, provisioned, and uses only one datasource', () => {
   assert.ok(dashboard.panels.length >= 10);
   assert.match(read('monitoring', 'grafana', 'provisioning', 'dashboards', 'default.yml'), /\/etc\/grafana\/dashboards/);
   assert.match(read('monitoring', 'grafana', 'provisioning', 'datasources', 'prometheus.yml'), /http:\/\/prometheus:9090/);
+
+  const authority = dashboard.panels.find(({ title }) => title === 'Authority queue/transaction');
+  assert.match(authority.targets[0].expr, /tubepulse_authority_pending_backup_keys/);
+  assert.match(authority.targets[0].expr, /tubepulse_authority_pending_backup_consecutive_samples >= 2/);
+  assert.match(authority.targets[1].expr, /tubepulse_authority_transaction_active/);
+  assert.match(authority.targets[1].expr, /tubepulse_authority_transaction_active_consecutive_samples >= 2/);
+
+  const youtube = dashboard.panels.find(({ title }) => title === 'YouTube API quotas and freshness');
+  assert.ok(
+    youtube.targets.some(({ expr }) => expr === 'tubepulse_youtube_api_failures'),
+    'raw cumulative YouTube failure history remains graphed',
+  );
 });
 
 test('channels and subscriptions stat remains readable at mobile widths', () => {

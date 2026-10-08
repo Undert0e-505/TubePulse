@@ -66,6 +66,8 @@ export function createCollector({ config = loadConfig(), fetchImpl = globalThis.
     lastCollectionSuccess: Boolean(persisted.lastCollectionSuccess),
     errorsTotal: Number(persisted.errorsTotal) || 0,
     lastFailure: persisted.lastFailure || null,
+    authorityPendingConsecutiveSamples: Number(persisted.authorityPendingConsecutiveSamples) || 0,
+    authorityTransactionConsecutiveSamples: Number(persisted.authorityTransactionConsecutiveSamples) || 0,
     latest: persisted.latest || null,
     cache: persisted.cache || { host: null, cloudflare: null },
   };
@@ -96,7 +98,27 @@ export function createCollector({ config = loadConfig(), fetchImpl = globalThis.
       ]);
       const hostSuccess = hostResult.status === 'fulfilled';
       const cloudflareSuccess = cloudflareResult.status === 'fulfilled';
-      if (hostSuccess) state.cache.host = hostResult.value;
+      if (hostSuccess) {
+        const host = structuredClone(hostResult.value);
+        const pending = Number(host?.authority?.pendingBackupKeys || 0);
+        const transactionActive = Boolean(host?.authority?.transactionActive);
+        state.authorityPendingConsecutiveSamples = pending > 0
+          ? state.authorityPendingConsecutiveSamples + 1
+          : 0;
+        state.authorityTransactionConsecutiveSamples = transactionActive
+          ? state.authorityTransactionConsecutiveSamples + 1
+          : 0;
+        if (host?.authority && typeof host.authority === 'object') {
+          host.authority.pendingBackupConsecutiveSamples = state.authorityPendingConsecutiveSamples;
+          host.authority.transactionActiveConsecutiveSamples = state.authorityTransactionConsecutiveSamples;
+        }
+        state.cache.host = host;
+      } else {
+        // A failed host collection cannot confirm that a queue remained
+        // pending across consecutive observations.
+        state.authorityPendingConsecutiveSamples = 0;
+        state.authorityTransactionConsecutiveSamples = 0;
+      }
       if (cloudflareSuccess) state.cache.cloudflare = cloudflareResult.value;
       const failures = [];
       if (!hostSuccess) failures.push(safeFailure(hostResult.reason));

@@ -37,11 +37,11 @@
       "options": { "reduceOptions": { "calcs": ["lastNotNull"], "values": false }, "showThresholdLabels": false, "showThresholdMarkers": true }
     },
     {
-      "type": "stat", "title": "Authority queue/transaction", "description": "Pending D1 backup keys and active transaction state. Brief lease activity is normal.",
+      "type": "stat", "title": "Authority queue/transaction", "description": "Pending D1 backup keys and active transactions become actionable after two consecutive collector samples. Brief lease activity is normal.",
       "gridPos": { "x": 18, "y": 0, "w": 6, "h": 4 },
       "targets": [
-        { "expr": "tubepulse_authority_pending_backup_keys", "legendFormat": "pending keys", "refId": "A" },
-        { "expr": "tubepulse_authority_transaction_active", "legendFormat": "transaction", "refId": "B" }
+        { "expr": "tubepulse_authority_pending_backup_keys and on() (tubepulse_authority_pending_backup_consecutive_samples >= 2)", "legendFormat": "persistent pending keys", "refId": "A" },
+        { "expr": "tubepulse_authority_transaction_active and on() (tubepulse_authority_transaction_active_consecutive_samples >= 2)", "legendFormat": "persistent transaction", "refId": "B" }
       ],
       "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 1 }] } }, "overrides": [] },
       "options": { "colorMode": "value", "graphMode": "none", "orientation": "horizontal", "reduceOptions": { "calcs": ["lastNotNull"], "values": false } }

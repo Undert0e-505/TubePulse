@@ -278,6 +278,124 @@ test('unchanged 85-channel detector uses two calls and no playlist request; coun
   assert.equal(playlistCalls, 1);
 });
 
+test('a valid empty channel is reconciled without its missing uploads playlist and discovers its first upload', async (t) => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tubepulse-data-api-empty-'));
+  t.after(() => fs.rm(dataDir, { recursive: true, force: true }));
+  const now = Date.parse('2026-10-08T05:00:00Z');
+  const channelId = 'UC0000000000000000000000';
+  const stateFile = createHomeSchedulerStateFile(dataDir, 'shadow');
+  const kv = new MemoryKv({ 'channels:active': [channelId] });
+  let videoCount = 0;
+  let playlistCalls = 0;
+  const api = {
+    async listChannels() {
+      return { items: [{
+        id: channelId,
+        statistics: { videoCount: String(videoCount) },
+        contentDetails: { relatedPlaylists: { uploads: 'UU0000000000000000000000' } },
+      }] };
+    },
+    async listPlaylistItems() {
+      playlistCalls++;
+      return { items: [{
+        snippet: { title: 'First upload', publishedAt: '2026-10-08T05:04:00Z' },
+        contentDetails: { videoId: 'firstvideo01', videoPublishedAt: '2026-10-08T05:04:00Z' },
+        status: { privacyStatus: 'public' },
+      }] };
+    },
+    async listVideoDetails(ids) {
+      return { items: ids.map((id) => ({
+        id,
+        snippet: { title: 'First upload', publishedAt: '2026-10-08T05:04:00Z', channelTitle: 'Channel', thumbnails: {} },
+        status: { privacyStatus: 'public' },
+      })) };
+    },
+    async batchGetStats() { return { items: [] }; },
+  };
+  const runner = new HomeSchedulerRunner({
+    config: {
+      mode: 'shadow', videoSourceMode: 'youtube-api', dataDir, sync: { configured: false, concurrency: 1 },
+      workerBindings: { YOUTUBE_API_KEY: 'test', TUBEPULSE_NOTIFICATION_MODE: 'shadow' },
+      youtubeSafetyReconcileHours: 6, youtubeMaxReconciliationsPerCycle: 5,
+      youtubeMaxMigrationReconciliationsPerCycle: 100, youtubeMaxPlaylistPages: 3,
+      youtubeDailyQuotaUnits: 10_000, youtubeQuotaReserveUnits: 1_000,
+      youtubeStatisticsDailyQuotaUnits: 10_000, youtubeStatisticsReserveUnits: 1_000,
+      channelTimeoutMs: 1000,
+    },
+    stateFile, youtubeDataApiClient: api, now: () => now,
+  });
+
+  const empty = await runner.runYoutubeDataApiCycle({ TUBEPULSE_KV: kv }, kv, now);
+  assert.equal(empty.outcome, 'ok');
+  assert.equal(empty.reconciliationDueCount, 0);
+  assert.equal(playlistCalls, 0);
+  let state = await stateFile.read();
+  assert.equal(state.youtubeDataApi.channels[channelId].videoCount, 0);
+  assert.equal(state.youtubeDataApi.channels[channelId].lastReconcileOutcome, 'empty');
+  assert.equal(state.youtubeDataApi.channels[channelId].lastPageCount, 0);
+  assert.ok(state.youtubeDataApi.channels[channelId].lastReconciledAt);
+  assert.equal(state.youtubeDataApi.quota.general.failures, 0);
+
+  videoCount = 1;
+  const firstUpload = await runner.runYoutubeDataApiCycle({ TUBEPULSE_KV: kv }, kv, now + 300_000);
+  assert.equal(firstUpload.changedCount, 1);
+  assert.equal(firstUpload.reconciledCount, 1);
+  assert.equal(playlistCalls, 1);
+  assert.equal((await kv.get(`channel:${channelId}:recent`, 'json'))[0].videoId, 'firstvideo01');
+  state = await stateFile.read();
+  assert.notEqual(state.youtubeDataApi.channels[channelId].lastReconcileOutcome, 'empty');
+});
+
+test('an unresolved YouTube reconciliation error remains current until a successful cycle clears it', async (t) => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tubepulse-data-api-error-'));
+  t.after(() => fs.rm(dataDir, { recursive: true, force: true }));
+  const now = Date.parse('2026-10-08T05:00:00Z');
+  const channelId = 'UC0000000000000000000000';
+  const stateFile = createHomeSchedulerStateFile(dataDir, 'shadow');
+  const kv = new MemoryKv({ 'channels:active': [channelId] });
+  let fail = true;
+  const api = {
+    async listChannels() {
+      return { items: [{
+        id: channelId,
+        statistics: { videoCount: '1' },
+        contentDetails: { relatedPlaylists: { uploads: 'UU0000000000000000000000' } },
+      }] };
+    },
+    async listPlaylistItems() {
+      if (fail) throw Object.assign(new Error('playlist unavailable'), { category: 'not-found' });
+      return { items: [] };
+    },
+    async listVideoDetails() { return { items: [] }; },
+    async batchGetStats() { return { items: [] }; },
+  };
+  const runner = new HomeSchedulerRunner({
+    config: {
+      mode: 'shadow', videoSourceMode: 'youtube-api', dataDir, sync: { configured: false, concurrency: 1 },
+      workerBindings: { YOUTUBE_API_KEY: 'test' },
+      youtubeSafetyReconcileHours: 6, youtubeMaxReconciliationsPerCycle: 5,
+      youtubeMaxMigrationReconciliationsPerCycle: 100, youtubeMaxPlaylistPages: 3,
+      youtubeDailyQuotaUnits: 10_000, youtubeQuotaReserveUnits: 1_000,
+      youtubeStatisticsDailyQuotaUnits: 10_000, youtubeStatisticsReserveUnits: 1_000,
+      channelTimeoutMs: 1000,
+    },
+    stateFile, youtubeDataApiClient: api, now: () => now,
+  });
+
+  const failed = await runner.runYoutubeDataApiCycle({}, kv, now);
+  assert.equal(failed.outcome, 'partial');
+  let state = await stateFile.read();
+  assert.equal(state.youtubeDataApi.lastError.category, 'not-found');
+  assert.equal(state.youtubeDataApi.quota.general.failures, 1);
+
+  fail = false;
+  const recovered = await runner.runYoutubeDataApiCycle({}, kv, now + 300_000);
+  assert.equal(recovered.outcome, 'ok');
+  state = await stateFile.read();
+  assert.equal(state.youtubeDataApi.lastError, null);
+  assert.equal(state.youtubeDataApi.quota.general.failures, 1, 'historical failure count remains available');
+});
+
 test('an unchanged detector baseline cannot suppress an established channel migration catch-up', async (t) => {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tubepulse-data-api-migration-'));
   t.after(() => fs.rm(dataDir, { recursive: true, force: true }));

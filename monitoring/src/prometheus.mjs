@@ -75,7 +75,9 @@ export function prometheusText({ snapshot, collector }) {
   metric('tubepulse_authority_remote_available', bool(host.authority?.remoteAvailable));
   metric('tubepulse_authority_current', bool(host.authority?.current));
   metric('tubepulse_authority_pending_backup_keys', host.authority?.pendingBackupKeys);
+  metric('tubepulse_authority_pending_backup_consecutive_samples', host.authority?.pendingBackupConsecutiveSamples);
   metric('tubepulse_authority_transaction_active', bool(host.authority?.transactionActive));
+  metric('tubepulse_authority_transaction_active_consecutive_samples', host.authority?.transactionActiveConsecutiveSamples);
   metric('tubepulse_authority_lease_active', bool(host.authority?.leaseActive));
   metric('tubepulse_authority_backend_ready', bool(host.authority?.backendReady));
   for (const field of ['total', 'publication', 'api']) metric('tubepulse_authority_d1_estimated_rows', host.authority?.estimatedRows?.[field], { kind: field });

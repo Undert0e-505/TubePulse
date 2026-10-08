@@ -73,12 +73,32 @@ test('aggregate monitoring counts profiles and subscriptions without exposing re
   assert.equal(payload.notifications.pending, 2);
   assert.equal(payload.notifications.durableBacklog, 1);
   assert.equal(payload.notifications.oldestPendingAgeSeconds, 75);
+  assert.equal(payload.youtube.general.failures, 1, 'daily failure history remains visible');
+  assert.equal(payload.youtube.lastErrorPresent, false, 'resolved failures are not active incidents');
   assert.equal(payload.authority.backendReady, true);
   assertAggregateMonitoringSafe(payload);
   const serialized = JSON.stringify(payload);
   for (const secret of ['private-install', 'private-fcm', 'UCprivate', 'private title', 'private-video']) {
     assert.equal(serialized.includes(secret), false);
   }
+});
+
+test('aggregate monitoring distinguishes a current YouTube error from cumulative failure history', async () => {
+  const payload = await collectAggregateMonitoring({
+    adapter: new MemoryAdapter({ 'channels:active': '[]' }),
+    nowMs: Date.parse('2026-10-08T05:00:00Z'),
+    localStatus: {
+      scheduler: {
+        youtubeDataApi: {
+          lastError: { at: '2026-10-08T04:59:00Z', category: 'network' },
+          quota: { general: { failures: 7 }, statistics: { failures: 2 } },
+        },
+      },
+    },
+  });
+  assert.equal(payload.youtube.lastErrorPresent, true);
+  assert.equal(payload.youtube.general.failures, 7);
+  assert.equal(payload.youtube.statistics.failures, 2);
 });
 
 test('aggregate monitoring preserves explicit zero and tolerates invalid rows', async () => {

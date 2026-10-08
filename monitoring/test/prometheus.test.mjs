@@ -27,7 +27,14 @@ test('Prometheus exposition contains aggregate labels and excludes identifiers',
         },
         youtube: { general: {}, statistics: {} },
         notifications: { pending: 2, oldestPendingAgeSeconds: 75, durableBacklog: 1 },
-        authority: { estimatedRows: {}, limits: {} },
+        authority: {
+          pendingBackupKeys: 2,
+          pendingBackupConsecutiveSamples: 1,
+          transactionActive: true,
+          transactionActiveConsecutiveSamples: 1,
+          estimatedRows: {},
+          limits: {},
+        },
       },
       cloudflare: {
         window: { workers: [{ script: 'tubepulse-api', status: 'success', requests: 5 }], d1: {}, durableObjects: {} },
@@ -46,5 +53,9 @@ test('Prometheus exposition contains aggregate labels and excludes identifiers',
   assert.match(metrics, /tubepulse_notifications_pending 2/);
   assert.match(metrics, /tubepulse_notifications_oldest_pending_age_seconds 75/);
   assert.match(metrics, /tubepulse_notifications_durable_backlog 1/);
+  assert.match(metrics, /tubepulse_authority_pending_backup_keys 2/);
+  assert.match(metrics, /tubepulse_authority_pending_backup_consecutive_samples 1/);
+  assert.match(metrics, /tubepulse_authority_transaction_active 1/);
+  assert.match(metrics, /tubepulse_authority_transaction_active_consecutive_samples 1/);
   assert.doesNotMatch(metrics, /deviceId|channelId|fcmToken|UC[A-Za-z0-9_-]{20}/);
 });

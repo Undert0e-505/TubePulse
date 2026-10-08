@@ -57,3 +57,47 @@ test('intervals are aligned and non-overlapping', () => {
     startMs: Date.parse('2026-10-06T11:00:00Z'), endMs: Date.parse('2026-10-06T11:05:00Z'),
   });
 });
+
+test('D1 queue and transaction activity become actionable only after consecutive successful collector samples', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tubepulse-collector-pending-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const tokenFile = path.join(root, 'token.txt');
+  fs.writeFileSync(tokenFile, 'test-token');
+  let pendingBackupKeys = 10;
+  let transactionActive = true;
+  const fetchImpl = async (url) => {
+    if (String(url).includes('host.test')) {
+      return jsonResponse({ privacy: 'aggregate-only', authority: { pendingBackupKeys, transactionActive } });
+    }
+    return jsonResponse({ data: { viewer: { accounts: [{
+      workerWindow: [], workerDay: [], d1Window: [], d1Day: [], d1Storage: [],
+      doInvocationsWindow: [], doInvocationsDay: [], doPeriodicWindow: [], doPeriodicDay: [], doStorage: [],
+    }] } } });
+  };
+  const config = {
+    port: 9464, hostStatusUrl: 'http://host.test/monitoring', accountId: 'a'.repeat(32),
+    d1DatabaseId: '11111111-2222-3333-4444-555555555555', workerScript: 'tubepulse-api', tokenFile,
+    snapshotDir: path.join(root, 'snapshots'), stateFile: path.join(root, 'collector', 'state.json'),
+    cadenceMs: 300_000, analyticsDelayMs: 600_000, retentionDays: 1095,
+    limits: { d1RowsWritten: 100000, d1RowsRead: 5000000, workerRequests: 100000 },
+  };
+  const firstTime = Date.parse('2026-10-08T05:00:00Z');
+  const collector = createCollector({ config, fetchImpl, now: () => firstTime });
+
+  await collector.collect(firstTime);
+  assert.match(collector.metrics(), /tubepulse_authority_pending_backup_keys 10/);
+  assert.match(collector.metrics(), /tubepulse_authority_pending_backup_consecutive_samples 1/);
+  assert.match(collector.metrics(), /tubepulse_authority_transaction_active_consecutive_samples 1/);
+
+  const restarted = createCollector({ config, fetchImpl, now: () => firstTime + 300_000 });
+  await restarted.collect(firstTime + 300_000);
+  assert.match(restarted.metrics(), /tubepulse_authority_pending_backup_consecutive_samples 2/);
+  assert.match(restarted.metrics(), /tubepulse_authority_transaction_active_consecutive_samples 2/);
+
+  pendingBackupKeys = 0;
+  transactionActive = false;
+  await restarted.collect(firstTime + 600_000);
+  assert.match(restarted.metrics(), /tubepulse_authority_pending_backup_keys 0/);
+  assert.match(restarted.metrics(), /tubepulse_authority_pending_backup_consecutive_samples 0/);
+  assert.match(restarted.metrics(), /tubepulse_authority_transaction_active_consecutive_samples 0/);
+});

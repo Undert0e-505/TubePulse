@@ -988,6 +988,7 @@ export class HomeSchedulerRunner {
       const uploadsPlaylistId = item.contentDetails?.relatedPlaylists?.uploads || previous.uploadsPlaylistId || null;
       const baselineMissing = !Number.isFinite(Number(previous.videoCount));
       const changed = !baselineMissing && Number(previous.videoCount) !== videoCount;
+      const confirmedEmpty = Number.isFinite(videoCount) && videoCount === 0;
       const lastReconciled = Date.parse(previous.lastReconciledAt || '');
       const safetyDue = !Number.isFinite(lastReconciled) || this.now() - lastReconciled >= safetyMs;
       health.channels[channelId] = {
@@ -999,8 +1000,19 @@ export class HomeSchedulerRunner {
         subscriberCount: item.statistics?.subscriberCount ?? null,
         hiddenSubscriberCount: Boolean(item.statistics?.hiddenSubscriberCount),
         lastDetectorAt: iso(this.now()),
+        ...(confirmedEmpty ? {
+          lastReconciledAt: iso(this.now()),
+          lastReconcileOutcome: 'empty',
+          lastPageCount: 0,
+          paginationBoundReached: false,
+        } : {}),
       };
-      if (uploadsPlaylistId && (baselineMissing || changed || safetyDue)) {
+      // A valid zero-video channel has no uploads to enumerate. Some such
+      // channels return 404 for their otherwise valid uploads playlist, so
+      // record an empty successful baseline without spending another quota
+      // unit. A later 0 -> 1 detector change still enters reconciliation and
+      // discovers the first upload normally.
+      if (!confirmedEmpty && uploadsPlaylistId && (baselineMissing || changed || safetyDue)) {
         candidates.push({ channelId, baselineMissing, changed, safetyDue, uploadsPlaylistId, lastReconciled });
       }
     }
@@ -1067,6 +1079,7 @@ export class HomeSchedulerRunner {
     const due = selectDueMetricVideos(channelRecents, health.metricPoll, scheduledTime, { newestOnly });
     let statsMethod = health.statsMethod;
     let statisticsRequests = 0;
+    let unresolvedStatisticsFailure = false;
     const allStatistics = new Map();
     for (const entries of chunked(due, 50)) {
       try {
@@ -1084,6 +1097,7 @@ export class HomeSchedulerRunner {
         for (const [videoId, metrics] of normalizeStatistics(payload)) allStatistics.set(videoId, metrics);
       } catch (error) {
         await this.recordYoutubeApiFailure(statsMethod === 'batchGetStats' ? 'statistics' : 'general', error);
+        unresolvedStatisticsFailure = true;
         break;
       }
     }
@@ -1103,7 +1117,9 @@ export class HomeSchedulerRunner {
     }
     health.metricPoll = pruneMetricPollToVisibleVideos(health.metricPoll, channelRecents);
     health.lastGoodAt = iso(this.now());
-    health.lastError = null;
+    if (!reconcileResults.some((entry) => entry.outcome === 'error') && !unresolvedStatisticsFailure) {
+      health.lastError = null;
+    }
     health.lastCycle = {
       scheduledAt: iso(scheduledTime), finishedAt: iso(this.now()), detectorRequests: Math.ceil(channels.length / 50),
       activeCount: active.length, uniqueActiveCount: channels.length,
