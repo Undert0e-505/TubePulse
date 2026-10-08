@@ -5,232 +5,274 @@
   "graphTooltip": 1,
   "id": null,
   "links": [
+    { "title": "Diagnostics", "type": "link", "url": "/d/tubepulse-diagnostics/tubepulse-diagnostics", "targetBlank": false },
     { "title": "Prometheus", "type": "link", "url": "http://127.0.0.1:9090", "targetBlank": true }
   ],
   "panels": [
     {
-      "type": "stat", "title": "Host ready/current", "description": "Both the local host service and authority replication must be current.",
-      "gridPos": { "x": 0, "y": 0, "w": 4, "h": 4 },
-      "targets": [{ "expr": "tubepulse_host_ready * tubepulse_host_authority_current", "legendFormat": "ready/current", "refId": "A" }],
-      "fieldConfig": { "defaults": { "mappings": [{ "type": "value", "options": { "0": { "text": "NOT READY", "color": "red" }, "1": { "text": "READY", "color": "green" } } }], "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] } }, "overrides": [] },
-      "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "center", "reduceOptions": { "calcs": ["lastNotNull"], "values": false } }
+      "id": 1,
+      "type": "stat",
+      "title": "Overall health",
+      "description": "Green means the service and all warning signals are clear. Amber means core service remains available but an actionable warning needs review. Red is reserved for core availability faults or dangerous budget use. Missing data is never treated as healthy.",
+      "gridPos": { "x": 0, "y": 0, "w": 6, "h": 4 },
+      "targets": [
+        {
+          "expr": "(tubepulse_collector_collection_success * tubepulse_collector_host_collection_success * tubepulse_host_ready * tubepulse_host_authority_current * tubepulse_host_scheduler_active * tubepulse_authority_backend_ready * tubepulse_notifications_barrier_healthy * (tubepulse_host_last_error_present == bool 0) * ((time() - tubepulse_collector_last_success_timestamp_seconds) < bool 960) * (scalar(sum(tubepulse_cloudflare_worker_errors{period=\"window\"})) == bool 0) * (scalar(tubepulse:d1_write_budget_ratio) < bool 0.9) * (scalar(tubepulse:worker_request_budget_ratio) < bool 0.9) * (scalar(max(tubepulse_youtube_quota_used / tubepulse_youtube_quota_limit)) < bool 0.9)) * (1 + (tubepulse_collector_cloudflare_collection_success * tubepulse_subscription_integrity_consistent * (tubepulse_authority_pending_backup_consecutive_samples < bool 2) * (tubepulse_authority_transaction_active_consecutive_samples < bool 2) * (tubepulse_notifications_durable_backlog == bool 0) * (tubepulse_notifications_callback_pending == bool 0) * (tubepulse_notifications_ambiguous_sending == bool 0) * (tubepulse_notifications_retained_failures == bool 0) * (tubepulse_notifications_failed == bool 0) * (tubepulse_youtube_last_error_present == bool 0) * ((time() - tubepulse_collector_last_success_timestamp_seconds) < bool 660) * (scalar(tubepulse:d1_write_budget_ratio) < bool 0.7) * (scalar(tubepulse:d1_read_budget_ratio) < bool 0.7) * (scalar(tubepulse:d1_write_projected_end_of_day / on() tubepulse_guardrail{resource=\"d1_rows_written_day\"}) < bool 0.7) * (scalar(tubepulse:worker_request_budget_ratio) < bool 0.7) * (scalar(max(tubepulse_youtube_quota_used / tubepulse_youtube_quota_limit)) < bool 0.7) * (scalar(sum(tubepulse_cloudflare_worker_requests{period=\"window\",script!=\"tubepulse-api\"}) or vector(0)) == bool 0)))",
+          "legendFormat": "service",
+          "refId": "A",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "NO DATA",
+          "mappings": [{ "type": "value", "options": { "0": { "text": "FAULT", "color": "red" }, "1": { "text": "ATTENTION", "color": "orange" }, "2": { "text": "HEALTHY", "color": "green" } } }],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "orange", "value": 1 }, { "color": "green", "value": 2 }] }
+        },
+        "overrides": []
+      },
+      "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "center", "textMode": "value", "reduceOptions": { "calcs": ["lastNotNull"], "values": false } }
     },
     {
-      "type": "stat", "title": "Collector freshness", "description": "Age of the latest fully successful five-minute aggregate collection.",
-      "gridPos": { "x": 4, "y": 0, "w": 4, "h": 4 },
-      "targets": [{ "expr": "time() - tubepulse_collector_last_success_timestamp_seconds", "legendFormat": "age", "refId": "A" }],
-      "fieldConfig": { "defaults": { "unit": "s", "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 600 }, { "color": "red", "value": 1200 }] } }, "overrides": [] },
-      "options": { "colorMode": "background", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"], "values": false } }
+      "id": 2,
+      "type": "stat",
+      "title": "Data freshness",
+      "description": "Age of the last fully successful aggregate collection. The collector runs every five minutes; amber allows one delayed interval and red indicates multiple missed intervals.",
+      "gridPos": { "x": 6, "y": 0, "w": 4, "h": 4 },
+      "targets": [{ "expr": "time() - tubepulse_collector_last_success_timestamp_seconds", "legendFormat": "last success", "refId": "A", "instant": true, "range": false }],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "noValue": "NO DATA", "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 660 }, { "color": "red", "value": 960 }] } },
+        "overrides": []
+      },
+      "options": { "colorMode": "background", "graphMode": "area", "justifyMode": "center", "textMode": "value_and_name", "reduceOptions": { "calcs": ["lastNotNull"], "values": false } }
     },
     {
-      "type": "stat", "title": "Cloudflare analytics", "description": "GraphQL analytics are delayed and approximate; red means the collector is serving the last good sample.",
-      "gridPos": { "x": 8, "y": 0, "w": 4, "h": 4 },
-      "targets": [{ "expr": "tubepulse_collector_cloudflare_collection_success", "legendFormat": "collection", "refId": "A" }],
-      "fieldConfig": { "defaults": { "mappings": [{ "type": "value", "options": { "0": { "text": "STALE", "color": "red" }, "1": { "text": "CURRENT", "color": "green" } } }] }, "overrides": [] },
-      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"], "values": false } }
+      "id": 3,
+      "type": "stat",
+      "title": "Host authority",
+      "description": "Confirms that the local host is ready, authoritative data is current and the D1 backup backend is ready.",
+      "gridPos": { "x": 10, "y": 0, "w": 5, "h": 4 },
+      "targets": [{ "expr": "tubepulse_host_ready * tubepulse_host_authority_current * tubepulse_authority_backend_ready", "legendFormat": "host route/current", "refId": "A", "instant": true, "range": false }],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "NO DATA",
+          "mappings": [{ "type": "value", "options": { "0": { "text": "NOT CURRENT", "color": "red" }, "1": { "text": "CURRENT", "color": "green" } } }],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] }
+        },
+        "overrides": []
+      },
+      "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "center", "textMode": "value_and_name", "reduceOptions": { "calcs": ["lastNotNull"], "values": false } }
     },
     {
-      "type": "gauge", "title": "D1 writes today", "description": "UTC-day D1 rows written from Cloudflare analytics versus the configurable free-plan guardrail.",
-      "gridPos": { "x": 12, "y": 0, "w": 6, "h": 4 },
-      "targets": [{ "expr": "100 * tubepulse:d1_write_budget_ratio", "legendFormat": "used", "refId": "A" }],
-      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 65 }, { "color": "red", "value": 85 }] } }, "overrides": [] },
+      "id": 4,
+      "type": "stat",
+      "title": "Active risks",
+      "description": "Compact severity for queues, transactions, integrity, API/Worker failures, notification delivery and budget danger. Warning-only conditions are amber; red indicates a core fault. Use Diagnostics for detail.",
+      "gridPos": { "x": 15, "y": 0, "w": 9, "h": 4 },
+      "targets": [{
+        "expr": "(tubepulse_collector_collection_success * tubepulse_collector_host_collection_success * tubepulse_host_ready * tubepulse_host_authority_current * tubepulse_host_scheduler_active * tubepulse_authority_backend_ready * tubepulse_notifications_barrier_healthy * (tubepulse_host_last_error_present == bool 0) * ((time() - tubepulse_collector_last_success_timestamp_seconds) < bool 960) * (scalar(sum(tubepulse_cloudflare_worker_errors{period=\"window\"})) == bool 0) * (scalar(tubepulse:d1_write_budget_ratio) < bool 0.9) * (scalar(tubepulse:worker_request_budget_ratio) < bool 0.9) * (scalar(max(tubepulse_youtube_quota_used / tubepulse_youtube_quota_limit)) < bool 0.9)) * (1 + (tubepulse_collector_cloudflare_collection_success * tubepulse_subscription_integrity_consistent * (tubepulse_authority_pending_backup_consecutive_samples < bool 2) * (tubepulse_authority_transaction_active_consecutive_samples < bool 2) * (tubepulse_notifications_durable_backlog == bool 0) * (tubepulse_notifications_callback_pending == bool 0) * (tubepulse_notifications_ambiguous_sending == bool 0) * (tubepulse_notifications_retained_failures == bool 0) * (tubepulse_notifications_failed == bool 0) * (tubepulse_youtube_last_error_present == bool 0) * ((time() - tubepulse_collector_last_success_timestamp_seconds) < bool 660) * (scalar(tubepulse:d1_write_budget_ratio) < bool 0.7) * (scalar(tubepulse:d1_read_budget_ratio) < bool 0.7) * (scalar(tubepulse:d1_write_projected_end_of_day / on() tubepulse_guardrail{resource=\"d1_rows_written_day\"}) < bool 0.7) * (scalar(tubepulse:worker_request_budget_ratio) < bool 0.7) * (scalar(max(tubepulse_youtube_quota_used / tubepulse_youtube_quota_limit)) < bool 0.7) * (scalar(sum(tubepulse_cloudflare_worker_requests{period=\"window\",script!=\"tubepulse-api\"}) or vector(0)) == bool 0)))",
+        "legendFormat": "queues / errors / integrity", "refId": "A", "instant": true, "range": false
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "NO DATA",
+          "mappings": [{ "type": "value", "options": { "0": { "text": "CRITICAL", "color": "red" }, "1": { "text": "REVIEW BELOW", "color": "orange" }, "2": { "text": "CLEAR", "color": "green" } } }],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "orange", "value": 1 }, { "color": "green", "value": 2 }] }
+        },
+        "overrides": []
+      },
+      "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "center", "textMode": "value_and_name", "reduceOptions": { "calcs": ["lastNotNull"], "values": false } }
+    },
+    {
+      "id": 5, "type": "stat", "title": "Active 24h", "description": "Aggregate installations active during the last 24 hours.",
+      "gridPos": { "x": 0, "y": 4, "w": 3, "h": 4 },
+      "targets": [{ "expr": "tubepulse_installs_active{window=\"h24\"}", "legendFormat": "devices", "refId": "A", "instant": true, "range": false }],
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "blue" } }, "overrides": [] },
+      "options": { "colorMode": "value", "graphMode": "none", "justifyMode": "center", "textMode": "value", "text": { "valueSize": 32 }, "reduceOptions": { "calcs": ["lastNotNull"], "values": false } }
+    },
+    {
+      "id": 14, "type": "stat", "title": "Active 7d", "description": "Aggregate installations active during the last seven days.",
+      "gridPos": { "x": 3, "y": 4, "w": 3, "h": 4 },
+      "targets": [{ "expr": "tubepulse_installs_active{window=\"d7\"}", "legendFormat": "devices", "refId": "A", "instant": true, "range": false }],
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "blue" } }, "overrides": [] },
+      "options": { "colorMode": "value", "graphMode": "none", "justifyMode": "center", "textMode": "value", "text": { "valueSize": 32 }, "reduceOptions": { "calcs": ["lastNotNull"], "values": false } }
+    },
+    {
+      "id": 15, "type": "stat", "title": "Registered", "description": "Total aggregate registered installations.",
+      "gridPos": { "x": 6, "y": 4, "w": 3, "h": 4 },
+      "targets": [{ "expr": "tubepulse_installs_total", "legendFormat": "devices", "refId": "A", "instant": true, "range": false }],
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "blue" } }, "overrides": [] },
+      "options": { "colorMode": "value", "graphMode": "none", "justifyMode": "center", "textMode": "value", "text": { "valueSize": 32 }, "reduceOptions": { "calcs": ["lastNotNull"], "values": false } }
+    },
+    {
+      "id": 16, "type": "stat", "title": "Push capable", "description": "Aggregate installations with a current push token.",
+      "gridPos": { "x": 9, "y": 4, "w": 3, "h": 4 },
+      "targets": [{ "expr": "tubepulse_installs_push_capable", "legendFormat": "devices", "refId": "A", "instant": true, "range": false }],
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "blue" } }, "overrides": [] },
+      "options": { "colorMode": "value", "graphMode": "none", "justifyMode": "center", "textMode": "value", "text": { "valueSize": 32 }, "reduceOptions": { "calcs": ["lastNotNull"], "values": false } }
+    },
+    {
+      "id": 17, "type": "stat", "title": "Active channels", "description": "Unique channels currently active across aggregate subscription state.",
+      "gridPos": { "x": 12, "y": 4, "w": 4, "h": 4 },
+      "targets": [{ "expr": "tubepulse_channels_active", "legendFormat": "channels", "refId": "A", "instant": true, "range": false }],
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "blue" } }, "overrides": [] },
+      "options": { "colorMode": "value", "graphMode": "none", "justifyMode": "center", "textMode": "value", "text": { "valueSize": 32 }, "reduceOptions": { "calcs": ["lastNotNull"], "values": false } }
+    },
+    {
+      "id": 18, "type": "stat", "title": "Memberships", "description": "Aggregate configured installation-to-channel membership relationships.",
+      "gridPos": { "x": 16, "y": 4, "w": 4, "h": 4 },
+      "targets": [{ "expr": "tubepulse_subscriptions_configured_memberships", "legendFormat": "configured", "refId": "A", "instant": true, "range": false }],
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "blue" } }, "overrides": [] },
+      "options": { "colorMode": "value", "graphMode": "none", "justifyMode": "center", "textMode": "value", "text": { "valueSize": 32 }, "reduceOptions": { "calcs": ["lastNotNull"], "values": false } }
+    },
+    {
+      "id": 19, "type": "stat", "title": "Max / install", "description": "Largest aggregate channel count configured by any installation. This is a scale indicator, not a fault threshold.",
+      "gridPos": { "x": 20, "y": 4, "w": 4, "h": 4 },
+      "targets": [{ "expr": "tubepulse_channels_per_install{statistic=\"max\"}", "legendFormat": "channels", "refId": "A", "instant": true, "range": false }],
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "blue" } }, "overrides": [] },
+      "options": { "colorMode": "value", "graphMode": "none", "justifyMode": "center", "textMode": "value", "text": { "valueSize": 32 }, "reduceOptions": { "calcs": ["lastNotNull"], "values": false } }
+    },
+    {
+      "id": 6,
+      "type": "gauge",
+      "title": "D1 writes today",
+      "description": "UTC-day rows written as a percentage of the configured daily guardrail. Cloudflare analytics are delayed and approximate.",
+      "gridPos": { "x": 0, "y": 8, "w": 6, "h": 5 },
+      "targets": [{ "expr": "100 * tubepulse:d1_write_budget_ratio", "legendFormat": "used", "refId": "A", "instant": true, "range": false }],
+      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100, "noValue": "NO DATA", "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 70 }, { "color": "red", "value": 90 }] } }, "overrides": [] },
       "options": { "reduceOptions": { "calcs": ["lastNotNull"], "values": false }, "showThresholdLabels": false, "showThresholdMarkers": true }
     },
     {
-      "type": "stat", "title": "Authority queue/transaction", "description": "Pending D1 backup keys and active transactions become actionable after two consecutive collector samples. Brief lease activity is normal.",
-      "gridPos": { "x": 18, "y": 0, "w": 6, "h": 4 },
-      "targets": [
-        { "expr": "tubepulse_authority_pending_backup_keys and on() (tubepulse_authority_pending_backup_consecutive_samples >= 2)", "legendFormat": "persistent pending keys", "refId": "A" },
-        { "expr": "tubepulse_authority_transaction_active and on() (tubepulse_authority_transaction_active_consecutive_samples >= 2)", "legendFormat": "persistent transaction", "refId": "B" }
-      ],
-      "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 1 }] } }, "overrides": [] },
-      "options": { "colorMode": "value", "graphMode": "none", "orientation": "horizontal", "reduceOptions": { "calcs": ["lastNotNull"], "values": false } }
+      "id": 7,
+      "type": "gauge",
+      "title": "D1 projected EOD",
+      "description": "Projected UTC end-of-day D1 writes as a percentage of the configured daily guardrail. The projection is stabilized during the first UTC hour.",
+      "gridPos": { "x": 6, "y": 8, "w": 6, "h": 5 },
+      "targets": [{ "expr": "100 * tubepulse:d1_write_projected_end_of_day / on() tubepulse_guardrail{resource=\"d1_rows_written_day\"}", "legendFormat": "projected", "refId": "A", "instant": true, "range": false }],
+      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100, "noValue": "NO DATA", "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 70 }, { "color": "red", "value": 90 }] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "values": false }, "showThresholdLabels": false, "showThresholdMarkers": true }
     },
     {
-      "type": "stat", "title": "Install aggregates", "description": "Aggregate-only registered, push-capable, active and newly registered installation counts.",
-      "gridPos": { "x": 0, "y": 4, "w": 8, "h": 5 },
-      "targets": [
-        { "expr": "tubepulse_installs_total", "legendFormat": "registered", "refId": "A" },
-        { "expr": "tubepulse_installs_push_capable", "legendFormat": "push capable", "refId": "B" },
-        { "expr": "tubepulse_installs_active{window=\"h24\"}", "legendFormat": "active 24h", "refId": "C" },
-        { "expr": "tubepulse_installs_new{window=\"d7\"}", "legendFormat": "new 7d", "refId": "D" }
-      ],
-      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
-      "options": { "colorMode": "value", "graphMode": "area", "orientation": "horizontal", "reduceOptions": { "calcs": ["lastNotNull"], "values": false } }
-    },
-    {
-      "type": "bargauge", "title": "App versions", "description": "Aggregate installation count by reported app version; no installation identifiers are labels.",
-      "gridPos": { "x": 8, "y": 4, "w": 8, "h": 5 },
-      "targets": [{ "expr": "tubepulse_installs_app_version", "legendFormat": "{{version}}", "refId": "A" }],
-      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "id": 8,
+      "type": "bargauge",
+      "title": "YouTube quota",
+      "description": "Persisted YouTube Data API quota consumption relative to each configured limit. General and statistics quotas are independent.",
+      "gridPos": { "x": 12, "y": 8, "w": 6, "h": 5 },
+      "targets": [{ "expr": "100 * tubepulse_youtube_quota_used / tubepulse_youtube_quota_limit", "legendFormat": "{{quota}}", "refId": "A", "instant": true, "range": false }],
+      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100, "noValue": "NO DATA", "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 70 }, { "color": "red", "value": 90 }] } }, "overrides": [] },
       "options": { "displayMode": "gradient", "orientation": "horizontal", "reduceOptions": { "calcs": ["lastNotNull"], "values": false }, "showUnfilled": true }
     },
     {
-      "type": "stat", "title": "Channels and subscriptions", "description": "Active channels, configured device-side memberships, inverse subscriber-index memberships, and per-install distribution. Membership totals are relationships and are not expected to equal the unique active-channel count.",
-      "gridPos": { "x": 16, "y": 4, "w": 8, "h": 8 },
+      "id": 9,
+      "type": "stat",
+      "title": "Notifications",
+      "description": "Delivery is healthy only when the visibility barrier is healthy and no durable, callback, ambiguous-send, retained-failure or last-cycle failure is pending.",
+      "gridPos": { "x": 18, "y": 8, "w": 6, "h": 5 },
       "targets": [
-        { "expr": "tubepulse_channels_active", "legendFormat": "active channels", "refId": "A" },
-        { "expr": "tubepulse_subscriptions_configured_memberships", "legendFormat": "configured memberships", "refId": "B" },
-        { "expr": "tubepulse_subscriptions_indexed_memberships", "legendFormat": "indexed memberships", "refId": "C" },
-        { "expr": "tubepulse_channels_per_install{statistic=\"mean\"}", "legendFormat": "mean/install", "refId": "D" },
-        { "expr": "tubepulse_channels_per_install{statistic=\"p95\"}", "legendFormat": "p95/install", "refId": "E" },
-        { "expr": "tubepulse_channels_per_install{statistic=\"max\"}", "legendFormat": "max/install", "refId": "F" },
-        { "expr": "tubepulse_channels_per_install{statistic=\"zero\"}", "legendFormat": "zero-channel", "refId": "G" }
+        { "expr": "tubepulse_notifications_barrier_healthy * (tubepulse_notifications_durable_backlog == bool 0) * (tubepulse_notifications_callback_pending == bool 0) * (tubepulse_notifications_ambiguous_sending == bool 0) * (tubepulse_notifications_retained_failures == bool 0) * (tubepulse_notifications_failed == bool 0)", "legendFormat": "delivery", "refId": "A", "instant": true, "range": false },
+        { "expr": "tubepulse_notifications_durable_backlog", "legendFormat": "durable backlog", "refId": "B", "instant": true, "range": false }
       ],
-      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
-      "options": { "colorMode": "value", "graphMode": "none", "orientation": "horizontal", "textMode": "value_and_name", "wideLayout": true, "text": { "titleSize": 16, "valueSize": 22 }, "reduceOptions": { "calcs": ["lastNotNull"], "values": false } }
+      "fieldConfig": {
+        "defaults": { "noValue": "NO DATA" },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "delivery" }, "properties": [
+            { "id": "mappings", "value": [{ "type": "value", "options": { "0": { "text": "ATTENTION", "color": "red" }, "1": { "text": "HEALTHY", "color": "green" } } }] },
+            { "id": "thresholds", "value": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] } }
+          ] },
+          { "matcher": { "id": "byName", "options": "durable backlog" }, "properties": [
+            { "id": "thresholds", "value": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] } }
+          ] }
+        ]
+      },
+      "options": { "colorMode": "value", "graphMode": "none", "justifyMode": "center", "orientation": "horizontal", "textMode": "value_and_name", "wideLayout": true, "text": { "titleSize": 15, "valueSize": 24 }, "reduceOptions": { "calcs": ["lastNotNull"], "values": false } }
     },
     {
-      "type": "timeseries", "title": "Worker traffic by script/status", "description": "Non-overlapping finalized five-minute Cloudflare windows. Activity on triggerless legacy scripts is visible by script name.",
-      "gridPos": { "x": 0, "y": 12, "w": 12, "h": 7 },
-      "targets": [{ "expr": "tubepulse_cloudflare_worker_requests{period=\"window\"}", "legendFormat": "{{script}} / {{status}}", "refId": "A" }],
-      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1 } }, "overrides": [] },
-      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
+      "id": 10,
+      "type": "timeseries",
+      "title": "Worker requests / 5m",
+      "description": "Aggregate Worker request volume in each finalized five-minute Cloudflare window, providing a directly comparable request-rate trend.",
+      "gridPos": { "x": 0, "y": 13, "w": 8, "h": 6 },
+      "targets": [{ "expr": "sum by (status) (tubepulse_cloudflare_worker_requests{period=\"window\"})", "legendFormat": "{{status}}", "refId": "A" }],
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "blue" }, "custom": { "drawStyle": "bars", "fillOpacity": 30, "lineWidth": 1, "showPoints": "never" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "calcs": [] }, "tooltip": { "mode": "multi" } }
     },
     {
-      "type": "timeseries", "title": "Worker errors and legacy activity", "description": "Errors and requests to scripts other than the active public API. Expected legacy traffic is zero unless an explicit rollback/test is active.",
-      "gridPos": { "x": 12, "y": 12, "w": 12, "h": 7 },
-      "targets": [
-        { "expr": "tubepulse_cloudflare_worker_errors{period=\"window\"}", "legendFormat": "errors {{script}}/{{status}}", "refId": "A" },
-        { "expr": "tubepulse_cloudflare_worker_requests{period=\"window\",script!=\"tubepulse-api\"}", "legendFormat": "legacy {{script}}/{{status}}", "refId": "B" }
-      ],
-      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
-      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
-    },
-    {
-      "type": "timeseries", "title": "D1 rows per finalized window", "description": "Rows read/written in each delayed finalized Cloudflare analytics window; batching does not reduce billed rows.",
-      "gridPos": { "x": 0, "y": 19, "w": 12, "h": 7 },
+      "id": 11,
+      "type": "timeseries",
+      "title": "D1 rows / window",
+      "description": "Rows read and written in each delayed, finalized five-minute Cloudflare analytics window.",
+      "gridPos": { "x": 8, "y": 13, "w": 8, "h": 6 },
       "targets": [
         { "expr": "tubepulse_cloudflare_d1_rows_written{period=\"window\"}", "legendFormat": "written", "refId": "A" },
         { "expr": "tubepulse_cloudflare_d1_rows_read{period=\"window\"}", "legendFormat": "read", "refId": "B" }
       ],
-      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "bars", "fillOpacity": 30 } }, "overrides": [] },
-      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
-    },
-    {
-      "type": "stat", "title": "D1 UTC-day usage/projection", "description": "Raw day counts plus a projection clamped during the first UTC hour to avoid unstable division. Cloudflare analytics are approximate, not billing authority.",
-      "gridPos": { "x": 12, "y": 19, "w": 12, "h": 7 },
-      "targets": [
-        { "expr": "tubepulse:d1_rows_written_day", "legendFormat": "rows written today", "refId": "A" },
-        { "expr": "tubepulse:d1_write_projected_end_of_day", "legendFormat": "projected end of day", "refId": "B" },
-        { "expr": "tubepulse:d1_rows_read_day", "legendFormat": "rows read today", "refId": "C" },
-        { "expr": "tubepulse_cloudflare_d1_storage_bytes", "legendFormat": "database bytes", "refId": "D" }
-      ],
-      "fieldConfig": { "defaults": { "unit": "short", "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 45000 }, { "color": "red", "value": 90000 }] } }, "overrides": [{ "matcher": { "id": "byName", "options": "database bytes" }, "properties": [{ "id": "unit", "value": "bytes" }] }] },
-      "options": { "colorMode": "value", "graphMode": "area", "orientation": "horizontal", "reduceOptions": { "calcs": ["lastNotNull"], "values": false } }
-    },
-    {
-      "type": "timeseries", "title": "Internal D1 safety budgets", "description": "Conservative coordinator row estimates versus stricter publication/total safety caps.",
-      "gridPos": { "x": 0, "y": 26, "w": 12, "h": 7 },
-      "targets": [
-        { "expr": "tubepulse_authority_d1_estimated_rows", "legendFormat": "used {{kind}}", "refId": "A" },
-        { "expr": "tubepulse_authority_d1_estimated_row_limit", "legendFormat": "limit {{kind}}", "refId": "B" }
-      ],
-      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 5 } }, "overrides": [] },
-      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
-    },
-    {
-      "type": "timeseries", "title": "YouTube API quotas and freshness", "description": "Persisted general/statistics usage, configured limits/reserves, failures and last-good age.",
-      "gridPos": { "x": 12, "y": 26, "w": 12, "h": 7 },
-      "targets": [
-        { "expr": "tubepulse_youtube_quota_used", "legendFormat": "used {{quota}}", "refId": "A" },
-        { "expr": "tubepulse_youtube_quota_limit", "legendFormat": "limit {{quota}}", "refId": "B" },
-        { "expr": "tubepulse_youtube_quota_reserve", "legendFormat": "reserve {{quota}}", "refId": "C" },
-        { "expr": "tubepulse_youtube_api_failures", "legendFormat": "failures {{quota}}", "refId": "D" },
-        { "expr": "tubepulse_youtube_last_good_age_seconds", "legendFormat": "last-good age (s)", "refId": "E" }
-      ],
-      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 5 } }, "overrides": [] },
-      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
-    },
-    {
-      "type": "timeseries", "title": "Notification delivery", "description": "Aggregate last-cycle delivery outcomes only; no token, installation or channel labels.",
-      "gridPos": { "x": 0, "y": 33, "w": 12, "h": 7 },
-      "targets": [
-        { "expr": "tubepulse_notifications_queued", "legendFormat": "queued", "refId": "A" },
-        { "expr": "tubepulse_notifications_sent", "legendFormat": "sent", "refId": "B" },
-        { "expr": "tubepulse_notifications_failed", "legendFormat": "failed", "refId": "C" },
-        { "expr": "tubepulse_notifications_suppressed", "legendFormat": "suppressed", "refId": "D" },
-        { "expr": "tubepulse_notifications_recovered", "legendFormat": "recovered", "refId": "E" },
-        { "expr": "tubepulse_notifications_durable_backlog", "legendFormat": "durable backlog", "refId": "F" },
-        { "expr": "tubepulse_notifications_callback_pending", "legendFormat": "callback pending", "refId": "G" },
-        { "expr": "tubepulse_notifications_retained_failures", "legendFormat": "retained failures", "refId": "H" },
-        { "expr": "tubepulse_notifications_transient_nags_expired", "legendFormat": "expired legacy nags", "refId": "I" }
-      ],
-      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
-      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
-    },
-    {
-      "type": "timeseries", "title": "Durable Object aggregate usage", "description": "Verified Cloudflare datasets: invocations, errors, periodic SQL rows/storage units and storage bytes.",
-      "gridPos": { "x": 12, "y": 33, "w": 12, "h": 7 },
-      "targets": [
-        { "expr": "tubepulse_cloudflare_do_requests{period=\"window\"}", "legendFormat": "requests", "refId": "A" },
-        { "expr": "tubepulse_cloudflare_do_errors{period=\"window\"}", "legendFormat": "errors", "refId": "B" },
-        { "expr": "tubepulse_cloudflare_do_rows_read{period=\"window\"}", "legendFormat": "rows read", "refId": "C" },
-        { "expr": "tubepulse_cloudflare_do_rows_written{period=\"window\"}", "legendFormat": "rows written", "refId": "D" },
-        { "expr": "tubepulse_cloudflare_do_storage_bytes", "legendFormat": "storage bytes", "refId": "E" }
-      ],
-      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [{ "matcher": { "id": "byName", "options": "storage bytes" }, "properties": [{ "id": "unit", "value": "bytes" }] }] },
-      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
-    },
-    {
-      "type": "stat", "title": "Cloudflare daily guardrails", "description": "UTC-day raw usage and percentage of configurable plan guardrails. Analytics are delayed/approximate rather than billing authority.",
-      "gridPos": { "x": 0, "y": 40, "w": 8, "h": 7 },
-      "targets": [
-        { "expr": "tubepulse:worker_requests_day", "legendFormat": "Worker requests", "refId": "A" },
-        { "expr": "100 * tubepulse:worker_request_budget_ratio", "legendFormat": "Worker request %", "refId": "B" },
-        { "expr": "100 * tubepulse:d1_read_budget_ratio", "legendFormat": "D1 read %", "refId": "C" },
-        { "expr": "100 * tubepulse:d1_write_budget_ratio", "legendFormat": "D1 write %", "refId": "D" }
-      ],
-      "fieldConfig": { "defaults": { "unit": "short", "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 75 }, { "color": "red", "value": 90 }] } }, "overrides": [
-        { "matcher": { "id": "byName", "options": "Worker request %" }, "properties": [{ "id": "unit", "value": "percent" }] },
-        { "matcher": { "id": "byName", "options": "D1 read %" }, "properties": [{ "id": "unit", "value": "percent" }] },
-        { "matcher": { "id": "byName", "options": "D1 write %" }, "properties": [{ "id": "unit", "value": "percent" }] }
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "bars", "fillOpacity": 28, "lineWidth": 1, "showPoints": "never" } }, "overrides": [
+        { "matcher": { "id": "byName", "options": "written" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "blue" } }] },
+        { "matcher": { "id": "byName", "options": "read" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "purple" } }] }
       ] },
-      "options": { "colorMode": "value", "graphMode": "area", "orientation": "horizontal", "reduceOptions": { "calcs": ["lastNotNull"], "values": false } }
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "calcs": [] }, "tooltip": { "mode": "multi" } }
     },
     {
-      "type": "timeseries", "title": "Worker CPU and subrequests", "description": "Per-script finalized-window subrequests and CPU p50/p99 reported by Cloudflare.",
-      "gridPos": { "x": 8, "y": 40, "w": 8, "h": 7 },
+      "id": 12,
+      "type": "timeseries",
+      "title": "Notification outcomes",
+      "description": "Aggregate outcomes from recent notification cycles. Failures and durable backlog should remain at zero.",
+      "gridPos": { "x": 16, "y": 13, "w": 8, "h": 6 },
       "targets": [
-        { "expr": "tubepulse_cloudflare_worker_subrequests{period=\"window\"}", "legendFormat": "subrequests {{script}}", "refId": "A" },
-        { "expr": "tubepulse_cloudflare_worker_cpu_seconds{period=\"window\"}", "legendFormat": "CPU p{{quantile}} {{script}}", "refId": "B" }
+        { "expr": "tubepulse_notifications_sent", "legendFormat": "sent", "refId": "A" },
+        { "expr": "tubepulse_notifications_failed", "legendFormat": "failed", "refId": "B" },
+        { "expr": "tubepulse_notifications_durable_backlog", "legendFormat": "backlog", "refId": "C" }
       ],
-      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 5 } }, "overrides": [] },
-      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
-    },
-    {
-      "type": "timeseries", "title": "D1 queries and response bytes", "description": "Read/write query totals and batch response bytes per finalized Cloudflare analytics window.",
-      "gridPos": { "x": 16, "y": 40, "w": 8, "h": 7 },
-      "targets": [
-        { "expr": "tubepulse_cloudflare_d1_read_queries{period=\"window\"}", "legendFormat": "read queries", "refId": "A" },
-        { "expr": "tubepulse_cloudflare_d1_write_queries{period=\"window\"}", "legendFormat": "write queries", "refId": "B" },
-        { "expr": "tubepulse_cloudflare_d1_response_bytes{period=\"window\"}", "legendFormat": "response bytes", "refId": "C" }
-      ],
-      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 5 } }, "overrides": [{ "matcher": { "id": "byName", "options": "response bytes" }, "properties": [{ "id": "unit", "value": "bytes" }] }] },
-      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
-    },
-    {
-      "type": "stat", "title": "Subscription index integrity", "description": "Aggregate-only comparison of device-side memberships, inverse channel subscriber indexes, profiles, and the active-channel index. Any nonzero issue persisting for 15 minutes alerts; no identifiers or records are exposed.",
-      "gridPos": { "x": 0, "y": 47, "w": 24, "h": 6 },
-      "targets": [
-        { "expr": "tubepulse_subscription_integrity_consistent", "legendFormat": "consistent (1=yes)", "refId": "A" },
-        { "expr": "tubepulse_subscription_membership_mismatches", "legendFormat": "membership {{direction}}", "refId": "B" },
-        { "expr": "tubepulse_subscription_integrity_issues", "legendFormat": "{{kind}}", "refId": "C" }
-      ],
-      "fieldConfig": { "defaults": { "unit": "short", "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] } }, "overrides": [
-        { "matcher": { "id": "byName", "options": "consistent (1=yes)" }, "properties": [{ "id": "thresholds", "value": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] } }] }
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 12, "lineWidth": 2, "showPoints": "never" } }, "overrides": [
+        { "matcher": { "id": "byName", "options": "sent" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "blue" } }] },
+        { "matcher": { "id": "byName", "options": "failed" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }] },
+        { "matcher": { "id": "byName", "options": "backlog" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } }] }
       ] },
-      "options": { "colorMode": "value", "graphMode": "none", "orientation": "horizontal", "reduceOptions": { "calcs": ["lastNotNull"], "values": false } }
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "calcs": [] }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 13,
+      "type": "stat",
+      "title": "Actionable signals",
+      "description": "Only non-zero signals appear beside the summary. Warning-only counts are amber; core availability or dangerous budget conditions become red. Zero means there is no current queue, transaction, drift, API failure, delivery failure, Worker error or legacy-script traffic.",
+      "gridPos": { "x": 0, "y": 19, "w": 24, "h": 4 },
+      "targets": [
+        { "expr": "tubepulse_host_last_error_present + (tubepulse_authority_pending_backup_consecutive_samples >= bool 2) + (tubepulse_authority_transaction_active_consecutive_samples >= bool 2) + (1 - tubepulse_subscription_integrity_consistent) + tubepulse_youtube_last_error_present + (tubepulse_notifications_failed > bool 0) + (tubepulse_notifications_durable_backlog > bool 0) + (tubepulse_notifications_callback_pending > bool 0) + (tubepulse_notifications_ambiguous_sending > bool 0) + (scalar(sum(tubepulse_cloudflare_worker_errors{period=\"window\"}) or vector(0)) > bool 0) + (scalar(sum(tubepulse_cloudflare_worker_requests{period=\"window\",script!=\"tubepulse-api\"}) or vector(0)) > bool 0) + 1000 * (1 - (tubepulse_collector_collection_success * tubepulse_collector_host_collection_success * tubepulse_host_ready * tubepulse_host_authority_current * tubepulse_host_scheduler_active * tubepulse_authority_backend_ready * tubepulse_notifications_barrier_healthy * (tubepulse_host_last_error_present == bool 0) * ((time() - tubepulse_collector_last_success_timestamp_seconds) < bool 960) * (scalar(sum(tubepulse_cloudflare_worker_errors{period=\"window\"})) == bool 0) * (scalar(tubepulse:d1_write_budget_ratio) < bool 0.9) * (scalar(tubepulse:worker_request_budget_ratio) < bool 0.9) * (scalar(max(tubepulse_youtube_quota_used / tubepulse_youtube_quota_limit)) < bool 0.9)))", "legendFormat": "active signals", "refId": "A", "instant": true, "range": false },
+        { "expr": "tubepulse_authority_pending_backup_keys and on() (tubepulse_authority_pending_backup_consecutive_samples >= 2)", "legendFormat": "D1 persistent queue", "refId": "B", "instant": true, "range": false },
+        { "expr": "tubepulse_authority_transaction_active and on() (tubepulse_authority_transaction_active_consecutive_samples >= 2)", "legendFormat": "D1 persistent transaction", "refId": "C", "instant": true, "range": false },
+        { "expr": "(1 - tubepulse_subscription_integrity_consistent) > 0", "legendFormat": "subscription drift", "refId": "D", "instant": true, "range": false },
+        { "expr": "tubepulse_youtube_last_error_present > 0", "legendFormat": "YouTube current error", "refId": "E", "instant": true, "range": false },
+        { "expr": "tubepulse_notifications_failed > 0", "legendFormat": "notification failures", "refId": "F", "instant": true, "range": false },
+        { "expr": "tubepulse_notifications_durable_backlog > 0", "legendFormat": "notification backlog", "refId": "G", "instant": true, "range": false },
+        { "expr": "sum(tubepulse_cloudflare_worker_errors{period=\"window\"}) > 0", "legendFormat": "Worker errors", "refId": "H", "instant": true, "range": false },
+        { "expr": "sum(tubepulse_cloudflare_worker_requests{period=\"window\",script!=\"tubepulse-api\"}) > 0", "legendFormat": "legacy traffic", "refId": "I", "instant": true, "range": false },
+        { "expr": "tubepulse_notifications_callback_pending > 0", "legendFormat": "notification callbacks", "refId": "J", "instant": true, "range": false },
+        { "expr": "tubepulse_notifications_ambiguous_sending > 0", "legendFormat": "ambiguous sends", "refId": "K", "instant": true, "range": false },
+        { "expr": "(1 - (tubepulse_collector_collection_success * tubepulse_collector_host_collection_success * tubepulse_host_ready * tubepulse_host_authority_current * tubepulse_host_scheduler_active * tubepulse_authority_backend_ready * tubepulse_notifications_barrier_healthy * (tubepulse_host_last_error_present == bool 0) * ((time() - tubepulse_collector_last_success_timestamp_seconds) < bool 960) * (scalar(sum(tubepulse_cloudflare_worker_errors{period=\"window\"})) == bool 0) * (scalar(tubepulse:d1_write_budget_ratio) < bool 0.9) * (scalar(tubepulse:worker_request_budget_ratio) < bool 0.9) * (scalar(max(tubepulse_youtube_quota_used / tubepulse_youtube_quota_limit)) < bool 0.9))) > 0", "legendFormat": "core availability", "refId": "L", "instant": true, "range": false }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 1 }, { "color": "red", "value": 1000 }] } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "active signals" }, "properties": [{ "id": "mappings", "value": [
+            { "type": "value", "options": { "0": { "text": "ALL CLEAR", "color": "green" } } },
+            { "type": "range", "options": { "from": 1000, "to": 1000000, "result": { "text": "CRITICAL", "color": "red" } } }
+          ] }] },
+          { "matcher": { "id": "byName", "options": "core availability" }, "properties": [{ "id": "thresholds", "value": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] } }] },
+          { "matcher": { "id": "byName", "options": "Worker errors" }, "properties": [{ "id": "thresholds", "value": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] } }] }
+        ]
+      },
+      "options": { "colorMode": "value", "graphMode": "none", "justifyMode": "center", "orientation": "horizontal", "textMode": "value_and_name", "wideLayout": true, "text": { "titleSize": 15, "valueSize": 23 }, "reduceOptions": { "calcs": ["lastNotNull"], "values": false } }
     }
   ],
   "refresh": "30s",
   "schemaVersion": 41,
-  "tags": ["tubepulse", "operations", "aggregate-only"],
+  "tags": ["tubepulse", "wallboard", "aggregate-only"],
   "templating": { "list": [] },
   "time": { "from": "now-24h", "to": "now" },
   "timepicker": { "refresh_intervals": ["30s", "1m", "5m", "15m"] },
   "timezone": "utc",
-  "title": "TubePulse Operations",
+  "title": "TubePulse Wallboard",
   "uid": "tubepulse-operations",
   "version": 1,
   "weekStart": "monday"

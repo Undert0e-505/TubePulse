@@ -1,18 +1,19 @@
 # TubePulse aggregate operations monitoring
 
-This stack provides a ready-made, localhost-only TubePulse operations dashboard. It is observability, not part of the app request path: failure of the collector, Prometheus, or Grafana must never stop, restart, disable, or mark the production authority stale.
+This stack provides ready-made, localhost-only TubePulse operational dashboards. The always-on wallboard is the default; a separate diagnostics dashboard keeps the complete drill-down detail. Monitoring is observability, not part of the app request path: failure of the collector, Prometheus, or Grafana must never stop, restart, disable, or mark the production authority stale.
 
 ## Components and URLs
 
 | Component | Local URL | Purpose |
 |---|---|---|
-| Grafana | <http://127.0.0.1:3000/d/tubepulse-operations/tubepulse-operations> | Provisioned `TubePulse Operations` dashboard and default landing page |
+| Grafana wallboard | <http://127.0.0.1:3000/d/tubepulse-operations/tubepulse-operations> | Single-screen `TubePulse Wallboard` and default landing page |
+| Grafana diagnostics | <http://127.0.0.1:3000/d/tubepulse-diagnostics/tubepulse-diagnostics> | Detailed `TubePulse Diagnostics` dashboard for investigation |
 | Prometheus | <http://127.0.0.1:9090> | Scrapes aggregate gauges every 30 seconds and retains local trends |
 | Collector | <http://127.0.0.1:9464/health> and `/metrics` | Samples the host and Cloudflare every five minutes |
 
 By default, all published ports are explicitly bound to `127.0.0.1`. Grafana permits anonymous **Viewer** access so opening the dashboard requires no stored dashboard password. Do not change the port bindings to a LAN/public address without a restrictive host firewall.
 
-The tracked default remains loopback-only. A host may opt Grafana alone into same-LAN access with ignored `monitoring/.env.local` configuration and the tracked, Private-profile Windows Firewall helper described below. Prometheus, the collector, and the authority stay loopback-only. Anonymous viewers can see aggregate operational data but cannot edit dashboards; no record identifiers or credentials are exposed by this stack.
+The tracked default remains loopback-only. A host may opt Grafana alone into same-LAN access with ignored `monitoring/.env.local` configuration and the tracked, Private-profile Windows Firewall helper described below. Prometheus, the collector, and the authority stay loopback-only. Anonymous viewers can see aggregate operational data but cannot edit dashboards; no record identifiers or credentials are exposed by this stack. For an unattended display, append `?orgId=1&kiosk` to the wallboard URL; omit it to retain ordinary Grafana navigation.
 
 The tracked Compose file pins explicit Prometheus, Grafana, and Node image versions and digests. Services use `restart: unless-stopped`, bounded Docker JSON logs, and a separate Compose project. The monitoring network joins the existing private authority network only so the collector can reach the aggregate endpoint. Monitoring has no authority credentials and cannot mutate application state.
 
@@ -103,7 +104,15 @@ Historical monitoring data is intentionally ignored and local. It is lost with t
 
 ## Dashboard and guardrails
 
-The provisioned dashboard defaults to 24 hours and supports 7-day, 30-day, and custom ranges. It includes freshness/health, install and version aggregates, subscription distributions and index integrity, per-script Worker activity (including unexpected legacy traffic), D1/DO activity and storage, internal row estimates, YouTube quotas, scheduler freshness, and notification outcomes. Configured subscriptions are membership relationships read from `device:*:channels`; indexed subscriptions are the reverse relationships in `channel:*:subscribers`. Either total can legitimately exceed the unique active-channel count. The integrity panel compares the two directions and the `channels:active`/profile invariants without exposing the underlying identifiers. Persistent nonzero drift alerts after 15 minutes; monitoring never repairs canonical state.
+The provisioned `TubePulse Wallboard` keeps current health, freshness, aggregate audience/scale, budget risk, key trends and actionable non-zero signals in one desktop viewport. Health uses three severities: green for fully healthy, amber when the service remains available but an actionable warning exists, and red only for a core availability fault or dangerous budget use. It defaults to the last 24 hours in UTC and refreshes every 30 seconds. Its ordinary local URL is the Grafana wallboard URL above; kiosk mode is:
+
+```text
+http://127.0.0.1:3000/d/tubepulse-operations/tubepulse-operations?orgId=1&kiosk
+```
+
+For LAN viewing, replace `127.0.0.1` with the private host address reported by the firewall helper. The path and optional kiosk query remain the same.
+
+`TubePulse Diagnostics` defaults to 24 hours and supports 7-day, 30-day, and custom ranges. It preserves the detailed install and version aggregates, subscription distributions and index integrity, per-script Worker activity (including unexpected legacy traffic), D1/DO activity and storage, internal row estimates, YouTube quotas, scheduler freshness, and notification outcomes. Configured subscriptions are membership relationships read from `device:*:channels`; indexed subscriptions are the reverse relationships in `channel:*:subscribers`. Either total can legitimately exceed the unique active-channel count. The integrity panel compares the two directions and the `channels:active`/profile invariants without exposing the underlying identifiers. Persistent nonzero drift alerts after 15 minutes; monitoring never repairs canonical state.
 
 Default external-plan guide values are configurable and currently represent the documented free-plan guardrails: 100,000 D1 rows written/day, 5,000,000 D1 rows read/day, and 100,000 Worker requests/day. Paid-plan accounts must override these values to match their contract. The dashboard separately displays the stricter coordinator safety caps. D1 batching improves atomicity and latency but does not reduce per-row billing. End-of-day write projection clamps its divisor during the first UTC hour to avoid an unstable early extrapolation.
 

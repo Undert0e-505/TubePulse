@@ -9,28 +9,122 @@ import { prometheusText } from '../src/prometheus.mjs';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const read = (...parts) => fs.readFileSync(path.join(root, ...parts), 'utf8');
 
-test('dashboard is valid, provisioned, and uses only one datasource', () => {
-  const dashboard = JSON.parse(read('monitoring', 'grafana', 'dashboards', 'tubepulse-operations.json'));
-  assert.equal(dashboard.uid, 'tubepulse-operations');
-  assert.ok(dashboard.panels.length >= 10);
+test('wallboard and diagnostics dashboards are valid, provisioned, and use one datasource', () => {
+  const wallboard = JSON.parse(read('monitoring', 'grafana', 'dashboards', 'tubepulse-operations.json'));
+  const diagnostics = JSON.parse(read('monitoring', 'grafana', 'dashboards', 'tubepulse-diagnostics.json'));
+  assert.equal(wallboard.uid, 'tubepulse-operations');
+  assert.equal(wallboard.title, 'TubePulse Wallboard');
+  assert.equal(diagnostics.uid, 'tubepulse-diagnostics');
+  assert.equal(diagnostics.title, 'TubePulse Diagnostics');
+  assert.ok(wallboard.panels.length >= 10);
+  assert.ok(diagnostics.panels.length >= 10);
   assert.match(read('monitoring', 'grafana', 'provisioning', 'dashboards', 'default.yml'), /\/etc\/grafana\/dashboards/);
   assert.match(read('monitoring', 'grafana', 'provisioning', 'datasources', 'prometheus.yml'), /http:\/\/prometheus:9090/);
+});
 
-  const authority = dashboard.panels.find(({ title }) => title === 'Authority queue/transaction');
-  assert.match(authority.targets[0].expr, /tubepulse_authority_pending_backup_keys/);
-  assert.match(authority.targets[0].expr, /tubepulse_authority_pending_backup_consecutive_samples >= 2/);
-  assert.match(authority.targets[1].expr, /tubepulse_authority_transaction_active/);
-  assert.match(authority.targets[1].expr, /tubepulse_authority_transaction_active_consecutive_samples >= 2/);
+test('wallboard is a readable one-screen 24-column health overview', () => {
+  const dashboard = JSON.parse(read('monitoring', 'grafana', 'dashboards', 'tubepulse-operations.json'));
+  assert.equal(dashboard.refresh, '30s');
+  assert.deepEqual(dashboard.time, { from: 'now-24h', to: 'now' });
+  assert.equal(dashboard.timezone, 'utc');
+  assert.ok(dashboard.tags.includes('wallboard'));
 
-  const youtube = dashboard.panels.find(({ title }) => title === 'YouTube API quotas and freshness');
-  assert.ok(
-    youtube.targets.some(({ expr }) => expr === 'tubepulse_youtube_api_failures'),
-    'raw cumulative YouTube failure history remains graphed',
-  );
+  const occupied = new Set();
+  for (const panel of dashboard.panels) {
+    const { x, y, w, h } = panel.gridPos;
+    assert.ok(x >= 0 && y >= 0 && w > 0 && h > 0, `${panel.title} needs a valid grid position`);
+    assert.ok(x + w <= 24, `${panel.title} exceeds the 24-column grid`);
+    assert.ok(y + h <= 23, `${panel.title} falls below the one-screen wallboard bound`);
+    for (let row = y; row < y + h; row += 1) {
+      for (let column = x; column < x + w; column += 1) {
+        const cell = `${column}:${row}`;
+        assert.ok(!occupied.has(cell), `${panel.title} overlaps another panel at ${cell}`);
+        occupied.add(cell);
+      }
+    }
+  }
+
+  const byTitle = new Map(dashboard.panels.map((panel) => [panel.title, panel]));
+  for (const title of [
+    'Overall health', 'Data freshness', 'Host authority', 'Active risks',
+    'Active 24h', 'Active 7d', 'Registered', 'Push capable', 'Active channels',
+    'Memberships', 'Max / install', 'D1 writes today', 'D1 projected EOD', 'YouTube quota',
+    'Notifications', 'Worker requests / 5m', 'D1 rows / window',
+    'Notification outcomes', 'Actionable signals',
+  ]) assert.ok(byTitle.has(title), `wallboard is missing ${title}`);
+
+  const overall = byTitle.get('Overall health');
+  assert.match(overall.targets[0].expr, /tubepulse_collector_collection_success/);
+  assert.match(overall.targets[0].expr, /tubepulse_host_authority_current/);
+  assert.equal(overall.fieldConfig.defaults.noValue, 'NO DATA');
+  assert.equal(overall.fieldConfig.defaults.mappings[0].options['0'].text, 'FAULT');
+  assert.equal(overall.fieldConfig.defaults.mappings[0].options['1'].text, 'ATTENTION');
+  assert.equal(overall.fieldConfig.defaults.mappings[0].options['2'].text, 'HEALTHY');
+  assert.deepEqual(overall.fieldConfig.defaults.thresholds.steps.map(({ color, value }) => ({ color, value })), [
+    { color: 'red', value: null },
+    { color: 'orange', value: 1 },
+    { color: 'green', value: 2 },
+  ]);
+  assert.equal(overall.targets[0].instant, true);
+  assert.equal(overall.targets[0].range, false);
+
+  const risks = byTitle.get('Active risks');
+  assert.equal(risks.fieldConfig.defaults.mappings[0].options['0'].text, 'CRITICAL');
+  assert.equal(risks.fieldConfig.defaults.mappings[0].options['1'].text, 'REVIEW BELOW');
+  assert.equal(risks.fieldConfig.defaults.mappings[0].options['2'].text, 'CLEAR');
+
+  const freshness = byTitle.get('Data freshness');
+  assert.equal(freshness.fieldConfig.defaults.unit, 's');
+  assert.deepEqual(freshness.fieldConfig.defaults.thresholds.steps.map(({ value }) => value), [null, 660, 960]);
+
+  for (const title of ['Active 24h', 'Active 7d', 'Registered', 'Push capable', 'Active channels', 'Memberships', 'Max / install']) {
+    const audience = byTitle.get(title);
+    assert.equal(audience.targets.length, 1);
+    assert.equal(audience.targets[0].instant, true);
+    assert.equal(audience.options.textMode, 'value');
+    assert.ok(audience.options.text.valueSize >= 30);
+    assert.equal(audience.fieldConfig.defaults.thresholds, undefined, 'scale counts must not use danger thresholds');
+    assert.equal(audience.fieldConfig.defaults.color.fixedColor, 'blue');
+  }
+
+  for (const title of ['D1 writes today', 'D1 projected EOD', 'YouTube quota']) {
+    const panel = byTitle.get(title);
+    assert.equal(panel.fieldConfig.defaults.unit, 'percent');
+    assert.equal(panel.fieldConfig.defaults.min, 0);
+    assert.equal(panel.fieldConfig.defaults.max, 100);
+    assert.deepEqual(panel.fieldConfig.defaults.thresholds.steps.map(({ value }) => value), [null, 70, 90]);
+  }
+
+  assert.match(byTitle.get('Actionable signals').targets[0].expr, /tubepulse_authority_pending_backup_consecutive_samples >= bool 2/);
+  assert.doesNotMatch(byTitle.get('Actionable signals').targets[0].expr, /tubepulse_youtube_api_failures/);
+  assert.match(byTitle.get('Overall health').targets[0].expr, /tubepulse_authority_pending_backup_consecutive_samples < bool 2/);
+  assert.match(byTitle.get('Overall health').targets[0].expr, /tubepulse_authority_transaction_active_consecutive_samples < bool 2/);
+  assert.doesNotMatch(byTitle.get('Overall health').targets[0].expr, /tubepulse_youtube_api_failures/);
+  assert.match(byTitle.get('Actionable signals').targets[0].expr, /tubepulse_subscription_integrity_consistent/);
+  assert.match(byTitle.get('Actionable signals').targets[0].expr, /tubepulse_notifications_durable_backlog/);
+  assert.match(byTitle.get('Actionable signals').targets[0].expr, /tubepulse_cloudflare_worker_errors/);
+  assert.deepEqual(byTitle.get('Actionable signals').fieldConfig.defaults.thresholds.steps.map(({ color, value }) => ({ color, value })), [
+    { color: 'green', value: null },
+    { color: 'orange', value: 1 },
+    { color: 'red', value: 1000 },
+  ]);
+  assert.ok(byTitle.get('Actionable signals').targets.some(({ legendFormat }) => legendFormat === 'core availability'));
+  assert.ok(byTitle.get('Actionable signals').targets.some(({ legendFormat }) => legendFormat === 'D1 persistent queue'));
+  assert.ok(byTitle.get('Actionable signals').targets.some(({ legendFormat }) => legendFormat === 'D1 persistent transaction'));
+  assert.ok(byTitle.get('Actionable signals').targets.some(({ legendFormat }) => legendFormat === 'YouTube current error'));
+  for (const target of byTitle.get('Actionable signals').targets) {
+    assert.equal(target.instant, true);
+    assert.equal(target.range, false);
+  }
+
+  const serialized = JSON.stringify(dashboard);
+  for (const sensitive of ['deviceId', 'channelId', 'fcmToken', 'installationId']) {
+    assert.doesNotMatch(serialized, new RegExp(sensitive, 'i'));
+  }
 });
 
 test('channels and subscriptions stat remains readable at mobile widths', () => {
-  const dashboard = JSON.parse(read('monitoring', 'grafana', 'dashboards', 'tubepulse-operations.json'));
+  const dashboard = JSON.parse(read('monitoring', 'grafana', 'dashboards', 'tubepulse-diagnostics.json'));
   const panel = dashboard.panels.find(({ title }) => title === 'Channels and subscriptions');
   assert.ok(panel);
   assert.equal(panel.type, 'stat');
@@ -49,7 +143,10 @@ test('channels and subscriptions stat remains readable at mobile widths', () => 
 });
 
 test('every dashboard target is well formed and references an exported or recorded metric', () => {
-  const dashboard = JSON.parse(read('monitoring', 'grafana', 'dashboards', 'tubepulse-operations.json'));
+  const dashboards = [
+    JSON.parse(read('monitoring', 'grafana', 'dashboards', 'tubepulse-operations.json')),
+    JSON.parse(read('monitoring', 'grafana', 'dashboards', 'tubepulse-diagnostics.json')),
+  ];
   const rules = read('monitoring', 'prometheus', 'rules.yml');
   const sample = prometheusText({
     collector: {
@@ -73,16 +170,18 @@ test('every dashboard target is well formed and references an exported or record
   const known = new Set(sample.trim().split('\n').map((line) => line.split(/[ {]/, 1)[0]));
   for (const match of rules.matchAll(/^\s*- record:\s*(tubepulse[^\s]+)\s*$/gm)) known.add(match[1]);
 
-  for (const panel of dashboard.panels) {
-    assert.ok(panel.description, `${panel.title} needs a description`);
-    const refs = new Set();
-    for (const target of panel.targets || []) {
-      assert.equal(typeof target.expr, 'string', `${panel.title} target needs an expression`);
-      assert.ok(target.expr.trim(), `${panel.title} target expression cannot be blank`);
-      assert.ok(target.refId && !refs.has(target.refId), `${panel.title} target refIds must be unique`);
-      refs.add(target.refId);
-      for (const metric of target.expr.match(/\btubepulse(?::|_)[A-Za-z0-9_:]+/g) || []) {
-        assert.ok(known.has(metric), `${panel.title} references unknown metric ${metric}`);
+  for (const dashboard of dashboards) {
+    for (const panel of dashboard.panels) {
+      assert.ok(panel.description, `${dashboard.title}: ${panel.title} needs a description`);
+      const refs = new Set();
+      for (const target of panel.targets || []) {
+        assert.equal(typeof target.expr, 'string', `${panel.title} target needs an expression`);
+        assert.ok(target.expr.trim(), `${panel.title} target expression cannot be blank`);
+        assert.ok(target.refId && !refs.has(target.refId), `${panel.title} target refIds must be unique`);
+        refs.add(target.refId);
+        for (const metric of target.expr.match(/\btubepulse(?::|_)[A-Za-z0-9_:]+/g) || []) {
+          assert.ok(known.has(metric), `${panel.title} references unknown metric ${metric}`);
+        }
       }
     }
   }
