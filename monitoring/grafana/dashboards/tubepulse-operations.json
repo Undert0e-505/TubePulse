@@ -505,14 +505,14 @@
     },
     {
       "id": 8,
-      "type": "stat",
+      "type": "volkovlabs-echarts-panel",
       "title": "Backend seen 24h",
       "description": "Unique installations with a successful authenticated backend contact in the rolling 24-hour window, including notification taps that invoke /seen. Passive notification delivery alone is not counted. Aggregate context only; this is not a fault threshold.",
       "transparent": true,
       "gridPos": {
         "x": 0,
         "y": 5,
-        "w": 2,
+        "w": 5,
         "h": 4
       },
       "targets": [
@@ -535,33 +535,49 @@
         "overrides": []
       },
       "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "center",
-        "orientation": "auto",
-        "textMode": "value",
-        "wideLayout": true,
-        "text": {
-          "valueSize": 30
+        "renderer": "canvas",
+        "map": "none",
+        "editorMode": "code",
+        "followTheme": true,
+        "getOption": "const CYAN = '#4FC3F7';\nconst MUTED = 'rgba(204, 217, 229, 0.62)';\nconst GRID = 'rgba(148, 163, 184, 0.13)';\nconst frame = context.panel.data.series.find((candidate) =>\n  candidate.fields.some((field) => field.type === 'time') &&\n  candidate.fields.some((field) => field.type === 'number')\n);\nconst timeField = frame?.fields.find((field) => field.type === 'time');\nconst valueField = frame?.fields.find((field) => field.type === 'number');\nconst asArray = (field) => field?.values?.toArray\n  ? field.values.toArray()\n  : Array.from(field?.values ?? []);\nconst times = asArray(timeField);\nconst values = asArray(valueField);\nconst points = times\n  .map((time, index) => {\n    const rawValue = values[index];\n    return [Number(time), rawValue == null ? Number.NaN : Number(rawValue)];\n  })\n  .filter(([time, value]) => Number.isFinite(time) && Number.isFinite(value));\nconst latestPoint = points.length ? points[points.length - 1] : null;\nconst latestValue = latestPoint?.[1];\nconst width = context.panel.chart.getWidth();\nconst compact = width < 230 && Math.abs(latestValue ?? 0) >= 1000;\nconst valueText = Number.isFinite(latestValue)\n  ? new Intl.NumberFormat('en-GB', compact\n      ? { notation: 'compact', maximumFractionDigits: 1 }\n      : { maximumFractionDigits: 1 }\n    ).format(latestValue)\n  : '—';\nconst valueSize = width < 210 ? 23 : width < 420 ? 32 : 38;\nconst graphLeft = width < 210 ? '44%' : '40%';\nconst timeLabel = (value, index) => {\n  if (width < 300 && index % 2 === 1) return '';\n  const date = new Date(value);\n  const hours = String(date.getUTCHours()).padStart(2, '0');\n  if (width < 300) return `${hours}h`;\n  const minutes = String(date.getUTCMinutes()).padStart(2, '0');\n  return `${hours}:${minutes}`;\n};\n\nconst finiteValues = points.map((point) => point[1]);\nconst initialValue = finiteValues.length ? finiteValues[0] : 0;\nconst observedMin = finiteValues.length ? Math.min(...finiteValues) : initialValue;\nconst observedMax = finiteValues.length ? Math.max(...finiteValues) : initialValue;\nconst minimumSpan = 10;\nconst baselineMin = Math.max(0, initialValue - minimumSpan / 2);\nconst baselineMax = Math.max(initialValue + minimumSpan / 2, baselineMin + minimumSpan);\nlet domainMin = baselineMin;\nlet domainMax = baselineMax;\nif (observedMin < baselineMin) {\n  const lowerExcursion = baselineMin - observedMin;\n  const lowerHeadroom = Math.max(1, lowerExcursion * 0.15);\n  domainMin = Math.max(0, observedMin - lowerHeadroom);\n}\nif (observedMax > baselineMax) {\n  const upperExcursion = observedMax - baselineMax;\n  const upperHeadroom = Math.max(1, upperExcursion * 0.15);\n  domainMax = observedMax + upperHeadroom;\n}\nif (domainMax - domainMin < minimumSpan) domainMax = domainMin + minimumSpan;\nconst yDomain = { min: domainMin, max: domainMax };\n\nreturn {\n  animation: false,\n  backgroundColor: 'transparent',\n  graphic: [\n    {\n      type: 'text',\n      left: width < 210 ? '3%' : '5%',\n      top: '31%',\n      silent: true,\n      style: {\n        text: valueText,\n        fill: CYAN,\n        fontFamily: 'Inter, Roboto, sans-serif',\n        fontSize: valueSize,\n        fontWeight: 500,\n      },\n    },\n    ...(!points.length ? [{\n      type: 'text',\n      left: graphLeft,\n      top: '35%',\n      silent: true,\n      style: {\n        text: 'Awaiting samples',\n        fill: MUTED,\n        fontFamily: 'Inter, Roboto, sans-serif',\n        fontSize: 11,\n      },\n    }] : []),\n  ],\n  grid: {\n    left: graphLeft,\n    right: 22,\n    top: 8,\n    bottom: 25,\n    containLabel: false,\n  },\n  tooltip: {\n    trigger: 'axis',\n    confine: true,\n    backgroundColor: 'rgba(17, 24, 39, 0.96)',\n    borderColor: 'rgba(79, 195, 247, 0.35)',\n    textStyle: { color: '#E5EEF5', fontSize: 11 },\n    valueFormatter: (value) => Number.isFinite(Number(value))\n      ? new Intl.NumberFormat('en-GB', { maximumFractionDigits: 1 }).format(Number(value))\n      : '—',\n  },\n  xAxis: {\n    type: 'time',\n    show: points.length > 0,\n    boundaryGap: false,\n    min: points.length ? points[0][0] : undefined,\n    max: points.length ? points[points.length - 1][0] : undefined,\n    splitNumber: width < 300 ? 2 : 3,\n    minInterval: width < 300 ? 12 * 60 * 60 * 1000 : 6 * 60 * 60 * 1000,\n    axisLine: { show: true, lineStyle: { color: 'rgba(148, 163, 184, 0.32)' } },\n    axisTick: { show: false },\n    axisLabel: {\n      color: MUTED,\n      fontSize: 9,\n      hideOverlap: true,\n      showMinLabel: true,\n      showMaxLabel: true,\n      margin: 7,\n      formatter: timeLabel,\n    },\n    splitLine: { show: false },\n  },\n  yAxis: {\n    type: 'value',\n    show: false,\n    min: yDomain.min,\n    max: yDomain.max,\n    splitLine: { show: true, lineStyle: { color: GRID } },\n  },\n  series: [{\n    name: frame?.name || 'History',\n    type: 'line',\n    data: points,\n    showSymbol: false,\n    connectNulls: false,\n    smooth: 0.22,\n    sampling: 'lttb',\n    silent: false,\n    lineStyle: { color: CYAN, width: 2 },\n    itemStyle: { color: CYAN },\n    areaStyle: {\n      color: {\n        type: 'linear',\n        x: 0,\n        y: 0,\n        x2: 0,\n        y2: 1,\n        colorStops: [\n          { offset: 0, color: 'rgba(79, 195, 247, 0.30)' },\n          { offset: 1, color: 'rgba(79, 195, 247, 0.025)' },\n        ],\n      },\n    },\n    emphasis: { disabled: true },\n  }],\n};",
+        "editor": {
+          "format": "auto",
+          "height": 650
         },
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "values": false
+        "themeEditor": {
+          "name": "default",
+          "config": "{}"
+        },
+        "visualEditor": {
+          "code": "return { dataset: context.editor.dataset, series: context.editor.series, xAxis: { type: 'time' }, yAxis: { type: 'value' } };",
+          "dataset": [],
+          "series": []
+        },
+        "baidu": {
+          "callback": "bmapReady",
+          "key": ""
+        },
+        "gaode": {
+          "key": "",
+          "plugin": "AMap.Scale,AMap.ToolBar"
+        },
+        "google": {
+          "callback": "gmapReady",
+          "key": ""
         }
-      }
+      },
+      "pluginVersion": "7.1.0"
     },
     {
       "id": 9,
-      "type": "stat",
+      "type": "volkovlabs-echarts-panel",
       "title": "Backend seen 7d",
       "description": "Unique installations with a successful authenticated backend contact in the rolling seven-day window, including notification taps that invoke /seen. Passive notification delivery alone is not counted. Aggregate context only; this is not a fault threshold.",
       "transparent": true,
       "gridPos": {
-        "x": 2,
+        "x": 5,
         "y": 5,
-        "w": 2,
+        "w": 4,
         "h": 4
       },
       "targets": [
@@ -584,33 +600,49 @@
         "overrides": []
       },
       "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "center",
-        "orientation": "auto",
-        "textMode": "value",
-        "wideLayout": true,
-        "text": {
-          "valueSize": 30
+        "renderer": "canvas",
+        "map": "none",
+        "editorMode": "code",
+        "followTheme": true,
+        "getOption": "const CYAN = '#4FC3F7';\nconst MUTED = 'rgba(204, 217, 229, 0.62)';\nconst GRID = 'rgba(148, 163, 184, 0.13)';\nconst frame = context.panel.data.series.find((candidate) =>\n  candidate.fields.some((field) => field.type === 'time') &&\n  candidate.fields.some((field) => field.type === 'number')\n);\nconst timeField = frame?.fields.find((field) => field.type === 'time');\nconst valueField = frame?.fields.find((field) => field.type === 'number');\nconst asArray = (field) => field?.values?.toArray\n  ? field.values.toArray()\n  : Array.from(field?.values ?? []);\nconst times = asArray(timeField);\nconst values = asArray(valueField);\nconst points = times\n  .map((time, index) => {\n    const rawValue = values[index];\n    return [Number(time), rawValue == null ? Number.NaN : Number(rawValue)];\n  })\n  .filter(([time, value]) => Number.isFinite(time) && Number.isFinite(value));\nconst latestPoint = points.length ? points[points.length - 1] : null;\nconst latestValue = latestPoint?.[1];\nconst width = context.panel.chart.getWidth();\nconst compact = width < 230 && Math.abs(latestValue ?? 0) >= 1000;\nconst valueText = Number.isFinite(latestValue)\n  ? new Intl.NumberFormat('en-GB', compact\n      ? { notation: 'compact', maximumFractionDigits: 1 }\n      : { maximumFractionDigits: 1 }\n    ).format(latestValue)\n  : '—';\nconst valueSize = width < 210 ? 23 : width < 420 ? 32 : 38;\nconst graphLeft = width < 210 ? '44%' : '40%';\nconst timeLabel = (value, index) => {\n  if (width < 300 && index % 2 === 1) return '';\n  const date = new Date(value);\n  const hours = String(date.getUTCHours()).padStart(2, '0');\n  if (width < 300) return `${hours}h`;\n  const minutes = String(date.getUTCMinutes()).padStart(2, '0');\n  return `${hours}:${minutes}`;\n};\n\nconst finiteValues = points.map((point) => point[1]);\nconst initialValue = finiteValues.length ? finiteValues[0] : 0;\nconst observedMin = finiteValues.length ? Math.min(...finiteValues) : initialValue;\nconst observedMax = finiteValues.length ? Math.max(...finiteValues) : initialValue;\nconst minimumSpan = 10;\nconst baselineMin = Math.max(0, initialValue - minimumSpan / 2);\nconst baselineMax = Math.max(initialValue + minimumSpan / 2, baselineMin + minimumSpan);\nlet domainMin = baselineMin;\nlet domainMax = baselineMax;\nif (observedMin < baselineMin) {\n  const lowerExcursion = baselineMin - observedMin;\n  const lowerHeadroom = Math.max(1, lowerExcursion * 0.15);\n  domainMin = Math.max(0, observedMin - lowerHeadroom);\n}\nif (observedMax > baselineMax) {\n  const upperExcursion = observedMax - baselineMax;\n  const upperHeadroom = Math.max(1, upperExcursion * 0.15);\n  domainMax = observedMax + upperHeadroom;\n}\nif (domainMax - domainMin < minimumSpan) domainMax = domainMin + minimumSpan;\nconst yDomain = { min: domainMin, max: domainMax };\n\nreturn {\n  animation: false,\n  backgroundColor: 'transparent',\n  graphic: [\n    {\n      type: 'text',\n      left: width < 210 ? '3%' : '5%',\n      top: '31%',\n      silent: true,\n      style: {\n        text: valueText,\n        fill: CYAN,\n        fontFamily: 'Inter, Roboto, sans-serif',\n        fontSize: valueSize,\n        fontWeight: 500,\n      },\n    },\n    ...(!points.length ? [{\n      type: 'text',\n      left: graphLeft,\n      top: '35%',\n      silent: true,\n      style: {\n        text: 'Awaiting samples',\n        fill: MUTED,\n        fontFamily: 'Inter, Roboto, sans-serif',\n        fontSize: 11,\n      },\n    }] : []),\n  ],\n  grid: {\n    left: graphLeft,\n    right: 22,\n    top: 8,\n    bottom: 25,\n    containLabel: false,\n  },\n  tooltip: {\n    trigger: 'axis',\n    confine: true,\n    backgroundColor: 'rgba(17, 24, 39, 0.96)',\n    borderColor: 'rgba(79, 195, 247, 0.35)',\n    textStyle: { color: '#E5EEF5', fontSize: 11 },\n    valueFormatter: (value) => Number.isFinite(Number(value))\n      ? new Intl.NumberFormat('en-GB', { maximumFractionDigits: 1 }).format(Number(value))\n      : '—',\n  },\n  xAxis: {\n    type: 'time',\n    show: points.length > 0,\n    boundaryGap: false,\n    min: points.length ? points[0][0] : undefined,\n    max: points.length ? points[points.length - 1][0] : undefined,\n    splitNumber: width < 300 ? 2 : 3,\n    minInterval: width < 300 ? 12 * 60 * 60 * 1000 : 6 * 60 * 60 * 1000,\n    axisLine: { show: true, lineStyle: { color: 'rgba(148, 163, 184, 0.32)' } },\n    axisTick: { show: false },\n    axisLabel: {\n      color: MUTED,\n      fontSize: 9,\n      hideOverlap: true,\n      showMinLabel: true,\n      showMaxLabel: true,\n      margin: 7,\n      formatter: timeLabel,\n    },\n    splitLine: { show: false },\n  },\n  yAxis: {\n    type: 'value',\n    show: false,\n    min: yDomain.min,\n    max: yDomain.max,\n    splitLine: { show: true, lineStyle: { color: GRID } },\n  },\n  series: [{\n    name: frame?.name || 'History',\n    type: 'line',\n    data: points,\n    showSymbol: false,\n    connectNulls: false,\n    smooth: 0.22,\n    sampling: 'lttb',\n    silent: false,\n    lineStyle: { color: CYAN, width: 2 },\n    itemStyle: { color: CYAN },\n    areaStyle: {\n      color: {\n        type: 'linear',\n        x: 0,\n        y: 0,\n        x2: 0,\n        y2: 1,\n        colorStops: [\n          { offset: 0, color: 'rgba(79, 195, 247, 0.30)' },\n          { offset: 1, color: 'rgba(79, 195, 247, 0.025)' },\n        ],\n      },\n    },\n    emphasis: { disabled: true },\n  }],\n};",
+        "editor": {
+          "format": "auto",
+          "height": 650
         },
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "values": false
+        "themeEditor": {
+          "name": "default",
+          "config": "{}"
+        },
+        "visualEditor": {
+          "code": "return { dataset: context.editor.dataset, series: context.editor.series, xAxis: { type: 'time' }, yAxis: { type: 'value' } };",
+          "dataset": [],
+          "series": []
+        },
+        "baidu": {
+          "callback": "bmapReady",
+          "key": ""
+        },
+        "gaode": {
+          "key": "",
+          "plugin": "AMap.Scale,AMap.ToolBar"
+        },
+        "google": {
+          "callback": "gmapReady",
+          "key": ""
         }
-      }
+      },
+      "pluginVersion": "7.1.0"
     },
     {
       "id": 10,
-      "type": "stat",
+      "type": "volkovlabs-echarts-panel",
       "title": "Registered",
       "description": "Audience & scale — registered installations. Aggregate context only; this is not a fault threshold.",
       "transparent": true,
       "gridPos": {
-        "x": 4,
+        "x": 9,
         "y": 5,
-        "w": 2,
+        "w": 4,
         "h": 4
       },
       "targets": [
@@ -633,33 +665,49 @@
         "overrides": []
       },
       "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "center",
-        "orientation": "auto",
-        "textMode": "value",
-        "wideLayout": true,
-        "text": {
-          "valueSize": 30
+        "renderer": "canvas",
+        "map": "none",
+        "editorMode": "code",
+        "followTheme": true,
+        "getOption": "const CYAN = '#4FC3F7';\nconst MUTED = 'rgba(204, 217, 229, 0.62)';\nconst GRID = 'rgba(148, 163, 184, 0.13)';\nconst frame = context.panel.data.series.find((candidate) =>\n  candidate.fields.some((field) => field.type === 'time') &&\n  candidate.fields.some((field) => field.type === 'number')\n);\nconst timeField = frame?.fields.find((field) => field.type === 'time');\nconst valueField = frame?.fields.find((field) => field.type === 'number');\nconst asArray = (field) => field?.values?.toArray\n  ? field.values.toArray()\n  : Array.from(field?.values ?? []);\nconst times = asArray(timeField);\nconst values = asArray(valueField);\nconst points = times\n  .map((time, index) => {\n    const rawValue = values[index];\n    return [Number(time), rawValue == null ? Number.NaN : Number(rawValue)];\n  })\n  .filter(([time, value]) => Number.isFinite(time) && Number.isFinite(value));\nconst latestPoint = points.length ? points[points.length - 1] : null;\nconst latestValue = latestPoint?.[1];\nconst width = context.panel.chart.getWidth();\nconst compact = width < 230 && Math.abs(latestValue ?? 0) >= 1000;\nconst valueText = Number.isFinite(latestValue)\n  ? new Intl.NumberFormat('en-GB', compact\n      ? { notation: 'compact', maximumFractionDigits: 1 }\n      : { maximumFractionDigits: 1 }\n    ).format(latestValue)\n  : '—';\nconst valueSize = width < 210 ? 23 : width < 420 ? 32 : 38;\nconst graphLeft = width < 210 ? '44%' : '40%';\nconst timeLabel = (value, index) => {\n  if (width < 300 && index % 2 === 1) return '';\n  const date = new Date(value);\n  const hours = String(date.getUTCHours()).padStart(2, '0');\n  if (width < 300) return `${hours}h`;\n  const minutes = String(date.getUTCMinutes()).padStart(2, '0');\n  return `${hours}:${minutes}`;\n};\n\nconst finiteValues = points.map((point) => point[1]);\nconst initialValue = finiteValues.length ? finiteValues[0] : 0;\nconst observedMin = finiteValues.length ? Math.min(...finiteValues) : initialValue;\nconst observedMax = finiteValues.length ? Math.max(...finiteValues) : initialValue;\nconst minimumSpan = 10;\nconst baselineMin = Math.max(0, initialValue - minimumSpan / 2);\nconst baselineMax = Math.max(initialValue + minimumSpan / 2, baselineMin + minimumSpan);\nlet domainMin = baselineMin;\nlet domainMax = baselineMax;\nif (observedMin < baselineMin) {\n  const lowerExcursion = baselineMin - observedMin;\n  const lowerHeadroom = Math.max(1, lowerExcursion * 0.15);\n  domainMin = Math.max(0, observedMin - lowerHeadroom);\n}\nif (observedMax > baselineMax) {\n  const upperExcursion = observedMax - baselineMax;\n  const upperHeadroom = Math.max(1, upperExcursion * 0.15);\n  domainMax = observedMax + upperHeadroom;\n}\nif (domainMax - domainMin < minimumSpan) domainMax = domainMin + minimumSpan;\nconst yDomain = { min: domainMin, max: domainMax };\n\nreturn {\n  animation: false,\n  backgroundColor: 'transparent',\n  graphic: [\n    {\n      type: 'text',\n      left: width < 210 ? '3%' : '5%',\n      top: '31%',\n      silent: true,\n      style: {\n        text: valueText,\n        fill: CYAN,\n        fontFamily: 'Inter, Roboto, sans-serif',\n        fontSize: valueSize,\n        fontWeight: 500,\n      },\n    },\n    ...(!points.length ? [{\n      type: 'text',\n      left: graphLeft,\n      top: '35%',\n      silent: true,\n      style: {\n        text: 'Awaiting samples',\n        fill: MUTED,\n        fontFamily: 'Inter, Roboto, sans-serif',\n        fontSize: 11,\n      },\n    }] : []),\n  ],\n  grid: {\n    left: graphLeft,\n    right: 22,\n    top: 8,\n    bottom: 25,\n    containLabel: false,\n  },\n  tooltip: {\n    trigger: 'axis',\n    confine: true,\n    backgroundColor: 'rgba(17, 24, 39, 0.96)',\n    borderColor: 'rgba(79, 195, 247, 0.35)',\n    textStyle: { color: '#E5EEF5', fontSize: 11 },\n    valueFormatter: (value) => Number.isFinite(Number(value))\n      ? new Intl.NumberFormat('en-GB', { maximumFractionDigits: 1 }).format(Number(value))\n      : '—',\n  },\n  xAxis: {\n    type: 'time',\n    show: points.length > 0,\n    boundaryGap: false,\n    min: points.length ? points[0][0] : undefined,\n    max: points.length ? points[points.length - 1][0] : undefined,\n    splitNumber: width < 300 ? 2 : 3,\n    minInterval: width < 300 ? 12 * 60 * 60 * 1000 : 6 * 60 * 60 * 1000,\n    axisLine: { show: true, lineStyle: { color: 'rgba(148, 163, 184, 0.32)' } },\n    axisTick: { show: false },\n    axisLabel: {\n      color: MUTED,\n      fontSize: 9,\n      hideOverlap: true,\n      showMinLabel: true,\n      showMaxLabel: true,\n      margin: 7,\n      formatter: timeLabel,\n    },\n    splitLine: { show: false },\n  },\n  yAxis: {\n    type: 'value',\n    show: false,\n    min: yDomain.min,\n    max: yDomain.max,\n    splitLine: { show: true, lineStyle: { color: GRID } },\n  },\n  series: [{\n    name: frame?.name || 'History',\n    type: 'line',\n    data: points,\n    showSymbol: false,\n    connectNulls: false,\n    smooth: 0.22,\n    sampling: 'lttb',\n    silent: false,\n    lineStyle: { color: CYAN, width: 2 },\n    itemStyle: { color: CYAN },\n    areaStyle: {\n      color: {\n        type: 'linear',\n        x: 0,\n        y: 0,\n        x2: 0,\n        y2: 1,\n        colorStops: [\n          { offset: 0, color: 'rgba(79, 195, 247, 0.30)' },\n          { offset: 1, color: 'rgba(79, 195, 247, 0.025)' },\n        ],\n      },\n    },\n    emphasis: { disabled: true },\n  }],\n};",
+        "editor": {
+          "format": "auto",
+          "height": 650
         },
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "values": false
+        "themeEditor": {
+          "name": "default",
+          "config": "{}"
+        },
+        "visualEditor": {
+          "code": "return { dataset: context.editor.dataset, series: context.editor.series, xAxis: { type: 'time' }, yAxis: { type: 'value' } };",
+          "dataset": [],
+          "series": []
+        },
+        "baidu": {
+          "callback": "bmapReady",
+          "key": ""
+        },
+        "gaode": {
+          "key": "",
+          "plugin": "AMap.Scale,AMap.ToolBar"
+        },
+        "google": {
+          "callback": "gmapReady",
+          "key": ""
         }
-      }
+      },
+      "pluginVersion": "7.1.0"
     },
     {
       "id": 11,
-      "type": "stat",
+      "type": "volkovlabs-echarts-panel",
       "title": "Push capable",
       "description": "Audience & scale — installations registered for push delivery. Aggregate context only; this is not a fault threshold.",
       "transparent": true,
       "gridPos": {
-        "x": 6,
+        "x": 13,
         "y": 5,
-        "w": 3,
+        "w": 4,
         "h": 4
       },
       "targets": [
@@ -682,33 +730,49 @@
         "overrides": []
       },
       "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "center",
-        "orientation": "auto",
-        "textMode": "value",
-        "wideLayout": true,
-        "text": {
-          "valueSize": 30
+        "renderer": "canvas",
+        "map": "none",
+        "editorMode": "code",
+        "followTheme": true,
+        "getOption": "const CYAN = '#4FC3F7';\nconst MUTED = 'rgba(204, 217, 229, 0.62)';\nconst GRID = 'rgba(148, 163, 184, 0.13)';\nconst frame = context.panel.data.series.find((candidate) =>\n  candidate.fields.some((field) => field.type === 'time') &&\n  candidate.fields.some((field) => field.type === 'number')\n);\nconst timeField = frame?.fields.find((field) => field.type === 'time');\nconst valueField = frame?.fields.find((field) => field.type === 'number');\nconst asArray = (field) => field?.values?.toArray\n  ? field.values.toArray()\n  : Array.from(field?.values ?? []);\nconst times = asArray(timeField);\nconst values = asArray(valueField);\nconst points = times\n  .map((time, index) => {\n    const rawValue = values[index];\n    return [Number(time), rawValue == null ? Number.NaN : Number(rawValue)];\n  })\n  .filter(([time, value]) => Number.isFinite(time) && Number.isFinite(value));\nconst latestPoint = points.length ? points[points.length - 1] : null;\nconst latestValue = latestPoint?.[1];\nconst width = context.panel.chart.getWidth();\nconst compact = width < 230 && Math.abs(latestValue ?? 0) >= 1000;\nconst valueText = Number.isFinite(latestValue)\n  ? new Intl.NumberFormat('en-GB', compact\n      ? { notation: 'compact', maximumFractionDigits: 1 }\n      : { maximumFractionDigits: 1 }\n    ).format(latestValue)\n  : '—';\nconst valueSize = width < 210 ? 23 : width < 420 ? 32 : 38;\nconst graphLeft = width < 210 ? '44%' : '40%';\nconst timeLabel = (value, index) => {\n  if (width < 300 && index % 2 === 1) return '';\n  const date = new Date(value);\n  const hours = String(date.getUTCHours()).padStart(2, '0');\n  if (width < 300) return `${hours}h`;\n  const minutes = String(date.getUTCMinutes()).padStart(2, '0');\n  return `${hours}:${minutes}`;\n};\n\nconst finiteValues = points.map((point) => point[1]);\nconst initialValue = finiteValues.length ? finiteValues[0] : 0;\nconst observedMin = finiteValues.length ? Math.min(...finiteValues) : initialValue;\nconst observedMax = finiteValues.length ? Math.max(...finiteValues) : initialValue;\nconst minimumSpan = 10;\nconst baselineMin = Math.max(0, initialValue - minimumSpan / 2);\nconst baselineMax = Math.max(initialValue + minimumSpan / 2, baselineMin + minimumSpan);\nlet domainMin = baselineMin;\nlet domainMax = baselineMax;\nif (observedMin < baselineMin) {\n  const lowerExcursion = baselineMin - observedMin;\n  const lowerHeadroom = Math.max(1, lowerExcursion * 0.15);\n  domainMin = Math.max(0, observedMin - lowerHeadroom);\n}\nif (observedMax > baselineMax) {\n  const upperExcursion = observedMax - baselineMax;\n  const upperHeadroom = Math.max(1, upperExcursion * 0.15);\n  domainMax = observedMax + upperHeadroom;\n}\nif (domainMax - domainMin < minimumSpan) domainMax = domainMin + minimumSpan;\nconst yDomain = { min: domainMin, max: domainMax };\n\nreturn {\n  animation: false,\n  backgroundColor: 'transparent',\n  graphic: [\n    {\n      type: 'text',\n      left: width < 210 ? '3%' : '5%',\n      top: '31%',\n      silent: true,\n      style: {\n        text: valueText,\n        fill: CYAN,\n        fontFamily: 'Inter, Roboto, sans-serif',\n        fontSize: valueSize,\n        fontWeight: 500,\n      },\n    },\n    ...(!points.length ? [{\n      type: 'text',\n      left: graphLeft,\n      top: '35%',\n      silent: true,\n      style: {\n        text: 'Awaiting samples',\n        fill: MUTED,\n        fontFamily: 'Inter, Roboto, sans-serif',\n        fontSize: 11,\n      },\n    }] : []),\n  ],\n  grid: {\n    left: graphLeft,\n    right: 22,\n    top: 8,\n    bottom: 25,\n    containLabel: false,\n  },\n  tooltip: {\n    trigger: 'axis',\n    confine: true,\n    backgroundColor: 'rgba(17, 24, 39, 0.96)',\n    borderColor: 'rgba(79, 195, 247, 0.35)',\n    textStyle: { color: '#E5EEF5', fontSize: 11 },\n    valueFormatter: (value) => Number.isFinite(Number(value))\n      ? new Intl.NumberFormat('en-GB', { maximumFractionDigits: 1 }).format(Number(value))\n      : '—',\n  },\n  xAxis: {\n    type: 'time',\n    show: points.length > 0,\n    boundaryGap: false,\n    min: points.length ? points[0][0] : undefined,\n    max: points.length ? points[points.length - 1][0] : undefined,\n    splitNumber: width < 300 ? 2 : 3,\n    minInterval: width < 300 ? 12 * 60 * 60 * 1000 : 6 * 60 * 60 * 1000,\n    axisLine: { show: true, lineStyle: { color: 'rgba(148, 163, 184, 0.32)' } },\n    axisTick: { show: false },\n    axisLabel: {\n      color: MUTED,\n      fontSize: 9,\n      hideOverlap: true,\n      showMinLabel: true,\n      showMaxLabel: true,\n      margin: 7,\n      formatter: timeLabel,\n    },\n    splitLine: { show: false },\n  },\n  yAxis: {\n    type: 'value',\n    show: false,\n    min: yDomain.min,\n    max: yDomain.max,\n    splitLine: { show: true, lineStyle: { color: GRID } },\n  },\n  series: [{\n    name: frame?.name || 'History',\n    type: 'line',\n    data: points,\n    showSymbol: false,\n    connectNulls: false,\n    smooth: 0.22,\n    sampling: 'lttb',\n    silent: false,\n    lineStyle: { color: CYAN, width: 2 },\n    itemStyle: { color: CYAN },\n    areaStyle: {\n      color: {\n        type: 'linear',\n        x: 0,\n        y: 0,\n        x2: 0,\n        y2: 1,\n        colorStops: [\n          { offset: 0, color: 'rgba(79, 195, 247, 0.30)' },\n          { offset: 1, color: 'rgba(79, 195, 247, 0.025)' },\n        ],\n      },\n    },\n    emphasis: { disabled: true },\n  }],\n};",
+        "editor": {
+          "format": "auto",
+          "height": 650
         },
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "values": false
+        "themeEditor": {
+          "name": "default",
+          "config": "{}"
+        },
+        "visualEditor": {
+          "code": "return { dataset: context.editor.dataset, series: context.editor.series, xAxis: { type: 'time' }, yAxis: { type: 'value' } };",
+          "dataset": [],
+          "series": []
+        },
+        "baidu": {
+          "callback": "bmapReady",
+          "key": ""
+        },
+        "gaode": {
+          "key": "",
+          "plugin": "AMap.Scale,AMap.ToolBar"
+        },
+        "google": {
+          "callback": "gmapReady",
+          "key": ""
         }
-      }
+      },
+      "pluginVersion": "7.1.0"
     },
     {
       "id": 12,
-      "type": "stat",
+      "type": "volkovlabs-echarts-panel",
       "title": "Channels",
       "description": "Audience & scale — active channels. Aggregate context only; this is not a fault threshold.",
       "transparent": true,
       "gridPos": {
-        "x": 9,
-        "y": 5,
-        "w": 2,
+        "x": 0,
+        "y": 9,
+        "w": 5,
         "h": 4
       },
       "targets": [
@@ -731,33 +795,49 @@
         "overrides": []
       },
       "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "center",
-        "orientation": "auto",
-        "textMode": "value",
-        "wideLayout": true,
-        "text": {
-          "valueSize": 30
+        "renderer": "canvas",
+        "map": "none",
+        "editorMode": "code",
+        "followTheme": true,
+        "getOption": "const CYAN = '#4FC3F7';\nconst MUTED = 'rgba(204, 217, 229, 0.62)';\nconst GRID = 'rgba(148, 163, 184, 0.13)';\nconst frame = context.panel.data.series.find((candidate) =>\n  candidate.fields.some((field) => field.type === 'time') &&\n  candidate.fields.some((field) => field.type === 'number')\n);\nconst timeField = frame?.fields.find((field) => field.type === 'time');\nconst valueField = frame?.fields.find((field) => field.type === 'number');\nconst asArray = (field) => field?.values?.toArray\n  ? field.values.toArray()\n  : Array.from(field?.values ?? []);\nconst times = asArray(timeField);\nconst values = asArray(valueField);\nconst points = times\n  .map((time, index) => {\n    const rawValue = values[index];\n    return [Number(time), rawValue == null ? Number.NaN : Number(rawValue)];\n  })\n  .filter(([time, value]) => Number.isFinite(time) && Number.isFinite(value));\nconst latestPoint = points.length ? points[points.length - 1] : null;\nconst latestValue = latestPoint?.[1];\nconst width = context.panel.chart.getWidth();\nconst compact = width < 230 && Math.abs(latestValue ?? 0) >= 1000;\nconst valueText = Number.isFinite(latestValue)\n  ? new Intl.NumberFormat('en-GB', compact\n      ? { notation: 'compact', maximumFractionDigits: 1 }\n      : { maximumFractionDigits: 1 }\n    ).format(latestValue)\n  : '—';\nconst valueSize = width < 210 ? 23 : width < 420 ? 32 : 38;\nconst graphLeft = width < 210 ? '44%' : '40%';\nconst timeLabel = (value, index) => {\n  if (width < 300 && index % 2 === 1) return '';\n  const date = new Date(value);\n  const hours = String(date.getUTCHours()).padStart(2, '0');\n  if (width < 300) return `${hours}h`;\n  const minutes = String(date.getUTCMinutes()).padStart(2, '0');\n  return `${hours}:${minutes}`;\n};\n\nconst finiteValues = points.map((point) => point[1]);\nconst initialValue = finiteValues.length ? finiteValues[0] : 0;\nconst observedMin = finiteValues.length ? Math.min(...finiteValues) : initialValue;\nconst observedMax = finiteValues.length ? Math.max(...finiteValues) : initialValue;\nconst minimumSpan = 10;\nconst baselineMin = Math.max(0, initialValue - minimumSpan / 2);\nconst baselineMax = Math.max(initialValue + minimumSpan / 2, baselineMin + minimumSpan);\nlet domainMin = baselineMin;\nlet domainMax = baselineMax;\nif (observedMin < baselineMin) {\n  const lowerExcursion = baselineMin - observedMin;\n  const lowerHeadroom = Math.max(1, lowerExcursion * 0.15);\n  domainMin = Math.max(0, observedMin - lowerHeadroom);\n}\nif (observedMax > baselineMax) {\n  const upperExcursion = observedMax - baselineMax;\n  const upperHeadroom = Math.max(1, upperExcursion * 0.15);\n  domainMax = observedMax + upperHeadroom;\n}\nif (domainMax - domainMin < minimumSpan) domainMax = domainMin + minimumSpan;\nconst yDomain = { min: domainMin, max: domainMax };\n\nreturn {\n  animation: false,\n  backgroundColor: 'transparent',\n  graphic: [\n    {\n      type: 'text',\n      left: width < 210 ? '3%' : '5%',\n      top: '31%',\n      silent: true,\n      style: {\n        text: valueText,\n        fill: CYAN,\n        fontFamily: 'Inter, Roboto, sans-serif',\n        fontSize: valueSize,\n        fontWeight: 500,\n      },\n    },\n    ...(!points.length ? [{\n      type: 'text',\n      left: graphLeft,\n      top: '35%',\n      silent: true,\n      style: {\n        text: 'Awaiting samples',\n        fill: MUTED,\n        fontFamily: 'Inter, Roboto, sans-serif',\n        fontSize: 11,\n      },\n    }] : []),\n  ],\n  grid: {\n    left: graphLeft,\n    right: 22,\n    top: 8,\n    bottom: 25,\n    containLabel: false,\n  },\n  tooltip: {\n    trigger: 'axis',\n    confine: true,\n    backgroundColor: 'rgba(17, 24, 39, 0.96)',\n    borderColor: 'rgba(79, 195, 247, 0.35)',\n    textStyle: { color: '#E5EEF5', fontSize: 11 },\n    valueFormatter: (value) => Number.isFinite(Number(value))\n      ? new Intl.NumberFormat('en-GB', { maximumFractionDigits: 1 }).format(Number(value))\n      : '—',\n  },\n  xAxis: {\n    type: 'time',\n    show: points.length > 0,\n    boundaryGap: false,\n    min: points.length ? points[0][0] : undefined,\n    max: points.length ? points[points.length - 1][0] : undefined,\n    splitNumber: width < 300 ? 2 : 3,\n    minInterval: width < 300 ? 12 * 60 * 60 * 1000 : 6 * 60 * 60 * 1000,\n    axisLine: { show: true, lineStyle: { color: 'rgba(148, 163, 184, 0.32)' } },\n    axisTick: { show: false },\n    axisLabel: {\n      color: MUTED,\n      fontSize: 9,\n      hideOverlap: true,\n      showMinLabel: true,\n      showMaxLabel: true,\n      margin: 7,\n      formatter: timeLabel,\n    },\n    splitLine: { show: false },\n  },\n  yAxis: {\n    type: 'value',\n    show: false,\n    min: yDomain.min,\n    max: yDomain.max,\n    splitLine: { show: true, lineStyle: { color: GRID } },\n  },\n  series: [{\n    name: frame?.name || 'History',\n    type: 'line',\n    data: points,\n    showSymbol: false,\n    connectNulls: false,\n    smooth: 0.22,\n    sampling: 'lttb',\n    silent: false,\n    lineStyle: { color: CYAN, width: 2 },\n    itemStyle: { color: CYAN },\n    areaStyle: {\n      color: {\n        type: 'linear',\n        x: 0,\n        y: 0,\n        x2: 0,\n        y2: 1,\n        colorStops: [\n          { offset: 0, color: 'rgba(79, 195, 247, 0.30)' },\n          { offset: 1, color: 'rgba(79, 195, 247, 0.025)' },\n        ],\n      },\n    },\n    emphasis: { disabled: true },\n  }],\n};",
+        "editor": {
+          "format": "auto",
+          "height": 650
         },
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "values": false
+        "themeEditor": {
+          "name": "default",
+          "config": "{}"
+        },
+        "visualEditor": {
+          "code": "return { dataset: context.editor.dataset, series: context.editor.series, xAxis: { type: 'time' }, yAxis: { type: 'value' } };",
+          "dataset": [],
+          "series": []
+        },
+        "baidu": {
+          "callback": "bmapReady",
+          "key": ""
+        },
+        "gaode": {
+          "key": "",
+          "plugin": "AMap.Scale,AMap.ToolBar"
+        },
+        "google": {
+          "callback": "gmapReady",
+          "key": ""
         }
-      }
+      },
+      "pluginVersion": "7.1.0"
     },
     {
       "id": 13,
-      "type": "stat",
+      "type": "volkovlabs-echarts-panel",
       "title": "Memberships",
       "description": "Audience & scale — configured channel memberships. Aggregate context only; this is not a fault threshold.",
       "transparent": true,
       "gridPos": {
-        "x": 11,
-        "y": 5,
-        "w": 3,
+        "x": 5,
+        "y": 9,
+        "w": 6,
         "h": 4
       },
       "targets": [
@@ -780,33 +860,49 @@
         "overrides": []
       },
       "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "center",
-        "orientation": "auto",
-        "textMode": "value",
-        "wideLayout": true,
-        "text": {
-          "valueSize": 30
+        "renderer": "canvas",
+        "map": "none",
+        "editorMode": "code",
+        "followTheme": true,
+        "getOption": "const CYAN = '#4FC3F7';\nconst MUTED = 'rgba(204, 217, 229, 0.62)';\nconst GRID = 'rgba(148, 163, 184, 0.13)';\nconst frame = context.panel.data.series.find((candidate) =>\n  candidate.fields.some((field) => field.type === 'time') &&\n  candidate.fields.some((field) => field.type === 'number')\n);\nconst timeField = frame?.fields.find((field) => field.type === 'time');\nconst valueField = frame?.fields.find((field) => field.type === 'number');\nconst asArray = (field) => field?.values?.toArray\n  ? field.values.toArray()\n  : Array.from(field?.values ?? []);\nconst times = asArray(timeField);\nconst values = asArray(valueField);\nconst points = times\n  .map((time, index) => {\n    const rawValue = values[index];\n    return [Number(time), rawValue == null ? Number.NaN : Number(rawValue)];\n  })\n  .filter(([time, value]) => Number.isFinite(time) && Number.isFinite(value));\nconst latestPoint = points.length ? points[points.length - 1] : null;\nconst latestValue = latestPoint?.[1];\nconst width = context.panel.chart.getWidth();\nconst compact = width < 230 && Math.abs(latestValue ?? 0) >= 1000;\nconst valueText = Number.isFinite(latestValue)\n  ? new Intl.NumberFormat('en-GB', compact\n      ? { notation: 'compact', maximumFractionDigits: 1 }\n      : { maximumFractionDigits: 1 }\n    ).format(latestValue)\n  : '—';\nconst valueSize = width < 210 ? 23 : width < 420 ? 32 : 38;\nconst graphLeft = width < 210 ? '44%' : '40%';\nconst timeLabel = (value, index) => {\n  if (width < 300 && index % 2 === 1) return '';\n  const date = new Date(value);\n  const hours = String(date.getUTCHours()).padStart(2, '0');\n  if (width < 300) return `${hours}h`;\n  const minutes = String(date.getUTCMinutes()).padStart(2, '0');\n  return `${hours}:${minutes}`;\n};\n\nconst finiteValues = points.map((point) => point[1]);\nconst initialValue = finiteValues.length ? finiteValues[0] : 0;\nconst observedMin = finiteValues.length ? Math.min(...finiteValues) : initialValue;\nconst observedMax = finiteValues.length ? Math.max(...finiteValues) : initialValue;\nconst minimumSpan = 10;\nconst baselineMin = Math.max(0, initialValue - minimumSpan / 2);\nconst baselineMax = Math.max(initialValue + minimumSpan / 2, baselineMin + minimumSpan);\nlet domainMin = baselineMin;\nlet domainMax = baselineMax;\nif (observedMin < baselineMin) {\n  const lowerExcursion = baselineMin - observedMin;\n  const lowerHeadroom = Math.max(1, lowerExcursion * 0.15);\n  domainMin = Math.max(0, observedMin - lowerHeadroom);\n}\nif (observedMax > baselineMax) {\n  const upperExcursion = observedMax - baselineMax;\n  const upperHeadroom = Math.max(1, upperExcursion * 0.15);\n  domainMax = observedMax + upperHeadroom;\n}\nif (domainMax - domainMin < minimumSpan) domainMax = domainMin + minimumSpan;\nconst yDomain = { min: domainMin, max: domainMax };\n\nreturn {\n  animation: false,\n  backgroundColor: 'transparent',\n  graphic: [\n    {\n      type: 'text',\n      left: width < 210 ? '3%' : '5%',\n      top: '31%',\n      silent: true,\n      style: {\n        text: valueText,\n        fill: CYAN,\n        fontFamily: 'Inter, Roboto, sans-serif',\n        fontSize: valueSize,\n        fontWeight: 500,\n      },\n    },\n    ...(!points.length ? [{\n      type: 'text',\n      left: graphLeft,\n      top: '35%',\n      silent: true,\n      style: {\n        text: 'Awaiting samples',\n        fill: MUTED,\n        fontFamily: 'Inter, Roboto, sans-serif',\n        fontSize: 11,\n      },\n    }] : []),\n  ],\n  grid: {\n    left: graphLeft,\n    right: 22,\n    top: 8,\n    bottom: 25,\n    containLabel: false,\n  },\n  tooltip: {\n    trigger: 'axis',\n    confine: true,\n    backgroundColor: 'rgba(17, 24, 39, 0.96)',\n    borderColor: 'rgba(79, 195, 247, 0.35)',\n    textStyle: { color: '#E5EEF5', fontSize: 11 },\n    valueFormatter: (value) => Number.isFinite(Number(value))\n      ? new Intl.NumberFormat('en-GB', { maximumFractionDigits: 1 }).format(Number(value))\n      : '—',\n  },\n  xAxis: {\n    type: 'time',\n    show: points.length > 0,\n    boundaryGap: false,\n    min: points.length ? points[0][0] : undefined,\n    max: points.length ? points[points.length - 1][0] : undefined,\n    splitNumber: width < 300 ? 2 : 3,\n    minInterval: width < 300 ? 12 * 60 * 60 * 1000 : 6 * 60 * 60 * 1000,\n    axisLine: { show: true, lineStyle: { color: 'rgba(148, 163, 184, 0.32)' } },\n    axisTick: { show: false },\n    axisLabel: {\n      color: MUTED,\n      fontSize: 9,\n      hideOverlap: true,\n      showMinLabel: true,\n      showMaxLabel: true,\n      margin: 7,\n      formatter: timeLabel,\n    },\n    splitLine: { show: false },\n  },\n  yAxis: {\n    type: 'value',\n    show: false,\n    min: yDomain.min,\n    max: yDomain.max,\n    splitLine: { show: true, lineStyle: { color: GRID } },\n  },\n  series: [{\n    name: frame?.name || 'History',\n    type: 'line',\n    data: points,\n    showSymbol: false,\n    connectNulls: false,\n    smooth: 0.22,\n    sampling: 'lttb',\n    silent: false,\n    lineStyle: { color: CYAN, width: 2 },\n    itemStyle: { color: CYAN },\n    areaStyle: {\n      color: {\n        type: 'linear',\n        x: 0,\n        y: 0,\n        x2: 0,\n        y2: 1,\n        colorStops: [\n          { offset: 0, color: 'rgba(79, 195, 247, 0.30)' },\n          { offset: 1, color: 'rgba(79, 195, 247, 0.025)' },\n        ],\n      },\n    },\n    emphasis: { disabled: true },\n  }],\n};",
+        "editor": {
+          "format": "auto",
+          "height": 650
         },
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "values": false
+        "themeEditor": {
+          "name": "default",
+          "config": "{}"
+        },
+        "visualEditor": {
+          "code": "return { dataset: context.editor.dataset, series: context.editor.series, xAxis: { type: 'time' }, yAxis: { type: 'value' } };",
+          "dataset": [],
+          "series": []
+        },
+        "baidu": {
+          "callback": "bmapReady",
+          "key": ""
+        },
+        "gaode": {
+          "key": "",
+          "plugin": "AMap.Scale,AMap.ToolBar"
+        },
+        "google": {
+          "callback": "gmapReady",
+          "key": ""
         }
-      }
+      },
+      "pluginVersion": "7.1.0"
     },
     {
       "id": 14,
-      "type": "stat",
+      "type": "volkovlabs-echarts-panel",
       "title": "Max / install",
       "description": "Audience & scale — highest channel count on one installation. Aggregate context only; this is not a fault threshold.",
       "transparent": true,
       "gridPos": {
-        "x": 14,
-        "y": 5,
-        "w": 3,
+        "x": 11,
+        "y": 9,
+        "w": 6,
         "h": 4
       },
       "targets": [
@@ -829,22 +925,38 @@
         "overrides": []
       },
       "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "center",
-        "orientation": "auto",
-        "textMode": "value",
-        "wideLayout": true,
-        "text": {
-          "valueSize": 30
+        "renderer": "canvas",
+        "map": "none",
+        "editorMode": "code",
+        "followTheme": true,
+        "getOption": "const CYAN = '#4FC3F7';\nconst MUTED = 'rgba(204, 217, 229, 0.62)';\nconst GRID = 'rgba(148, 163, 184, 0.13)';\nconst frame = context.panel.data.series.find((candidate) =>\n  candidate.fields.some((field) => field.type === 'time') &&\n  candidate.fields.some((field) => field.type === 'number')\n);\nconst timeField = frame?.fields.find((field) => field.type === 'time');\nconst valueField = frame?.fields.find((field) => field.type === 'number');\nconst asArray = (field) => field?.values?.toArray\n  ? field.values.toArray()\n  : Array.from(field?.values ?? []);\nconst times = asArray(timeField);\nconst values = asArray(valueField);\nconst points = times\n  .map((time, index) => {\n    const rawValue = values[index];\n    return [Number(time), rawValue == null ? Number.NaN : Number(rawValue)];\n  })\n  .filter(([time, value]) => Number.isFinite(time) && Number.isFinite(value));\nconst latestPoint = points.length ? points[points.length - 1] : null;\nconst latestValue = latestPoint?.[1];\nconst width = context.panel.chart.getWidth();\nconst compact = width < 230 && Math.abs(latestValue ?? 0) >= 1000;\nconst valueText = Number.isFinite(latestValue)\n  ? new Intl.NumberFormat('en-GB', compact\n      ? { notation: 'compact', maximumFractionDigits: 1 }\n      : { maximumFractionDigits: 1 }\n    ).format(latestValue)\n  : '—';\nconst valueSize = width < 210 ? 23 : width < 420 ? 32 : 38;\nconst graphLeft = width < 210 ? '44%' : '40%';\nconst timeLabel = (value, index) => {\n  if (width < 300 && index % 2 === 1) return '';\n  const date = new Date(value);\n  const hours = String(date.getUTCHours()).padStart(2, '0');\n  if (width < 300) return `${hours}h`;\n  const minutes = String(date.getUTCMinutes()).padStart(2, '0');\n  return `${hours}:${minutes}`;\n};\n\nconst finiteValues = points.map((point) => point[1]);\nconst initialValue = finiteValues.length ? finiteValues[0] : 0;\nconst observedMin = finiteValues.length ? Math.min(...finiteValues) : initialValue;\nconst observedMax = finiteValues.length ? Math.max(...finiteValues) : initialValue;\nconst minimumSpan = 10;\nconst baselineMin = Math.max(0, initialValue - minimumSpan / 2);\nconst baselineMax = Math.max(initialValue + minimumSpan / 2, baselineMin + minimumSpan);\nlet domainMin = baselineMin;\nlet domainMax = baselineMax;\nif (observedMin < baselineMin) {\n  const lowerExcursion = baselineMin - observedMin;\n  const lowerHeadroom = Math.max(1, lowerExcursion * 0.15);\n  domainMin = Math.max(0, observedMin - lowerHeadroom);\n}\nif (observedMax > baselineMax) {\n  const upperExcursion = observedMax - baselineMax;\n  const upperHeadroom = Math.max(1, upperExcursion * 0.15);\n  domainMax = observedMax + upperHeadroom;\n}\nif (domainMax - domainMin < minimumSpan) domainMax = domainMin + minimumSpan;\nconst yDomain = { min: domainMin, max: domainMax };\n\nreturn {\n  animation: false,\n  backgroundColor: 'transparent',\n  graphic: [\n    {\n      type: 'text',\n      left: width < 210 ? '3%' : '5%',\n      top: '31%',\n      silent: true,\n      style: {\n        text: valueText,\n        fill: CYAN,\n        fontFamily: 'Inter, Roboto, sans-serif',\n        fontSize: valueSize,\n        fontWeight: 500,\n      },\n    },\n    ...(!points.length ? [{\n      type: 'text',\n      left: graphLeft,\n      top: '35%',\n      silent: true,\n      style: {\n        text: 'Awaiting samples',\n        fill: MUTED,\n        fontFamily: 'Inter, Roboto, sans-serif',\n        fontSize: 11,\n      },\n    }] : []),\n  ],\n  grid: {\n    left: graphLeft,\n    right: 22,\n    top: 8,\n    bottom: 25,\n    containLabel: false,\n  },\n  tooltip: {\n    trigger: 'axis',\n    confine: true,\n    backgroundColor: 'rgba(17, 24, 39, 0.96)',\n    borderColor: 'rgba(79, 195, 247, 0.35)',\n    textStyle: { color: '#E5EEF5', fontSize: 11 },\n    valueFormatter: (value) => Number.isFinite(Number(value))\n      ? new Intl.NumberFormat('en-GB', { maximumFractionDigits: 1 }).format(Number(value))\n      : '—',\n  },\n  xAxis: {\n    type: 'time',\n    show: points.length > 0,\n    boundaryGap: false,\n    min: points.length ? points[0][0] : undefined,\n    max: points.length ? points[points.length - 1][0] : undefined,\n    splitNumber: width < 300 ? 2 : 3,\n    minInterval: width < 300 ? 12 * 60 * 60 * 1000 : 6 * 60 * 60 * 1000,\n    axisLine: { show: true, lineStyle: { color: 'rgba(148, 163, 184, 0.32)' } },\n    axisTick: { show: false },\n    axisLabel: {\n      color: MUTED,\n      fontSize: 9,\n      hideOverlap: true,\n      showMinLabel: true,\n      showMaxLabel: true,\n      margin: 7,\n      formatter: timeLabel,\n    },\n    splitLine: { show: false },\n  },\n  yAxis: {\n    type: 'value',\n    show: false,\n    min: yDomain.min,\n    max: yDomain.max,\n    splitLine: { show: true, lineStyle: { color: GRID } },\n  },\n  series: [{\n    name: frame?.name || 'History',\n    type: 'line',\n    data: points,\n    showSymbol: false,\n    connectNulls: false,\n    smooth: 0.22,\n    sampling: 'lttb',\n    silent: false,\n    lineStyle: { color: CYAN, width: 2 },\n    itemStyle: { color: CYAN },\n    areaStyle: {\n      color: {\n        type: 'linear',\n        x: 0,\n        y: 0,\n        x2: 0,\n        y2: 1,\n        colorStops: [\n          { offset: 0, color: 'rgba(79, 195, 247, 0.30)' },\n          { offset: 1, color: 'rgba(79, 195, 247, 0.025)' },\n        ],\n      },\n    },\n    emphasis: { disabled: true },\n  }],\n};",
+        "editor": {
+          "format": "auto",
+          "height": 650
         },
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "values": false
+        "themeEditor": {
+          "name": "default",
+          "config": "{}"
+        },
+        "visualEditor": {
+          "code": "return { dataset: context.editor.dataset, series: context.editor.series, xAxis: { type: 'time' }, yAxis: { type: 'value' } };",
+          "dataset": [],
+          "series": []
+        },
+        "baidu": {
+          "callback": "bmapReady",
+          "key": ""
+        },
+        "gaode": {
+          "key": "",
+          "plugin": "AMap.Scale,AMap.ToolBar"
+        },
+        "google": {
+          "callback": "gmapReady",
+          "key": ""
         }
-      }
+      },
+      "pluginVersion": "7.1.0"
     },
     {
       "id": 4,
@@ -855,7 +967,7 @@
         "x": 17,
         "y": 5,
         "w": 7,
-        "h": 4
+        "h": 8
       },
       "targets": [
         {
@@ -936,9 +1048,9 @@
       "description": "Aggregate Worker requests in finalized five-minute windows. Disconnected clients are context rather than service failure.",
       "gridPos": {
         "x": 0,
-        "y": 9,
+        "y": 13,
         "w": 8,
-        "h": 12
+        "h": 8
       },
       "targets": [
         {
@@ -1012,9 +1124,9 @@
       "description": "D1 rows read and written in delayed, finalized five-minute Cloudflare analytics windows.",
       "gridPos": {
         "x": 8,
-        "y": 9,
+        "y": 13,
         "w": 8,
-        "h": 12
+        "h": 8
       },
       "targets": [
         {
@@ -1096,9 +1208,9 @@
       "description": "Aggregate delivery outcomes from recent notification cycles. Coral failures and amber backlog remain quiet unless non-zero.",
       "gridPos": {
         "x": 16,
-        "y": 9,
+        "y": 13,
         "w": 8,
-        "h": 12
+        "h": 8
       },
       "targets": [
         {

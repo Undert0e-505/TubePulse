@@ -15,7 +15,7 @@ By default, all published ports are explicitly bound to `127.0.0.1`. Grafana per
 
 The tracked default remains loopback-only. A host may opt Grafana alone into same-LAN access with ignored `monitoring/.env.local` configuration and the tracked, Private-profile Windows Firewall helper described below. Prometheus, the collector, and the authority stay loopback-only. Anonymous viewers can see aggregate operational data but cannot edit dashboards; no record identifiers or credentials are exposed by this stack. For an unattended display, append `?orgId=1&kiosk` to the wallboard URL; omit it to retain ordinary Grafana navigation.
 
-The tracked Compose file pins explicit Prometheus, Grafana, and Node image versions and digests. Services use `restart: unless-stopped`, bounded Docker JSON logs, and a separate Compose project. The monitoring network joins the existing private authority network only so the collector can reach the aggregate endpoint. Monitoring has no authority credentials and cannot mutate application state.
+The tracked Compose file pins explicit Prometheus, Grafana, and Node image versions and digests. Grafana also preinstalls the signed Business Charts plugin at exactly `volkovlabs-echarts-panel@7.1.0`; that release supports the pinned Grafana 12.2 image and supplies the Apache ECharts audience cards. The plugin is restored automatically when Grafana is recreated, rather than depending on a manual UI installation. Services use `restart: unless-stopped`, bounded Docker JSON logs, and a separate Compose project. The monitoring network joins the existing private authority network only so the collector can reach the aggregate endpoint. Monitoring has no authority credentials and cannot mutate application state.
 
 ## Start, stop, and status
 
@@ -104,7 +104,7 @@ Historical monitoring data is intentionally ignored and local. It is lost with t
 
 ## Dashboard and guardrails
 
-The provisioned `TubePulse Wallboard` keeps current health, freshness, aggregate audience/scale, budget risk, key trends and actionable non-zero signals in one desktop viewport. Health uses three severities: green for fully healthy, amber when the service remains available but an actionable warning exists, and red only for a core availability fault or dangerous budget use. It defaults to the last 24 hours in UTC and refreshes every 30 seconds. Its ordinary local URL is the Grafana wallboard URL above; kiosk mode is:
+The provisioned `TubePulse Wallboard` keeps current health, freshness, aggregate audience/scale, budget risk, key trends and actionable non-zero signals in one desktop viewport. Each audience metric is an Apache ECharts card with its current value and 24-hour history on one horizontal row, including a UTC time axis at mobile widths. Health uses three severities: green for fully healthy, amber when the service remains available but an actionable warning exists, and red only for a core availability fault or dangerous budget use. It defaults to the last 24 hours in UTC and refreshes every 30 seconds. Its ordinary local URL is the Grafana wallboard URL above; kiosk mode is:
 
 ```text
 http://127.0.0.1:3000/d/tubepulse-operations/tubepulse-operations?orgId=1&kiosk

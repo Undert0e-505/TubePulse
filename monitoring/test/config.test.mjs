@@ -103,16 +103,107 @@ test('wallboard is a readable one-screen calm health overview', () => {
     return panel;
   });
   for (const panel of audiencePanels) {
-    assert.equal(panel.type, 'stat');
+    assert.equal(panel.type, 'volkovlabs-echarts-panel');
+    assert.equal(panel.pluginVersion, '7.1.0');
     assert.equal(panel.transparent, true, `${panel.title} should read as part of one quiet group`);
     assert.equal(panel.targets.length, 1, `${panel.title} must remain readable when mobile panels stack`);
     assert.equal(panel.targets[0].instant, false);
     assert.equal(panel.targets[0].range, true);
-    assert.equal(panel.options.graphMode, 'area', `${panel.title} must show its own history`);
-    assert.ok(panel.gridPos.h >= 4, `${panel.title} needs enough height for a visible sparkline`);
-    assert.equal(panel.options.textMode, 'value');
+    assert.equal(panel.options.editorMode, 'code');
+    assert.equal(panel.options.renderer, 'canvas');
+    assert.equal(panel.options.followTheme, true);
+    assert.ok(panel.gridPos.h >= 4, `${panel.title} needs enough height for a value, history and axis`);
+    assert.ok(panel.gridPos.w >= 3, `${panel.title} needs enough desktop width for an unambiguous label`);
     assert.equal(panel.fieldConfig.defaults.thresholds, undefined, 'scale counts must not use danger thresholds');
     assert.equal(panel.fieldConfig.defaults.color.fixedColor, '#4FC3F7');
+
+    const chartFunction = panel.options.getOption;
+    assert.doesNotThrow(() => new Function('context', chartFunction), `${panel.title} chart function must parse`);
+    assert.match(chartFunction, /const latestPoint = points\.length \? points\[points\.length - 1\] : null/);
+    assert.match(chartFunction, /rawValue == null \? Number\.NaN/);
+    assert.match(chartFunction, /graphic:/, `${panel.title} must render the current value in the chart`);
+    assert.match(chartFunction, /grid:/, `${panel.title} must keep value and history in one composition`);
+    assert.match(chartFunction, /graphLeft/, `${panel.title} must reserve a same-row graph region`);
+    assert.match(chartFunction, /xAxis:[\s\S]*type: 'time'/, `${panel.title} must expose a real time axis`);
+    assert.match(chartFunction, /showMinLabel: true/);
+    assert.match(chartFunction, /showMaxLabel: true/);
+    assert.match(chartFunction, /splitNumber: width < 300 \? 2 : 3/, `${panel.title} must adapt axis density at narrow widths`);
+    assert.match(chartFunction, /minInterval: width < 300 \? 12 \* 60 \* 60 \* 1000/, `${panel.title} must avoid cramped desktop time labels`);
+    assert.match(chartFunction, /width < 300 && index % 2 === 1/, `${panel.title} must suppress alternate labels in narrow desktop cards`);
+    assert.match(chartFunction, /const initialValue = finiteValues\.length \? finiteValues\[0\] : 0/);
+    assert.match(chartFunction, /const minimumSpan = 10;/, `${panel.title} must prevent misleadingly tight count scaling`);
+    assert.match(chartFunction, /const baselineMin = Math\.max\(0, initialValue - minimumSpan \/ 2\)/);
+    assert.match(chartFunction, /const baselineMax = Math\.max\(initialValue \+ minimumSpan \/ 2, baselineMin \+ minimumSpan\)/);
+    assert.doesNotMatch(chartFunction, /magnitude \* 0\.10/, `${panel.title} must use the fixed ten-unit minimum span`);
+    assert.match(chartFunction, /min: yDomain\.min/);
+    assert.match(chartFunction, /max: yDomain\.max/);
+    assert.match(chartFunction, /#4FC3F7/);
+    assert.match(chartFunction, /Awaiting samples/, `${panel.title} needs an explicit no-data state`);
+
+    const render = new Function('context', chartFunction);
+    const option = render({
+      panel: {
+        chart: { getWidth: () => 360 },
+        data: {
+          series: [{
+            name: panel.title,
+            fields: [
+              { type: 'time', values: [1000, 2000, 3000] },
+              { type: 'number', values: [7, null, 9] },
+            ],
+          }],
+        },
+      },
+    });
+    assert.equal(option.graphic[0].style.text, '9', `${panel.title} must display the last non-null value`);
+    assert.deepEqual(option.series[0].data, [[1000, 7], [3000, 9]], `${panel.title} must not turn nulls into zeros`);
+    assert.equal(option.xAxis.type, 'time');
+    assert.equal(option.series[0].lineStyle.color, '#4FC3F7');
+    assert.ok(String(option.grid.left).endsWith('%'), `${panel.title} graph must remain beside the value`);
+    assert.ok(option.grid.right >= 18, `${panel.title} must reserve room for its final time label`);
+
+    for (const domainCase of [
+      { name: 'initial ten stays anchored', values: [10, 9, 11], expected: [5, 15] },
+      { name: 'initial hundred stays anchored', values: [100, 101], expected: [95, 105] },
+      { name: 'flat count', values: [70, 70], expected: [65, 75] },
+      { name: 'zero count', values: [0, 0], expected: [0, 10] },
+      { name: 'low initial count', values: [2, 2], expected: [0, 10] },
+      { name: 'upper escape', values: [10, 20], fixedMin: 5, expandedMax: 20 },
+      { name: 'lower escape', values: [10, 2], expandedMin: 2, fixedMax: 15 },
+      { name: 'wide range', values: [0, 100], fixedMin: 0, expandedMax: 100 },
+    ]) {
+      const times = domainCase.values.map((_, index) => 1000 + index * 1000);
+      const domainOption = render({
+        panel: {
+          chart: { getWidth: () => 360 },
+          data: {
+            series: [{
+              name: panel.title,
+              fields: [
+                { type: 'time', values: times },
+                { type: 'number', values: domainCase.values },
+              ],
+            }],
+          },
+        },
+      });
+      const domainSpan = domainOption.yAxis.max - domainOption.yAxis.min;
+      const observedMin = Math.min(...domainCase.values);
+      const observedMax = Math.max(...domainCase.values);
+      assert.ok(domainOption.yAxis.min >= 0, `${panel.title}: ${domainCase.name} must keep a zero floor`);
+      assert.ok(domainOption.yAxis.min <= observedMin, `${panel.title}: ${domainCase.name} must contain its minimum`);
+      assert.ok(domainOption.yAxis.max >= observedMax, `${panel.title}: ${domainCase.name} must contain its maximum`);
+      assert.ok(domainSpan >= 10 - 1e-9, `${panel.title}: ${domainCase.name} domain is too tight`);
+      if (domainCase.expected) assert.deepEqual(
+        [domainOption.yAxis.min, domainOption.yAxis.max],
+        domainCase.expected,
+        `${panel.title}: ${domainCase.name} must retain the initial ten-unit band`,
+      );
+      if (domainCase.fixedMin !== undefined) assert.equal(domainOption.yAxis.min, domainCase.fixedMin);
+      if (domainCase.fixedMax !== undefined) assert.equal(domainOption.yAxis.max, domainCase.fixedMax);
+      if (domainCase.expandedMin !== undefined) assert.ok(domainOption.yAxis.min < domainCase.expandedMin);
+      if (domainCase.expandedMax !== undefined) assert.ok(domainOption.yAxis.max > domainCase.expandedMax);
+    }
   }
   assert.deepEqual(
     audiencePanels.map(({ targets }) => targets[0].expr),
@@ -141,7 +232,7 @@ test('wallboard is a readable one-screen calm health overview', () => {
   for (const title of ['Service traffic · 24h', 'Database activity · 24h', 'Notification delivery · 24h']) {
     const trend = byTitle.get(title);
     assert.equal(trend.type, 'timeseries');
-    assert.ok(trend.gridPos.h >= 10);
+    assert.ok(trend.gridPos.h >= 8);
     assert.equal(trend.fieldConfig.defaults.custom.axisGridShow, false);
     assert.equal(trend.options.legend.placement, 'bottom');
   }
@@ -269,6 +360,8 @@ test('compose keeps collector and Prometheus on loopback and defaults Grafana to
   assert.match(read('monitoring', '.env.local.example'), /TUBEPULSE_MONITORING_GRAFANA_BIND_ADDRESS=127\.0\.0\.1/);
   assert.match(compose, /prom\/prometheus:v[^@]+@sha256:[a-f0-9]{64}/);
   assert.match(compose, /grafana\/grafana:v?[^@]+@sha256:[a-f0-9]{64}/);
+  assert.match(compose, /GF_PLUGINS_PREINSTALL_SYNC:\s*volkovlabs-echarts-panel@7\.1\.0/);
+  assert.doesNotMatch(compose, /volkovlabs-echarts-panel@(latest|7\.2\.)/);
   assert.match(compose, /retention\.size=5GB/);
 });
 
