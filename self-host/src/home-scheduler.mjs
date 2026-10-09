@@ -5,6 +5,7 @@ import { isCommunityPostsEnabled, parseCommunityPostChannelAllowlist } from '../
 import { isCommunityPostsDebugEnabled, pollSingleCommunityChannel } from '../../worker/tubepulse-posts/index.js';
 import { pollSingleRssChannel, processChannelUploads } from '../../worker/tubepulse-rss-0/index.js';
 import { runAuxTick } from '../../worker/tubepulse-aux/index.js';
+import { runAlignedVideoNotifications } from '../../worker/tubepulse-aux/aligned-video-notifications.mjs';
 import { getKV, key, mergeRssUploadsIntoRecentVideos, putKVIfChanged, stableJson } from '../../worker/tubepulse-cron/shared.mjs';
 import { isSyncExcluded } from './exclusions.mjs';
 import { JsonStateFile } from './file-state.mjs';
@@ -69,6 +70,7 @@ function freshSchedulerState(mode = 'shadow') {
     nextSweepAt: null,
     overlapSkips: 0,
     rssHealth: normalizeRssHealthState(null),
+    alignedVideoNotifications: { activatedAt: null },
   };
 }
 
@@ -828,9 +830,16 @@ export class HomeSchedulerRunner {
     }
   }
 
-  createEnvironment(target, notifications, notificationQueue = [], pendingNotifications = new Set()) {
+  createEnvironment(
+    target,
+    notifications,
+    notificationQueue = [],
+    pendingNotifications = new Set(),
+    alignedVideoDirty = new Set(),
+  ) {
     return {
       ...this.config.workerBindings,
+      TUBEPULSE_ALIGNED_VIDEO_NOTIFICATIONS_ENABLED: Boolean(this.config.alignedVideoNotificationsEnabled),
       TUBEPULSE_KV: target,
       // Active Home captures notification intents through the existing
       // no-network shadow sentinel. Delivery happens only after canonical KV,
@@ -840,6 +849,9 @@ export class HomeSchedulerRunner {
       TUBEPULSE_DEFERRED_NOTIFICATION_PENDING: (deviceId, channelId) => (
         pendingNotifications.has(`${deviceId}|${channelId}`)
       ),
+      TUBEPULSE_ALIGNED_VIDEO_DIRTY: (deviceId, channelId) => {
+        alignedVideoDirty.add(`${deviceId}|${channelId}`);
+      },
       TUBEPULSE_SHADOW_NOTIFICATION_OBSERVER: async (intent) => {
         const { kind, deviceId, channelId } = intent || {};
         notifications.total++;
@@ -1707,19 +1719,44 @@ export class HomeSchedulerRunner {
     const notifications = { total: 0, byKind: {} };
     const notificationQueue = [];
     const pendingNotifications = new Set();
+    const alignedVideoDirty = new Set();
     try {
       // Minute ticks keep posts/aux work aligned. Video detection itself is
       // batched and runs only on aligned five-minute boundaries.
       const shouldPrepare = true;
       const seed = shouldPrepare ? await this.publication.prepare() : null;
       const target = new RecordingKv(this.publication.target(), journal);
-      const env = this.createEnvironment(target, notifications, notificationQueue, pendingNotifications);
+      let alignedActivationAt = null;
+      if (this.config.alignedVideoNotificationsEnabled) {
+        const state = await this.stateFile.read();
+        state.alignedVideoNotifications ||= { activatedAt: null };
+        if (!state.alignedVideoNotifications.activatedAt) {
+          state.alignedVideoNotifications.activatedAt = iso(this.now());
+          await this.stateFile.write(state);
+        }
+        alignedActivationAt = Date.parse(state.alignedVideoNotifications.activatedAt);
+      }
+      const env = this.createEnvironment(
+        target, notifications, notificationQueue, pendingNotifications, alignedVideoDirty,
+      );
       const sweep = this.config.videoSourceMode === 'youtube-api'
         ? await this.runYoutubeDataApiCycle(env, target, scheduledTime, { force: forceSweep })
         : forceSweep
           ? await this.runRssSweep(env, target, scheduledTime)
           : await this.runRssCohort(env, target, scheduledTime);
+      let alignedNotifications = { outcome: 'disabled' };
+      if (this.config.alignedVideoNotificationsEnabled
+        && Math.floor(scheduledTime / MINUTE_MS) % 5 === 0
+        && sweep?.outcome !== 'error') {
+        const alignedContext = new WaitUntilContext();
+        alignedNotifications = await runAlignedVideoNotifications(env, alignedContext, scheduledTime, {
+          activationAt: Number.isFinite(alignedActivationAt) ? alignedActivationAt : scheduledTime,
+          newlyDetectedPairs: alignedVideoDirty,
+        });
+        await alignedContext.flush();
+      }
       const minuteJobs = await this.runMinuteJobs(env, target, scheduledTime, { forcePosts });
+      minuteJobs.alignedVideoNotifications = alignedNotifications;
       let publication;
       let notificationPublication = null;
       let notificationDelivery;

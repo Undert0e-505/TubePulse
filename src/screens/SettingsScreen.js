@@ -189,7 +189,7 @@ export default function SettingsScreen() {
       </View>
       <Text style={styles.guidance}>
         {mode === 'chill'
-          ? 'Chill: notify once, then remind roughly every 4 hours until you watch it.'
+          ? 'Chill: notify once, then remind every 4 hours until you watch it.'
           : "Relentless: remind you every nag interval until you've watched it."}
       </Text>
 
@@ -219,10 +219,8 @@ export default function SettingsScreen() {
       </View>
       <Text style={styles.guidance}>
         {mode === 'chill'
-          ? 'Chill mode reminds roughly every 4 hours. Nag interval only applies to Relentless mode.'
-          : settings.nagInterval === 5
-            ? '5-minute reminders run for the first hour, then back off to 15 minutes.'
-            : 'Relentless mode repeats reminders using the selected interval while items remain unread.'}
+          ? 'Chill mode reminds every 4 hours. Nag interval only applies to Relentless mode.'
+          : 'Relentless mode repeats reminders using the selected interval while items remain unread.'}
       </Text>
 
       {/* Do Not Disturb */}

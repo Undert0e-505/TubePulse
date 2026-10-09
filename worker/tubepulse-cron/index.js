@@ -2,7 +2,7 @@
 // All work has been moved to sharded workers:
 //   tubepulse-rss      — RSS/video polling (per-channel, every minute)
 //   tubepulse-posts    — Community post polling (per-channel, every minute)
-//   tubepulse-nag      — Nag/reminder processing (bounded batch, every minute)
+//   tubepulse-nag      — Legacy nag/reminder rollback path (bounded batch)
 //   tubepulse-prewarn  — Prewarn + upcoming drain (every minute)
 //
 // This worker remains deployed only to keep the old cron schedule

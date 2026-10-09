@@ -54,6 +54,9 @@ function serializableIntent(intent) {
     contentIds: intent.contentIds,
     requireUnwatched: intent.requireUnwatched,
     dedupeVersion: intent.dedupeVersion ?? null,
+    watermarkAt: intent.watermarkAt != null && Number.isFinite(Number(intent.watermarkAt))
+      ? Number(intent.watermarkAt)
+      : null,
   };
 }
 
@@ -301,7 +304,9 @@ export class ProductionNotificationCoordinator {
       const current = await getKV(kv, stateKey) || { unwatched: [], lastNagAt: null, nagCount: 0 };
       await putKV(kv, stateKey, {
         ...current,
-        lastNagAt: Date.now(),
+        lastNagAt: intent.watermarkAt != null && Number.isFinite(Number(intent.watermarkAt))
+          ? Number(intent.watermarkAt)
+          : Date.now(),
         ...(intent.kind === 'nag' ? { nagCount: Number(current.nagCount || 0) + 1 } : {}),
       });
     };

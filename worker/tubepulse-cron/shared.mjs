@@ -109,7 +109,7 @@ export function selectCommunityPostWork(eligibleChannels, minuteSlot) {
 
 // ─── DND logic ──────────────────────────────────────────────────────────
 
-export function isDndActive(dndStart, dndEnd, timezone = 'UTC') {
+export function isDndActive(dndStart, dndEnd, timezone = 'UTC', now = new Date()) {
   const [sh, sm] = dndStart.split(':').map(Number);
   const [eh, em] = dndEnd.split(':').map(Number);
   const startMins = sh * 60 + sm;
@@ -123,13 +123,13 @@ export function isDndActive(dndStart, dndEnd, timezone = 'UTC') {
       minute: '2-digit',
       hour12: false,
     });
-    const parts = fmt.formatToParts(new Date());
+    const parts = fmt.formatToParts(new Date(now));
     const hh = parseInt(parts.find(p => p.type === 'hour')?.value || '0', 10);
     const mm = parseInt(parts.find(p => p.type === 'minute')?.value || '0', 10);
     nowMins = hh * 60 + mm;
   } catch {
-    const now = new Date();
-    nowMins = now.getUTCHours() * 60 + now.getUTCMinutes();
+    const fallbackNow = new Date(now);
+    nowMins = fallbackNow.getUTCHours() * 60 + fallbackNow.getUTCMinutes();
   }
 
   if (startMins <= endMins) {
@@ -597,6 +597,43 @@ export function getNagIntervalMs(effective, state) {
     return activeMinutes * 60 * 1000;
   }
   return configuredMinutes * 60 * 1000;
+}
+
+// The aligned Home notification owner deliberately does not inherit the
+// legacy 5-minute-after-twelve backoff. Every supported interval is an exact
+// multiple of the five-minute video raster.
+export function getAlignedNagIntervalMs(effective) {
+  if ((effective?.mode || 'chill') === 'chill') return 4 * 60 * 60 * 1000;
+  const requested = Number(effective?.nagInterval || 15);
+  const minutes = [5, 15, 30, 60, 120].includes(requested) ? requested : 15;
+  return minutes * 60 * 1000;
+}
+
+export function videoNotificationTag(channelId) {
+  return `tubepulse-channel-${channelId}`;
+}
+
+// Installed clients have emitted both the compact server names and the UI
+// names over time. Keep the server tolerant so changing ownership does not
+// require a client migration.
+export function effectiveNotificationSettings(settings = {}, override = {}) {
+  settings ||= {};
+  override ||= {};
+  return {
+    mode: override.mode ?? override.notificationMode
+      ?? settings.mode ?? settings.notificationMode ?? 'chill',
+    nagInterval: override.nagInterval ?? settings.nagInterval ?? 15,
+    muted: override.muted ?? false,
+    dndEnabled: override.dndEnabled ?? settings.dndEnabled ?? false,
+    dndStart: override.dndStart ?? settings.dndStart ?? '22:00',
+    dndEnd: override.dndEnd ?? settings.dndEnd ?? '07:00',
+    dndTimezone: override.dndTimezone ?? settings.dndTimezone ?? 'UTC',
+    dndBypass: override.dndBypass ?? false,
+    tapAction: override.tapAction ?? settings.tapAction ?? 'video',
+    includeCommunityPosts: override.includeCommunityPosts
+      ?? settings.includeCommunityPosts
+      ?? false,
+  };
 }
 
 // ─── Cleanup helpers ────────────────────────────────────────────────────

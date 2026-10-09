@@ -77,10 +77,19 @@ above still apply.
 
 ### Reminder mode and interval
 
-- **Chill** sends the initial video notification and can nudge again after a longer interval while
-  the video remains unseen.
-- **Relentless** can repeat at the selected nag interval while the video remains unseen.
+- **Chill** sends the initial video notification and can nudge again every four hours while the video
+  remains unseen.
+- **Relentless** repeats at the selected nag interval while the video remains unseen.
 - Available nag intervals are 5, 15, 30, 60 and 120 minutes.
+
+Video checks are aligned to five-minute boundaries. A newly detected upload produces one notification
+for that channel's complete current visible unseen set: a single item when one is waiting, or one
+bundle when two or three are waiting. Later reminders use the same rule; a fourth unseen item is kept
+but stays outside the notification until it enters the visible top three. Swiping a notification away
+does not mark it seen, while tapping marks the exact single item or exact bundle contents seen. The
+selected Relentless interval remains exact, including 5-minute mode; new content and a due reminder
+on the same tick produce one consolidated alert. Server do-not-disturb defers delivery, while the
+notification mute actions keep delivery visible but silent.
 
 When community posts are enabled globally or for an individual channel, an unread currently visible
 post can be included in that channel's reminder. Disabling posts excludes them from later reminders.

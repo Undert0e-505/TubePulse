@@ -9,6 +9,7 @@ import {
   withKvMutationLock,
   seedKnownVideosFromRss, classifyRssVideosForNotification,
   updateKnownVideosAfterPoll, mergeRssUploadsIntoRecentVideos,
+  effectiveNotificationSettings, videoNotificationTag,
 } from '../tubepulse-cron/shared.mjs';
 
 const RSS_MAX_SHARDS = 3;
@@ -70,6 +71,8 @@ export async function processChannelUploads(env, ctx, channelId, source, options
   const uploads = Array.isArray(source?.uploads) ? source.uploads : [];
   const channelName = source?.channelName || null;
   const logPrefix = String(options.logPrefix || 'RSS').replace(/[^A-Za-z0-9 -]/g, '').slice(0, 32) || 'RSS';
+  const alignedNotifications = env.TUBEPULSE_ALIGNED_VIDEO_NOTIFICATIONS_ENABLED === true
+    || String(env.TUBEPULSE_ALIGNED_VIDEO_NOTIFICATIONS_ENABLED || '').toLowerCase() === 'true';
   if (uploads.length === 0) return { outcome: 'empty-feed' };
 
   // Read display cache and durable known/watermark state.
@@ -134,16 +137,20 @@ export async function processChannelUploads(env, ctx, channelId, source, options
   const subs = await getKV(kv, key.channelSubs(channelId)) || [];
   if (subs.length === 0) return;
 
-  // Get FCM access token (cached)
+  // In aligned mode this pass only records canonical content/unseen state.
+  // The Home owner builds one consolidated notification after every channel
+  // has been reconciled for the raster tick.
   let accessToken;
-  try {
-    accessToken = await getCachedFcmAccessToken(env);
-  } catch (err) {
-    console.error(`[${logPrefix}] FCM token error:`, err.message);
-    return;
+  let projectId;
+  if (!alignedNotifications) {
+    try {
+      accessToken = await getCachedFcmAccessToken(env);
+      projectId = JSON.parse(env.FIREBASE_SERVICE_ACCOUNT).project_id;
+    } catch (err) {
+      console.error(`[${logPrefix}] FCM token error:`, err.message);
+      return;
+    }
   }
-  const sa = JSON.parse(env.FIREBASE_SERVICE_ACCOUNT);
-  const projectId = sa.project_id;
   const deadDevices = [];
 
   for (const deviceId of subs) {
@@ -156,16 +163,7 @@ export async function processChannelUploads(env, ctx, channelId, source, options
     if (!profile?.fcmToken) continue;
     if (override?.muted) continue;
 
-    const effective = {
-      mode: override?.mode || settings?.mode || 'chill',
-      nagInterval: override?.nagInterval || settings?.nagInterval || 15,
-      dndEnabled: settings?.dndEnabled || false,
-      dndStart: settings?.dndStart || '22:00',
-      dndEnd: settings?.dndEnd || '07:00',
-      dndTimezone: settings?.dndTimezone || 'UTC',
-      dndBypass: override?.dndBypass || false,
-      tapAction: settings?.tapAction || 'video',
-    };
+    const effective = effectiveNotificationSettings(settings, override);
 
     const state = await getKV(kv, key.deviceState(deviceId, channelId)) || {
       unwatched: [], lastNagAt: null, nagCount: 0,
@@ -207,7 +205,10 @@ export async function processChannelUploads(env, ctx, channelId, source, options
 
     if (stateChanged) {
       await putKV(kv, key.deviceState(deviceId, channelId), state);
+      if (alignedNotifications) env.TUBEPULSE_ALIGNED_VIDEO_DIRTY?.(deviceId, channelId);
     }
+
+    if (alignedNotifications) continue;
 
     // Send FCM
     const notifyEntries = newVideos.filter((v) => v.type !== 'live_scheduled' && shouldNotify);
@@ -223,7 +224,7 @@ export async function processChannelUploads(env, ctx, channelId, source, options
             videoId: v.videoId, channelId, channelName, videoLink: v.link,
             type: v.type, tapAction: String(effective.tapAction),
           },
-          tag: `video-${v.videoId}`,
+          tag: videoNotificationTag(channelId),
         };
       } else {
         notifPayload = {
@@ -234,7 +235,7 @@ export async function processChannelUploads(env, ctx, channelId, source, options
             contentIds: JSON.stringify(notifyEntries.map((v) => v.videoId)),
             tapAction: String(effective.tapAction),
           },
-          tag: 'tubepulse-batch',
+          tag: videoNotificationTag(channelId),
         };
       }
       const pushResult = await sendFCMPush(

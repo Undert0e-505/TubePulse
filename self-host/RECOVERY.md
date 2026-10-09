@@ -185,7 +185,7 @@ Expected: required ignored files exist, no secret appears in output/Git, and Wor
 
 ### 4. Create an empty standby Home
 
-Keep `.env.authority` at template-safe values: standby mode, remote write/notifications false, trigger confirmation false, activation latch absent, Data API source selected. Create an empty ignored `self-host/data-authority`; never seed it from frozen KV, Preview, pilot, or another Miniflare store.
+Keep `.env.authority` at template-safe values: standby mode, remote write/notifications false, trigger confirmation false, activation latch absent, Data API source selected, and aligned video notifications false. Create an empty ignored `self-host/data-authority`; never seed it from frozen KV, Preview, pilot, or another Miniflare store.
 
 Start only Home in standby:
 
@@ -269,11 +269,12 @@ Then set only:
 TUBEPULSE_HOME_SCHEDULER_MODE=active
 TUBEPULSE_HOME_SCHEDULER_REMOTE_WRITE_ENABLED=true
 TUBEPULSE_HOME_SCHEDULER_NOTIFICATIONS_ENABLED=true
+TUBEPULSE_HOME_ALIGNED_VIDEO_NOTIFICATIONS_ENABLED=true
 TUBEPULSE_CLOUDFLARE_SCHEDULES_CONFIRMED_DISABLED=true
 TUBEPULSE_HOME_SCHEDULER_ACTIVATION_LATCH=CLOUDFLARE_SCHEDULES_CONFIRMED_DISABLED
 ```
 
-Leave D1 generation, API URL, Data API source, budgets, cadence, and unified-authority latch at verified production values. Start one stack:
+Leave D1 generation, API URL, Data API source, budgets, cadence, and unified-authority latch at verified production values. The current production notification owner also requires `TUBEPULSE_HOME_ALIGNED_VIDEO_NOTIFICATIONS_ENABLED=true`; it consolidates discovery and reminders on the five-minute raster and disables legacy rotating aux video nags. Never enable a Cloudflare scheduled notifier or a second Home scheduler alongside it. Start one stack:
 
 ```powershell
 docker compose --env-file .env.authority -f compose.authority.yaml up -d --force-recreate home-authority cloudflared
@@ -284,7 +285,7 @@ docker compose --env-file .env.authority -f compose.authority.yaml run --rm --no
 
 Verify local/remote current on the same D1 generation/manifest, one scheduler lease, Data API source, a successful aligned cycle, no unexplained pending/transaction/error, unchanged public Worker health, Home-first authenticated feed matching D1 fallback, safe no-op mutation behavior if an existing inert canary exists, and no unexpected notification.
 
-One-off notification intent history cannot be reconstructed. Canonical recent/unwatched state prevents wholesale replay, but a lost local `sending` boundary cannot be proven sent/unsent. Accept the bounded possibility of one suppressed or duplicate one-off push around failure; never mass-clear or resend backlog to compensate. Reminder nags are not recovery backlog: the host rebuilds them from current unwatched and visible content on a later aux cycle.
+One-off notification intent history cannot be reconstructed. Canonical recent/unwatched state prevents wholesale replay, but a lost local `sending` boundary cannot be proven sent/unsent. Accept the bounded possibility of one suppressed or duplicate one-off push around failure; never mass-clear or resend backlog to compensate. Reminder nags are not recovery backlog: the aligned owner rebuilds them from current unwatched and visible content on a later five-minute tick. The persisted activation timestamp and existing `lastNagAt` values prevent enabling the aligned owner from manufacturing a cutover backlog.
 
 ### 9. Install unattended startup
 

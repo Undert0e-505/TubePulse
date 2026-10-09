@@ -230,10 +230,18 @@ export async function updateSettings(deviceId, settings) {
  * Empty override deletes the override (inherits from device-level).
  */
 export async function setChannelOverride(deviceId, channelId, override) {
+  const normalized = override ? { ...override } : override;
+  if (normalized && normalized.notificationMode !== undefined && normalized.mode === undefined) {
+    normalized.mode = normalized.notificationMode;
+    delete normalized.notificationMode;
+  }
+  if (normalized && normalized.dndEnabled !== undefined && normalized.dndTimezone === undefined) {
+    normalized.dndTimezone = getLocalTimezone();
+  }
   return await apiFetch('/channel-override', {
     method: 'POST',
     deviceId,
-    body: { channelId, override },
+    body: { channelId, override: normalized },
   });
 }
 

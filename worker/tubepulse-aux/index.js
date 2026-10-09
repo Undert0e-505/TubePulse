@@ -15,6 +15,7 @@ import {
   getCachedFcmAccessToken, sendFCMPush, cleanupDeadDevice,
   removeFromNagActive,
   withKvMutationLock,
+  effectiveNotificationSettings, videoNotificationTag,
 } from '../tubepulse-cron/shared.mjs';
 
 const NAG_BATCH_SIZE = 5;
@@ -65,7 +66,9 @@ export async function runAuxTick(env, ctx, now = Date.now()) {
     }
 
     // ── 2. Nag: process bounded batch from nag:active ──
-    const nagFired = await runNag(env, ctx, now);
+    const alignedOwner = env.TUBEPULSE_ALIGNED_VIDEO_NOTIFICATIONS_ENABLED === true
+      || String(env.TUBEPULSE_ALIGNED_VIDEO_NOTIFICATIONS_ENABLED || '').toLowerCase() === 'true';
+    const nagFired = alignedOwner ? 0 : await runNag(env, ctx, now);
 
     // ── 3. Prewarn: only if nag had nothing to fire ──
     // Prewarn is rarely urgent (events are hours away). If nag fired
@@ -183,20 +186,7 @@ async function runNag(env, ctx, now) {
 
     if (!profile?.fcmToken) continue;
 
-    const effective = {
-      mode: override?.mode || settings?.mode || 'chill',
-      nagInterval: override?.nagInterval || settings?.nagInterval || 15,
-      dndEnabled: settings?.dndEnabled || false,
-      dndStart: settings?.dndStart || '22:00',
-      dndEnd: settings?.dndEnd || '07:00',
-      dndTimezone: settings?.dndTimezone || 'UTC',
-      dndBypass: override?.dndBypass || false,
-      muted: override?.muted || false,
-      tapAction: settings?.tapAction || 'video',
-      includeCommunityPosts: override?.includeCommunityPosts
-        ?? settings?.includeCommunityPosts
-        ?? false,
-    };
+    const effective = effectiveNotificationSettings(settings, override);
 
     if (effective.muted) continue;
 
@@ -259,10 +249,10 @@ async function runNag(env, ctx, now) {
           data: {
             videoId: itemId, channelId, channelName,
             videoLink: video?.link || `https://www.youtube.com/watch?v=${itemId}`,
-            type: 'nag', notificationTag: `video-${itemId}`,
+            type: 'nag', notificationTag: videoNotificationTag(channelId),
             tapAction: String(effective.tapAction),
           },
-          tag: `video-${itemId}`,
+          tag: videoNotificationTag(channelId),
         };
       }
     } else {
@@ -282,7 +272,7 @@ async function runNag(env, ctx, now) {
           contentIds: JSON.stringify(selectedContentIds),
           tapAction: String(effective.tapAction),
         },
-        tag: `tubepulse-nag-${channelId}`,
+        tag: videoNotificationTag(channelId),
       };
     }
 

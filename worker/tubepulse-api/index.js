@@ -3,6 +3,8 @@ import { createAuthorityWorker, TubePulseAuthorityCoordinator } from './authorit
 import {
   buildFcmMessage,
   normalizeNotificationCapability,
+  effectiveNotificationSettings,
+  videoNotificationTag,
 } from '../tubepulse-cron/shared.mjs';
 
 export { TubePulseAuthorityCoordinator };
@@ -1630,7 +1632,8 @@ async function handleWebSubPush(request, env, ctx) {
     const projectId = sa.project_id;
 
     // Step 4: For each subscriber, send notification + update state.
-    // Nag scheduling is handled by the cron worker's runNagCron (timestamp-based).
+    // Active Home notification scheduling is timestamp-based on the aligned
+    // detector tick; the retained cron runNag path is flag-off rollback only.
     for (const deviceId of subs) {
       // Read profile + settings + override
       const [deviceProfile, deviceSettings, deviceOverride] = await Promise.all([
@@ -1642,17 +1645,7 @@ async function handleWebSubPush(request, env, ctx) {
       if (!deviceProfile?.fcmToken) continue;
 
       // Resolve effective settings
-      const effective = {
-        mode: deviceOverride?.mode || deviceSettings?.mode || 'chill',
-        nagInterval: deviceOverride?.nagInterval || deviceSettings?.nagInterval || 15,
-        dndEnabled: deviceSettings?.dndEnabled || false,
-        dndStart: deviceSettings?.dndStart || '22:00',
-        dndEnd: deviceSettings?.dndEnd || '07:00',
-        dndTimezone: deviceSettings?.dndTimezone || 'UTC',
-        dndBypass: deviceOverride?.dndBypass || false,
-        muted: deviceOverride?.muted || false,
-        tapAction: deviceSettings?.tapAction || 'video',
-      };
+      const effective = effectiveNotificationSettings(deviceSettings, deviceOverride);
 
       if (effective.muted) continue;
 
@@ -1747,7 +1740,7 @@ async function handleWebSubPush(request, env, ctx) {
               type: entry.type,
               tapAction: String(effective.tapAction),
             },
-            tag: `video-${entry.videoId}`,
+            tag: videoNotificationTag(channelId),
           };
         } else {
           // Multiple new videos — batch
@@ -1761,7 +1754,7 @@ async function handleWebSubPush(request, env, ctx) {
               contentIds: JSON.stringify(notifyEntries.map((entry) => entry.videoId)),
               tapAction: String(effective.tapAction),
             },
-            tag: 'tubepulse-batch',
+            tag: videoNotificationTag(channelId),
           };
         }
 
@@ -1770,8 +1763,8 @@ async function handleWebSubPush(request, env, ctx) {
         );
 
         if (result.sent) {
-          // Initialise the nag clock so runNagCron doesn't immediately
-          // re-notify on the next 5-min tick.
+          // Initialise the reminder clock so neither the active aligned owner
+          // nor the flag-off runNag rollback path immediately re-notifies.
           state.lastNagAt = Date.now();
           await putKV(env.TUBEPULSE_KV, key.deviceState(deviceId, channelId), state);
         }

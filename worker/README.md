@@ -78,7 +78,7 @@ If deliberately re-enabled after Home has stopped and drained, these Workers use
 
 The active scheduler runs in the unified Home authority and reuses shared runtime helpers from `worker/tubepulse-cron/shared.mjs` and the established notification path. The Cloudflare entry points `worker/tubepulse-rss-0/1/2/index.js`, `worker/tubepulse-posts/index.js`, and `worker/tubepulse-aux/index.js` are retained rollback wrappers; `worker/tubepulse-cron/index.js` is a retired no-op.
 
-**Current schedule ownership:** the three RSS, posts, and aux Workers have no live Cron Triggers. Every aligned five-minute cycle, the unified Home authority batches all active channel IDs through `channels.list` (at most 50 IDs/request), reconciles the uploads playlist only for migration/change/safety-due channels, and polls video statistics in batches. It checks eligible community posts hourly and runs bounded aux work each minute. RSS is not an automatic fallback.
+**Current schedule ownership:** the three RSS, posts, and aux Workers have no live Cron Triggers. Every aligned five-minute cycle, the unified Home authority batches all active channel IDs through `channels.list` (at most 50 IDs/request), reconciles the uploads playlist only for migration/change/safety-due channels, polls relevant app-visible top-three statistics in batches, and makes the one video notification decision for each eligible device/channel. It checks eligible community posts hourly and runs minute aux only for prewarn/recovery work. RSS is not an automatic fallback.
 
 See [CONTRACTS.md](CONTRACTS.md) for the active worker contract/inventory reference before changing worker behavior.
 
@@ -86,7 +86,8 @@ See [CONTRACTS.md](CONTRACTS.md) for the active worker contract/inventory refere
 |---|---|
 | Home video detector | Sort/de-duplicate `channels:active`; batch `channels.list` by 50; reconcile uploads playlists on baseline/change/six-hour safety due; batch metadata and statistics by 50. A durable known-video watermark prevents deletion/restoration notification cascades. |
 | Home posts | Filter active channels through the optional allowlist and poll eligible channels hourly. First-poll seeding sends no notification. |
-| Host aux | Drain one legacy upcoming bucket, process a restart-safe rotating batch of at most five `nag:active` entries, then check prewarns. Reminder nags are transient and are rebuilt from current app-visible content; prewarns retain durable recovery. |
+| Home aligned video owner | After discovery/state updates, scan all `nag:active` pairs and send at most one compatible single or exact-top-three batch per pair when new or due. Reminders are transient; new-upload intents retain durable recovery. |
+| Host aux | Drain legacy upcoming work and check prewarn/recovery work each minute. Its rotating video-nag path is rollback-only and skipped while the aligned owner flag is enabled. |
 
 The old RSS shard selector used `floor((scheduledTime ?? Date.now()) / 300000)` and remains tested for rollback. It is historical behavior, not the current production detector. Always read `channels:active` for the current fleet rather than relying on a historical count.
 
@@ -113,9 +114,9 @@ Playlist items provide structural upload identity and publication data. Batched 
 
 **Normal detector quota cost: 576 general units/day.** Two one-unit `channels.list` calls every five minutes yield `2 × 288 = 576`. A six-hour first-page safety sweep adds up to `active channels × 4` general units/day; changed-channel playlist/detail calls are event-driven. `videos:batchGetStats` uses the separately accounted statistics bucket. Request counters persist across restart, reset at Pacific midnight, and enforce reserves. There is no active RSS fallback.
 
-### 3.2 FCM push from the cron
+### 3.2 FCM push from Home
 
-For each new video, the cron does the standard fan-out (which is identical to what a WebSub push would have done):
+After each aligned discovery pass, Home performs the standard subscriber fan-out:
 
 1. Read `channel:{id}:subscribers` to get the list of devices
 2. For each device:
@@ -191,12 +192,12 @@ Home keeps the current working copy in its persistent local store. D1 generation
 | `device:{deviceId}:profile` | JSON | `{ fcmToken, platform, appVersion, notificationCapability, createdAt, lastSeenAt }`; capability is `"local-v1"` or `null` | API register plus the hourly-throttled coordinated activity touch after successful authenticated app contact | API (any auth call), Home (FCM fan-out) |
 | `device:{deviceId}:settings` | JSON | `{ mode, nagInterval, dndEnabled, dndStart, dndEnd, dndTimezone, dndBypass, tapAction, includeCommunityPosts (v3.1), prewarnMinutes (v3.1), ... }` | API (settings) | Home (FCM fan-out filter) |
 | `device:{deviceId}:channels` | JSON array | `[channelId, ...]` | API (subscribe, unsubscribe) | API (feed filter) |
-| `device:{deviceId}:override:{channelId}` | JSON | per-channel notification override. May include `mode?`, `nagInterval?`, `dndBypass?`, `muted?`, `includeCommunityPosts?` (**v3.1**, tri-state null/true/false), `prewarnMinutes?` (**v3.1**, tri-state null/number) | API (channel-override) | Home (FCM fan-out filter) |
+| `device:{deviceId}:override:{channelId}` | JSON | per-channel notification override. Accepts `mode?` or `notificationMode?`, plus `nagInterval?`, inherited/per-channel DND fields, `dndBypass?`, `muted?`, `includeCommunityPosts?` (**v3.1**, tri-state null/true/false), and `prewarnMinutes?` (**v3.1**, tri-state null/number) | API (channel-override) | Home (FCM fan-out filter) |
 | `device:{deviceId}:state:{channelId}` | JSON | `{ unwatched: [...], lastNagAt, nagCount }` — `unwatched` holds plain videoIds and `post:{activityId}` for community posts (**v3.1** shares the array via `post:` namespace). `lastNagAt` is a timestamp updated after each successful nag push. `nagCount` tracks the number of reminder nags sent (not counting the initial new-video push). Both are reset to `null`/`0` by `/seen` when `unwatched` becomes empty, so the next unread item starts a fresh nag cadence. | Host (new video, nag fire) | Host (nag fire, seen cleanup) |
 | `upcoming:events:list` | JSON array | `[{ channelId, videoId, scheduledFor, addedAt }, ...]` — currently-scheduled live events, pruned 24h after live (**v3.1**, replaces the pre-v3.1 `upcoming:{bucket}` scheme) | Home video detector | Home aux (prewarn) |
 | `upcoming:prewarn:{videoId}:{deviceId}` | number | `prewarnMinutes` value at send-time, sentinel for "prewarn sent for this (event, device)" (**v3.1**) | Home aux (prewarn fire) | Home aux (prewarn fire) |
 | `upcoming:{bucket}` | JSON array | pre-v3.1 scheduled-livestream entries | (legacy writes only) | Home aux (`runUpcomingCron` drain-only) |
-| `nag:{bucket}` | JSON array | **Legacy/unused** — pending nag entries from the old 15-min bucket system. No longer written by any code path. The timestamp-based `runNagCron` replaces this entirely. | (none — legacy) | (none) |
+| `nag:{bucket}` | JSON array | **Legacy/unused** — pending nag entries from the old 15-min bucket system. No longer written by any code path. Current production uses aligned timestamp-based notification decisions; flag-off rollback uses `runNag`. | (none — legacy) | (none) |
 | `channels:active` | JSON array | `[channelId, ...]` — index of channels with ≥1 subscriber | API (subscribe, unsubscribe) | Home scheduler (Data API video detection, community posts) |
 | `handle:{lowercase}` | JSON | `{ channelId, cachedAt }` — 7-day TTL | API (resolve) | API (resolve) |
 | `fcm:lookup:{fcmToken}` | string | `deviceId` — reverse index from FCM token to the device that owns it | API (register) | API (register, migration) |
@@ -209,44 +210,26 @@ Home keeps the current working copy in its persistent local store. D1 generation
 
 ---
 
-## 5.1 Nag reminder behaviour
+## 5.1 Video notification and reminder behaviour
 
-The nag system sends repeat reminder push notifications while items remain unread. Home runs the aux path every minute; notification eligibility remains timestamp-based.
+Production enables `TUBEPULSE_HOME_ALIGNED_VIDEO_NOTIFICATIONS_ENABLED` in the ignored authority environment. Tracked examples default it to `false` as deployment insurance. When enabled, Home owns all video notifications on the aligned five-minute detector raster and skips the legacy rotating minute `runNag` path; both owners must never be active together.
 
-**How it works:**
+After discovery and canonical state updates, Home scans every indexed `nag:active` device/channel pair. One current app-visible unseen video yields a single notification. Two or three yield one batch containing exactly those visible IDs. A fourth remains in `unwatched` but is excluded until deletion/private removal promotes it. New content sends on its detector tick and resets the channel's reminder clock; if no content is new, a reminder sends only when the configured interval is due. New content plus a due reminder on the same tick is one consolidated push.
 
-1. Iterate `channels:active` → `channel:{id}:subscribers` → `device:{id}:state:{channelId}`
-2. For each subscriber with `unwatched.length > 0`, check `now - state.lastNagAt >= intervalMs`
-3. If enough time has passed, send an FCM nag push and update `state.lastNagAt` + `state.nagCount`
-4. If not enough time has passed, skip (no push, no canonical publication)
-
-**Interval calculation (`getNagIntervalMs`):**
-
-| Mode | Configured interval | Actual interval |
+| Mode | Configured interval | Active aligned interval |
 |---|---|---|
-| Relentless | 5 min | 5 min for first 12 nags (1 hour), then **15 min** (backoff) |
-| Relentless | 15 min | 15 min |
-| Relentless | 30 min | 30 min |
-| Relentless | 60 min | 60 min |
-| Relentless | 120 min | 120 min |
+| Relentless | 5 min | Exactly 5 minutes; no hidden backoff |
+| Relentless | 15 min | Exactly 15 minutes |
+| Relentless | 30 min | Exactly 30 minutes |
+| Relentless | 60 min | Exactly 60 minutes |
+| Relentless | 120 min | Exactly 120 minutes |
 | Chill | any | 4 hours |
 
-**Backoff rationale:** Relentless 5-minute mode would create frequent notification-state publications if sustained indefinitely. After the first hour, the interval backs off to 15 minutes, substantially reducing reminder and persistence churn.
+All intervals are five-minute raster multiples with no former rotating-scan jitter. `nagCount` counts only successfully delivered reminders; `lastNagAt` advances only after successful delivery and is raster-stamped. Both remain in the established state schema for rollback compatibility and reset when `/seen` empties `unwatched`. Failed sends remain eligible for safe recalculation. Resubscription silently seeds the current baseline and never manufactures history.
 
-**nagCount lifecycle:**
-- `nagCount` counts only reminder nags (the initial new-video push does NOT increment it)
-- `nagCount` is incremented in `runNagCron` after each successful FCM delivery
-- `nagCount` and `lastNagAt` are reset to `0`/`null` by `/seen` when `unwatched` becomes empty
-- A new unread item after a full clear starts fresh at `nagCount = 0` (5-min cadence)
-- A new item added while old unread remains does NOT reset `nagCount` (stays in backed-off mode)
+Every future single or batch video notification for one channel uses `tubepulse-channel-{channelId}`. It therefore replaces that channel's previous surface without colliding with another channel. Swiping does not acknowledge and the notification may return at the next due interval. Single taps acknowledge the exact item; bundle taps open the channel and acknowledge their exact `contentIds`. Server DND defers unseen state until the first eligible aligned tick, while local mute keeps the push visible but silent. New livestream notifications retain their DND bypass contract.
 
-**Notification stacking:**
-- Single-video nag: `tag: video-{videoId}` — replaces the original new-video notification in the tray
-- Multi-video nag: `tag: tubepulse-nag-{channelId}` — replaces previous batch nags for that channel
-- Different channels don't collide
-- A dismissed notification **will** reappear on the next nag interval (the FCM tag prevents stacking, not re-delivery)
-
-**Only `/seen` clears unwatched state.** Swiping away an Android tray notification does NOT mark anything seen. Opening settings, changing display mode, refreshing the feed, or app focus does NOT mark anything seen.
+Flag-off preserves the old bounded rotating aux implementation for rollback. It retains the old after-twelve backoff semantics; that behavior is not active production policy. The state and v4.0.0/v4.1.0 `type: nag` and `type: batch` payload schemas require no client migration.
 
 ### 5.2 `/seen` contract
 
@@ -317,10 +300,7 @@ All FCM pushes include an `android.notification.tag` for tray replacement:
 
 | Push type | Tag | Effect |
 |---|---|---|
-| New video (Home Data API poll) | `video-{videoId}` | Replaces any existing notification for the same video |
-| Batch new videos | `tubepulse-batch` | Replaces previous batch notifications |
-| Single-video nag | `video-{videoId}` | Replaces the original notification (updates tray) |
-| Multi-video nag | `tubepulse-nag-{channelId}` | Replaces previous batch nags for that channel |
+| Video or video reminder, single or batch | `tubepulse-channel-{channelId}` | Replaces the current video surface for that channel only |
 | Prewarn | `video-{videoId}` | Replaces previous prewarn for the same event |
 | Community post | (no explicit tag — defaults to `tubepulse`) | May stack if multiple posts arrive; acceptable for rare community posts |
 
@@ -330,9 +310,9 @@ Different channels don't collide (channel-specific tags). A dismissed notificati
 
 D1 rows written are the primary cloud-storage budget concern. The free plan allows 100,000 rows written per UTC day (Cloudflare plan-dependent).
 
-- Each successful nag changes `device:state` (one logical canonical mutation; D1 guard/application/cleanup rows are budgeted conservatively)
-- Relentless 5-min with persistent unread items: 12 writes in the first hour, then 4 writes/hour after backoff — a 67% reduction
-- Multiple test devices on 5-min relentless with uncleared items can accumulate writes quickly
+- Each successful reminder changes `device:state` once (one logical canonical mutation; D1 guard/application/cleanup rows are budgeted conservatively)
+- Relentless 5-minute mode remains exactly five minutes while content stays unseen, so capacity planning must allow up to 12 reminder-state changes per hour for each continuously eligible device/channel pair
+- Multiple test devices on 5-minute Relentless with uncleared items can accumulate writes quickly
 - Monitor at: `https://dash.cloudflare.com/<account_id>/workers/d1`
 - Do not leave several test devices on 5-min relentless indefinitely
 

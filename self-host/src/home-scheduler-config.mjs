@@ -76,6 +76,11 @@ export function readHomeSchedulerConfig(env = process.env, options = {}) {
     false,
     'TUBEPULSE_HOME_SCHEDULER_NOTIFICATIONS_ENABLED',
   );
+  const alignedVideoNotificationsEnabled = booleanValue(
+    env.TUBEPULSE_HOME_ALIGNED_VIDEO_NOTIFICATIONS_ENABLED,
+    false,
+    'TUBEPULSE_HOME_ALIGNED_VIDEO_NOTIFICATIONS_ENABLED',
+  );
   const gatewayAdminToken = readSecret(
     env,
     'TUBEPULSE_HOME_SCHEDULER_GATEWAY_ADMIN_TOKEN',
@@ -227,6 +232,7 @@ export function readHomeSchedulerConfig(env = process.env, options = {}) {
     },
     remoteWriteEnabled,
     notificationsEnabled,
+    alignedVideoNotificationsEnabled,
     notificationBarrier: {
       configured: Boolean(apiBaseUrl && (!gatewayConvergenceRequired
         || (gatewayAdminToken && gatewayAdminUrl && gatewayReconcileUrl))),
@@ -331,6 +337,7 @@ export function readHomeSchedulerConfig(env = process.env, options = {}) {
     workerBindings: {
       TUBEPULSE_ENABLE_COMMUNITY_POSTS: String(env.TUBEPULSE_ENABLE_COMMUNITY_POSTS ?? 'true'),
       TUBEPULSE_NOTIFICATION_MODE: mode === 'shadow' ? 'shadow' : 'active',
+      TUBEPULSE_ALIGNED_VIDEO_NOTIFICATIONS_ENABLED: alignedVideoNotificationsEnabled,
       ...(env.TUBEPULSE_COMMUNITY_POST_CHANNEL_ALLOWLIST
         ? { TUBEPULSE_COMMUNITY_POST_CHANNEL_ALLOWLIST: env.TUBEPULSE_COMMUNITY_POST_CHANNEL_ALLOWLIST }
         : {}),
@@ -352,6 +359,7 @@ export function publicHomeSchedulerConfig(config) {
     cloudflareReadConfigured: config.sync.configured,
     remoteWriteEnabled: config.remoteWriteEnabled,
     notificationsEnabled: config.notificationsEnabled,
+    alignedVideoNotificationsEnabled: config.alignedVideoNotificationsEnabled,
     notificationBarrierConfigured: Boolean(config.notificationBarrier?.configured),
     gatewayConvergenceRequired: Boolean(config.notificationBarrier?.gatewayConvergenceRequired),
     unifiedAuthorityEnabled: Boolean(config.authority?.enabled),

@@ -8,6 +8,7 @@ import {
   addToNagActive,
   seedKnownVideosFromRss, classifyRssVideosForNotification,
   updateKnownVideosAfterPoll, mergeRssUploadsIntoRecentVideos,
+  effectiveNotificationSettings, videoNotificationTag,
 } from '../tubepulse-cron/shared.mjs';
 
 const RSS_MAX_SHARDS = 3;
@@ -137,16 +138,7 @@ async function pollSingleRssChannel(env, ctx, channelId) {
     if (!profile?.fcmToken) continue;
     if (override?.muted) continue;
 
-    const effective = {
-      mode: override?.mode || settings?.mode || 'chill',
-      nagInterval: override?.nagInterval || settings?.nagInterval || 15,
-      dndEnabled: settings?.dndEnabled || false,
-      dndStart: settings?.dndStart || '22:00',
-      dndEnd: settings?.dndEnd || '07:00',
-      dndTimezone: settings?.dndTimezone || 'UTC',
-      dndBypass: override?.dndBypass || false,
-      tapAction: settings?.tapAction || 'video',
-    };
+    const effective = effectiveNotificationSettings(settings, override);
 
     const state = await getKV(kv, key.deviceState(deviceId, channelId)) || {
       unwatched: [], lastNagAt: null, nagCount: 0,
@@ -202,7 +194,7 @@ async function pollSingleRssChannel(env, ctx, channelId) {
             videoId: v.videoId, channelId, channelName, videoLink: v.link,
             type: v.type, tapAction: String(effective.tapAction),
           },
-          tag: `video-${v.videoId}`,
+          tag: videoNotificationTag(channelId),
         };
       } else {
         notifPayload = {
@@ -213,7 +205,7 @@ async function pollSingleRssChannel(env, ctx, channelId) {
             contentIds: JSON.stringify(notifyEntries.map((v) => v.videoId)),
             tapAction: String(effective.tapAction),
           },
-          tag: 'tubepulse-batch',
+          tag: videoNotificationTag(channelId),
         };
       }
       const pushResult = await sendFCMPush(

@@ -330,22 +330,19 @@ The shards therefore process up to three channels per five-minute tick. For `N` 
 - The same detection contract (new video → fan out to subscribers → FCM push) works identically
 - This rationale was superseded when production adopted batched `channels.list`, uploads-playlist reconciliation, and separate batched statistics.
 
-### 6.3 Host aux reminders — every minute
+### 6.3 Retained host aux reminder path — rollback only
 
-The production host reads `nag:active` and checks a bounded, time-rotated batch of at most five
-device/channel entries. The batch start advances deterministically each minute, so restart does not
-reset progress and scheduling fairness requires no canonical cursor write.
+When `TUBEPULSE_HOME_ALIGNED_VIDEO_NOTIFICATIONS_ENABLED=false`, the retained minute aux path reads
+`nag:active` and checks a bounded, time-rotated batch. It rebuilds each due reminder from current
+visible state, keeps reminder attempts transient, and advances `lastNagAt`/`nagCount` only after a
+successful delivery. This path retains its historical five-minute after-twelve backoff and rotating
+scan delay solely for rollback compatibility.
 
-For each due entry, the host applies DND, mode, mute and channel overrides, then derives a transient
-reminder from the channel's current app-visible top three videos plus settings-eligible community
-posts. The full `unwatched` history remains canonical so deleting a newer item can promote an older
-one back into eligibility. The reminder crosses the same public-feed and authority-route visibility
-barrier as one-off pushes. Success alone advances `lastNagAt` and `nagCount`; a failed or invisible
-attempt is discarded and recalculated from current state on a later cycle.
-
-Reminder nags never enter the durable notification-intent store. One-off upload, community-post and
-prewarn notifications retain durable at-most-once recovery. Pending nag records left by earlier
-versions are resolved as `transient-nag-expired` without FCM delivery or watermark changes.
+Current production sets the flag true, so this video-nag path is skipped and aux retains only
+applicable prewarn/recovery work. The aligned production owner is documented in §15.6. Both paths
+consume `mode` and `notificationMode` aliases and per-channel DND fields defensively. Pending nag
+records left by earlier versions resolve as `transient-nag-expired` without FCM delivery or
+watermark changes.
 
 ### 6.4 WebSub lease renewal cron — every 6 hours (DORMANT)
 
@@ -357,8 +354,8 @@ versions are resolved as `transient-nag-expired` without FCM delivery or waterma
 
 ### 6.5 What's NOT in any cron
 
-- "Check channels for new videos" — done by the Data API poller (6.2), not by a device-iteration loop
-- "Scan every device for unwatched videos" — `nag:active` is a bounded index and the host rotates through it fairly
+- "Check channels for new videos" — done by the Data API poller (§15.6), not by a device-iteration loop
+- "Run a second video-reminder scheduler" — in current production the aligned owner scans the bounded `nag:active` index on the same detector tick; minute aux only retains prewarn/recovery work
 - "Refresh channel metadata" — done lazily on next poll or bootstrap
 
 ---
@@ -795,7 +792,9 @@ The temporary local-package `google-services.json` exists only to satisfy the Gr
 
 ### 15.6 Unified Home production authority
 
-The scheduled-worker replacement is a separate process from both the retired app gateway experiment and the standalone Preview pilot. Video discovery is Data API-only in active mode: every aligned five-minute cycle batches sorted unique active IDs into `channels.list` groups of at most 50, compares persisted public `videoCount`, and reconciles only changed/missing-baseline uploads playlists. Production currently uses two detector requests per cycle, costing 576 general units/day. A bounded six-hour first-page safety pass adds at most `active channels × 4` general units/day and catches count-neutral replacement and propagation lag. Playlist/video/statistics results enter the existing canonical key schema and notification path; there is no parallel notifier and no `search.list` dependency. The scheduler reuses the existing post poller for an all-eligible-channel hourly sweep and the existing aux routine each minute. Configurable post cadence carries an explicit daily-quota projection and guard.
+The scheduled-worker replacement is a separate process from both the retired app gateway experiment and the standalone Preview pilot. Video discovery is Data API-only in active mode: every aligned five-minute cycle batches sorted unique active IDs into `channels.list` groups of at most 50, compares persisted public `videoCount`, and reconciles only changed/missing-baseline/safety-due uploads playlists. Production currently uses two detector requests per cycle, costing 576 general units/day. A bounded six-hour first-page safety pass adds at most `active channels × 4` general units/day and catches count-neutral replacement and propagation lag. Only each channel's relevant app-visible top three are eligible for statistics polling, in batches of at most 50. Playlist/video/statistics results enter the existing canonical key schema; only journaled changed keys publish to D1, and there is no `search.list` dependency. The scheduler reuses the existing post poller for an all-eligible-channel hourly sweep and minute aux only for applicable prewarn/recovery work. Configurable post cadence carries an explicit daily-quota projection and guard.
+
+Home is the sole active video notification owner. With `TUBEPULSE_HOME_ALIGNED_VIDEO_NOTIFICATIONS_ENABLED=true`, discovery and notification selection share the five-minute raster and the former rotating aux video-nag path is disabled. One visible unseen video produces the compatible single schema; two or three produce one batch containing the exact visible IDs. New content sends at its detector tick and resets that channel's reminder clock; without new content, Relentless repeats at exact 5/15/30/60/120-minute raster multiples and Chill at four hours. A new item and a due reminder on the same tick consolidate into one push. A fourth unseen item remains canonical outside the visible set and becomes eligible if promoted. Swiping does not acknowledge; a single or bundle tap acknowledges its exact content IDs. Server DND defers until the first eligible tick (new livestreams retain their documented bypass), while local mute changes sound only. Stable channel-scoped tags replace the previous surface for the same channel and cannot collide across channels. Existing v4.0.0/v4.1.0 payload schemas remain valid.
 
 Only each channel's dynamic app-visible top three videos are eligible for statistics polling. Their adaptive cadence remains intact; when a visible item becomes deleted/private, the promoted cached item is immediately due because non-visible poll clocks are pruned. The durable known-video watermark is independent of this optimization, so promotion cannot replay a notification. `commentCount` is collected into durable local observation state for possible future activity work, but comment movement is excluded from cadence and can never cause a canonical publication. A latest comment value may piggyback on a recent-video write already required by structure or allowed view/like persistence. Community-post structural changes persist immediately, while `fetchedAt`, relative-age labels, rotating delivery signatures, and same-hour engagement movement remain no-ops. Missing metrics hydrate once; any normalized known view/like change may persist once per UTC hour, and unchanged canonical metrics are forced fresh after 24 hours. The active upload path does not rewrite channel metadata merely to advance compatibility field `lastVideoId`.
 

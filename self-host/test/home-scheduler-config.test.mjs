@@ -33,6 +33,8 @@ test('Home scheduler defaults to fail-closed shadow mode', () => {
   assert.equal(config.mode, 'shadow');
   assert.equal(config.remoteWriteEnabled, false);
   assert.equal(config.notificationsEnabled, false);
+  assert.equal(config.alignedVideoNotificationsEnabled, false);
+  assert.equal(config.workerBindings.TUBEPULSE_ALIGNED_VIDEO_NOTIFICATIONS_ENABLED, false);
   assert.equal(config.workerBindings.TUBEPULSE_NOTIFICATION_MODE, 'shadow');
   assert.equal(config.rssChannelTimeoutMs, 3_000);
   assert.equal(config.youtubeApiFallback.enabled, false);
