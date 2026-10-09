@@ -144,6 +144,52 @@ test('wallboard is a readable one-screen calm health overview', () => {
   }
 });
 
+test('wallboard coalesces only an absent Worker-error window without masking core telemetry', () => {
+  const dashboard = JSON.parse(read('monitoring', 'grafana', 'dashboards', 'tubepulse-operations.json'));
+  const byTitle = new Map(dashboard.panels.map((panel) => [panel.title, panel]));
+  const statusExpr = byTitle.get('TubePulse status').targets[0].expr;
+  const attentionTargets = byTitle.get('Attention').targets;
+  const workerErrorTargets = attentionTargets.filter(({ expr }) => expr.includes('tubepulse_cloudflare_worker_errors'));
+  const workerErrorFallback = 'sum(tubepulse_cloudflare_worker_errors{period="window"}) or vector(0)';
+
+  assert.match(
+    statusExpr,
+    /scalar\(sum\(tubepulse_cloudflare_worker_errors\{period="window"\}\) or vector\(0\)\) == bool 0/,
+    'an absent Worker-error window must be equivalent to zero during collector cold start',
+  );
+  assert.doesNotMatch(
+    statusExpr,
+    /scalar\(sum\(tubepulse_cloudflare_worker_errors\{period="window"\}\)\) == bool 0/,
+    'the strict Worker-error sum would turn an absent series into a false core fault',
+  );
+  assert.ok(workerErrorTargets.length >= 3, 'attention must retain aggregate, actionable, and core Worker-error checks');
+  for (const target of workerErrorTargets) {
+    assert.ok(target.expr.includes(workerErrorFallback), `${target.legendFormat} must safely coalesce an absent Worker-error series`);
+  }
+  assert.match(statusExpr, /worker_errors[\s\S]*== bool 0/, 'a real nonzero Worker-error sum must still fail core health');
+  assert.ok(
+    workerErrorTargets.some(({ expr }) => /> bool 0|> 0/.test(expr)),
+    'real nonzero Worker errors must remain actionable',
+  );
+
+  for (const metric of [
+    'tubepulse_collector_collection_success',
+    'tubepulse_collector_host_collection_success',
+    'tubepulse_host_ready',
+    'tubepulse_host_authority_current',
+    'tubepulse_host_scheduler_active',
+    'tubepulse_authority_backend_ready',
+    'tubepulse_notifications_barrier_healthy',
+  ]) {
+    assert.ok(statusExpr.includes(metric), `${metric} must remain required for core health`);
+    assert.doesNotMatch(
+      statusExpr,
+      new RegExp(`${metric}\\s*(?:or|\\|)\\s*vector\\(`),
+      `${metric} must not be defaulted healthy when its telemetry is absent`,
+    );
+  }
+});
+
 test('channels and subscriptions stat remains readable at mobile widths', () => {
   const dashboard = JSON.parse(read('monitoring', 'grafana', 'dashboards', 'tubepulse-diagnostics.json'));
   const panel = dashboard.panels.find(({ title }) => title === 'Channels and subscriptions');
