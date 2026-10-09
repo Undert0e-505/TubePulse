@@ -23,8 +23,10 @@ YouTube channels into a focused feed, widget and configurable notification flow.
 Choose a quiet Chill reminder or a more persistent Relentless schedule, set do-not-disturb hours,
 and override individual channels when one creator needs different treatment. Scheduled livestreams
 can warn you ahead of time, while stacked alerts open the channel without marking later arrivals
-seen. Video alerts follow the same five-minute detection clock: one unseen item produces one alert,
-while two or three produce one exact channel bundle rather than separate notifications.
+seen. Upload alerts follow the same five-minute detection clock; near a scheduled livestream's
+published start, the host checks its public state more frequently for a prompt live transition.
+One unseen item produces one alert, while two or three produce one exact channel bundle rather than
+separate notifications.
 
 ## A feed and widget without recommendations
 

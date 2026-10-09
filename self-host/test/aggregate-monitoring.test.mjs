@@ -36,6 +36,7 @@ test('aggregate monitoring counts profiles and subscriptions without exposing re
     config: {
       youtubeDailyQuotaUnits: 10_000, youtubeQuotaReserveUnits: 1_000,
       youtubeStatisticsDailyQuotaUnits: 20_000, youtubeStatisticsReserveUnits: 2_000,
+      preciseLiveWatchDailyCap: 2_000,
     },
     localStatus: {
       status: 'ready', mode: 'active', authority: { replication: { status: 'current' } },
@@ -46,7 +47,12 @@ test('aggregate monitoring counts profiles and subscriptions without exposing re
           sourceMode: 'youtube-data-api', statsMethod: 'videos.list', lastGoodAt: now - 30_000,
           quota: { general: { units: 12, failures: 1 }, statistics: { units: 4, failures: 0 } },
         },
+        preciseLiveWatch: {
+          activeWatcherCount: 2, inWindowCount: 1, lastPollAt: now - 5_000,
+          lastOutcome: 'upcoming', transitions: 3, quota: { requests: 30, units: 30, failures: 0 },
+        },
       },
+      configuration: { preciseLiveWatchEnabled: true, preciseLiveWatchDailyCap: 2_000 },
     },
     remoteStatus: {
       ok: true, replication: { status: 'current' }, pendingBackupKeys: 0,
@@ -75,6 +81,28 @@ test('aggregate monitoring counts profiles and subscriptions without exposing re
   assert.equal(payload.notifications.oldestPendingAgeSeconds, 75);
   assert.equal(payload.youtube.general.failures, 1, 'daily failure history remains visible');
   assert.equal(payload.youtube.lastErrorPresent, false, 'resolved failures are not active incidents');
+  assert.deepEqual(payload.liveWatch, {
+    enabled: true,
+    active: 2,
+    inWindow: 1,
+    lastPollAgeSeconds: 5,
+    lastOutcome: 'upcoming',
+    lastTriggerReason: null,
+    transitions: 3,
+    cancellations: 0,
+    completed: 0,
+    timeouts: 0,
+    reschedules: 0,
+    requests: 30,
+    units: 30,
+    failures: 0,
+    dailyCap: 2_000,
+    remaining: 1_970,
+    ratio: 0.015,
+    resetsAt: null,
+    degraded: false,
+    degradedReason: null,
+  });
   assert.equal(payload.authority.backendReady, true);
   assertAggregateMonitoringSafe(payload);
   const serialized = JSON.stringify(payload);

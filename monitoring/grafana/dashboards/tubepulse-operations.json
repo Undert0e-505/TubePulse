@@ -34,7 +34,7 @@
       },
       "targets": [
         {
-          "expr": "(tubepulse_collector_collection_success * tubepulse_collector_host_collection_success * tubepulse_host_ready * tubepulse_host_authority_current * tubepulse_host_scheduler_active * tubepulse_authority_backend_ready * tubepulse_notifications_barrier_healthy * (tubepulse_host_last_error_present == bool 0) * ((time() - tubepulse_collector_last_success_timestamp_seconds) < bool 960) * (scalar(sum(tubepulse_cloudflare_worker_errors{period=\"window\"}) or vector(0)) == bool 0) * (scalar(tubepulse:d1_write_budget_ratio) < bool 0.9) * (scalar(tubepulse:worker_request_budget_ratio) < bool 0.9) * (scalar(max(tubepulse_youtube_quota_used / tubepulse_youtube_quota_limit)) < bool 0.9)) * (1 + (tubepulse_collector_cloudflare_collection_success * tubepulse_subscription_integrity_consistent * (tubepulse_authority_pending_backup_consecutive_samples < bool 2) * (tubepulse_authority_transaction_active_consecutive_samples < bool 2) * (tubepulse_notifications_durable_backlog == bool 0) * (tubepulse_notifications_callback_pending == bool 0) * (tubepulse_notifications_ambiguous_sending == bool 0) * (tubepulse_notifications_retained_failures == bool 0) * (tubepulse_notifications_failed == bool 0) * (tubepulse_youtube_last_error_present == bool 0) * ((time() - tubepulse_collector_last_success_timestamp_seconds) < bool 660) * (scalar(tubepulse:d1_write_budget_ratio) < bool 0.7) * (scalar(tubepulse:d1_read_budget_ratio) < bool 0.7) * (scalar(tubepulse:d1_write_projected_end_of_day / on() tubepulse_guardrail{resource=\"d1_rows_written_day\"}) < bool 0.7) * (scalar(tubepulse:worker_request_budget_ratio) < bool 0.7) * (scalar(max(tubepulse_youtube_quota_used / tubepulse_youtube_quota_limit)) < bool 0.7) * (scalar(sum(tubepulse_cloudflare_worker_requests{period=\"window\",script!=\"tubepulse-api\"}) or vector(0)) == bool 0)))",
+          "expr": "(tubepulse_collector_collection_success * tubepulse_collector_host_collection_success * tubepulse_host_ready * tubepulse_host_authority_current * tubepulse_host_scheduler_active * tubepulse_authority_backend_ready * tubepulse_notifications_barrier_healthy * (tubepulse_host_last_error_present == bool 0) * ((time() - tubepulse_collector_last_success_timestamp_seconds) < bool 960) * (scalar(sum(tubepulse_cloudflare_worker_errors{period=\"window\"}) or vector(0)) == bool 0) * (scalar(tubepulse:d1_write_budget_ratio) < bool 0.9) * (scalar(tubepulse:worker_request_budget_ratio) < bool 0.9) * (scalar(max(tubepulse_youtube_quota_used / tubepulse_youtube_quota_limit)) < bool 0.9)) * (1 + (tubepulse_collector_cloudflare_collection_success * tubepulse_subscription_integrity_consistent * (tubepulse_authority_pending_backup_consecutive_samples < bool 2) * (tubepulse_authority_transaction_active_consecutive_samples < bool 2) * (tubepulse_notifications_durable_backlog == bool 0) * (tubepulse_notifications_callback_pending == bool 0) * (tubepulse_notifications_ambiguous_sending == bool 0) * (tubepulse_notifications_retained_failures == bool 0) * (tubepulse_notifications_failed == bool 0) * (tubepulse_youtube_last_error_present == bool 0) * (tubepulse_live_watch_degraded == bool 0) * ((time() - tubepulse_collector_last_success_timestamp_seconds) < bool 660) * (scalar(tubepulse:d1_write_budget_ratio) < bool 0.7) * (scalar(tubepulse:d1_read_budget_ratio) < bool 0.7) * (scalar(tubepulse:d1_write_projected_end_of_day / on() tubepulse_guardrail{resource=\"d1_rows_written_day\"}) < bool 0.7) * (scalar(tubepulse:worker_request_budget_ratio) < bool 0.7) * (scalar(max(tubepulse_youtube_quota_used / tubepulse_youtube_quota_limit)) < bool 0.7) * (scalar(sum(tubepulse_cloudflare_worker_requests{period=\"window\",script!=\"tubepulse-api\"}) or vector(0)) == bool 0)))",
           "legendFormat": "System",
           "refId": "A",
           "instant": true,
@@ -266,7 +266,7 @@
       },
       "targets": [
         {
-          "expr": "tubepulse_host_last_error_present + (tubepulse_authority_pending_backup_consecutive_samples >= bool 2) + (tubepulse_authority_transaction_active_consecutive_samples >= bool 2) + (1 - tubepulse_subscription_integrity_consistent) + tubepulse_youtube_last_error_present + (tubepulse_notifications_failed > bool 0) + (tubepulse_notifications_durable_backlog > bool 0) + (tubepulse_notifications_callback_pending > bool 0) + (tubepulse_notifications_ambiguous_sending > bool 0) + (scalar(sum(tubepulse_cloudflare_worker_errors{period=\"window\"}) or vector(0)) > bool 0) + (scalar(sum(tubepulse_cloudflare_worker_requests{period=\"window\",script!=\"tubepulse-api\"}) or vector(0)) > bool 0) + 1000 * (1 - (tubepulse_collector_collection_success * tubepulse_collector_host_collection_success * tubepulse_host_ready * tubepulse_host_authority_current * tubepulse_host_scheduler_active * tubepulse_authority_backend_ready * tubepulse_notifications_barrier_healthy * (tubepulse_host_last_error_present == bool 0) * ((time() - tubepulse_collector_last_success_timestamp_seconds) < bool 960) * (scalar(sum(tubepulse_cloudflare_worker_errors{period=\"window\"}) or vector(0)) == bool 0) * (scalar(tubepulse:d1_write_budget_ratio) < bool 0.9) * (scalar(tubepulse:worker_request_budget_ratio) < bool 0.9) * (scalar(max(tubepulse_youtube_quota_used / tubepulse_youtube_quota_limit)) < bool 0.9)))",
+          "expr": "tubepulse_host_last_error_present + (tubepulse_authority_pending_backup_consecutive_samples >= bool 2) + (tubepulse_authority_transaction_active_consecutive_samples >= bool 2) + (1 - tubepulse_subscription_integrity_consistent) + tubepulse_youtube_last_error_present + tubepulse_live_watch_degraded + (tubepulse_notifications_failed > bool 0) + (tubepulse_notifications_durable_backlog > bool 0) + (tubepulse_notifications_callback_pending > bool 0) + (tubepulse_notifications_ambiguous_sending > bool 0) + (scalar(sum(tubepulse_cloudflare_worker_errors{period=\"window\"}) or vector(0)) > bool 0) + (scalar(sum(tubepulse_cloudflare_worker_requests{period=\"window\",script!=\"tubepulse-api\"}) or vector(0)) > bool 0) + 1000 * (1 - (tubepulse_collector_collection_success * tubepulse_collector_host_collection_success * tubepulse_host_ready * tubepulse_host_authority_current * tubepulse_host_scheduler_active * tubepulse_authority_backend_ready * tubepulse_notifications_barrier_healthy * (tubepulse_host_last_error_present == bool 0) * ((time() - tubepulse_collector_last_success_timestamp_seconds) < bool 960) * (scalar(sum(tubepulse_cloudflare_worker_errors{period=\"window\"}) or vector(0)) == bool 0) * (scalar(tubepulse:d1_write_budget_ratio) < bool 0.9) * (scalar(tubepulse:worker_request_budget_ratio) < bool 0.9) * (scalar(max(tubepulse_youtube_quota_used / tubepulse_youtube_quota_limit)) < bool 0.9)))",
           "legendFormat": "Live checks",
           "refId": "A",
           "instant": true,
@@ -346,6 +346,13 @@
           "expr": "(1 - (tubepulse_collector_collection_success * tubepulse_collector_host_collection_success * tubepulse_host_ready * tubepulse_host_authority_current * tubepulse_host_scheduler_active * tubepulse_authority_backend_ready * tubepulse_notifications_barrier_healthy * (tubepulse_host_last_error_present == bool 0) * ((time() - tubepulse_collector_last_success_timestamp_seconds) < bool 960) * (scalar(sum(tubepulse_cloudflare_worker_errors{period=\"window\"}) or vector(0)) == bool 0) * (scalar(tubepulse:d1_write_budget_ratio) < bool 0.9) * (scalar(tubepulse:worker_request_budget_ratio) < bool 0.9) * (scalar(max(tubepulse_youtube_quota_used / tubepulse_youtube_quota_limit)) < bool 0.9))) > 0",
           "legendFormat": "Core availability",
           "refId": "L",
+          "instant": true,
+          "range": false
+        },
+        {
+          "expr": "tubepulse_live_watch_degraded > 0",
+          "legendFormat": "Live precision degraded",
+          "refId": "M",
           "instant": true,
           "range": false
         }
@@ -995,6 +1002,13 @@
           "expr": "100 * tubepulse_youtube_quota_used{quota=\"statistics\"} / tubepulse_youtube_quota_limit{quota=\"statistics\"}",
           "legendFormat": "YouTube statistics",
           "refId": "D",
+          "instant": true,
+          "range": false
+        },
+        {
+          "expr": "100 * tubepulse_live_watch_quota_ratio",
+          "legendFormat": "Live watch",
+          "refId": "E",
           "instant": true,
           "range": false
         }

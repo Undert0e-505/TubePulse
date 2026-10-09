@@ -100,6 +100,7 @@ export function buildAlignedVideoPayload({ channelId, channelName, videos, effec
 export async function runAlignedVideoNotifications(env, ctx, scheduledTime, {
   activationAt = scheduledTime,
   newlyDetectedPairs = new Set(),
+  candidatePairs = null,
 } = {}) {
   const kv = env.TUBEPULSE_KV;
   const entries = await getKV(kv, key.nagActive()) || [];
@@ -109,6 +110,7 @@ export async function runAlignedVideoNotifications(env, ctx, scheduledTime, {
   let projectId = null;
 
   for (const entry of [...new Set(entries)].sort()) {
+    if (candidatePairs && !candidatePairs.has(entry)) continue;
     const separator = entry.indexOf('|');
     if (separator <= 0) continue;
     const deviceId = entry.slice(0, separator);

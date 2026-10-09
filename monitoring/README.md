@@ -83,7 +83,7 @@ Readable snapshots and Prometheus metrics contain only:
 - registered, new, backend-seen, and push-capable installation counts. `Backend seen 24h/7d` is the unique-installation count with a successful authenticated backend contact in that rolling window; it includes notification taps that invoke `/seen`, but passive notification delivery alone is not counted;
 - aggregate app-version counts;
 - active-channel counts; configured device-side and inverse subscriber-index membership totals; anonymous directional/index-integrity counts; and mean/p50/p95/max/zero-channel distribution;
-- host readiness/current state, scheduler progress/outcome, sweep state, and YouTube quota/failure/freshness;
+- host readiness/current state, scheduler progress/outcome, sweep state, and YouTube quota/failure/freshness, including aggregate precise-live watcher count, Pacific-day request/unit use, cap/remaining ratio, degraded state and a privacy-safe last-trigger-reason enum;
 - aggregate notification delivery outcomes plus durable pending/callback/failure intent counts;
 - D1 coordinator readiness, pending/transaction/lease booleans, conservative row estimates and limits;
 - per-TubePulse-script Cloudflare Worker request/error/subrequest and CPU aggregates;
@@ -104,7 +104,7 @@ Historical monitoring data is intentionally ignored and local. It is lost with t
 
 ## Dashboard and guardrails
 
-The provisioned `TubePulse Wallboard` keeps current health, freshness, aggregate audience/scale, budget risk, key trends and actionable non-zero signals in one desktop viewport. Each audience metric is an Apache ECharts card with its current value and 24-hour history on one horizontal row, including a UTC time axis at mobile widths. Health uses three severities: green for fully healthy, amber when the service remains available but an actionable warning exists, and red only for a core availability fault or dangerous budget use. It defaults to the last 24 hours in UTC and refreshes every 30 seconds. Its ordinary local URL is the Grafana wallboard URL above; kiosk mode is:
+The provisioned `TubePulse Wallboard` keeps current health, freshness, aggregate audience/scale, budget risk, key trends and actionable non-zero signals in one desktop viewport. Its Capacity card shows precise-live usage as a separate `Live watch` bar against the configured Pacific-day cap; this is deliberately not hidden inside the overall YouTube general quota. Zero/idle is healthy, while actual precision degradation appears as an amber Attention signal and ordinary five-minute detection continues. Each audience metric is an Apache ECharts card with its current value and 24-hour history on one horizontal row, including a UTC time axis at mobile widths. Health uses three severities: green for fully healthy, amber when the service remains available but an actionable warning exists, and red only for a core availability fault or dangerous budget use. It defaults to the last 24 hours in UTC and refreshes every 30 seconds. Its ordinary local URL is the Grafana wallboard URL above; kiosk mode is:
 
 ```text
 http://127.0.0.1:3000/d/tubepulse-operations/tubepulse-operations?orgId=1&kiosk

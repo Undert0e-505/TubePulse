@@ -130,14 +130,17 @@
       "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
     },
     {
-      "type": "timeseries", "title": "YouTube API quotas and freshness", "description": "Persisted general/statistics usage, configured limits/reserves, failures and last-good age.",
+      "type": "timeseries", "title": "YouTube API quotas and freshness", "description": "Persisted general/statistics usage, precise-live sub-cap usage, configured limits/reserves, failures and last-good age.",
       "gridPos": { "x": 12, "y": 26, "w": 12, "h": 7 },
       "targets": [
         { "expr": "tubepulse_youtube_quota_used", "legendFormat": "used {{quota}}", "refId": "A" },
         { "expr": "tubepulse_youtube_quota_limit", "legendFormat": "limit {{quota}}", "refId": "B" },
         { "expr": "tubepulse_youtube_quota_reserve", "legendFormat": "reserve {{quota}}", "refId": "C" },
         { "expr": "tubepulse_youtube_api_failures", "legendFormat": "failures {{quota}}", "refId": "D" },
-        { "expr": "tubepulse_youtube_last_good_age_seconds", "legendFormat": "last-good age (s)", "refId": "E" }
+        { "expr": "tubepulse_live_watch_quota_units_used", "legendFormat": "live watch used", "refId": "E" },
+        { "expr": "tubepulse_live_watch_quota_daily_cap", "legendFormat": "live watch cap", "refId": "F" },
+        { "expr": "tubepulse_live_watch_active_watchers", "legendFormat": "live watch active", "refId": "G" },
+        { "expr": "tubepulse_youtube_last_good_age_seconds", "legendFormat": "last-good age (s)", "refId": "H" }
       ],
       "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 5 } }, "overrides": [] },
       "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } }

@@ -164,6 +164,14 @@ export class YouTubeDataApiClient {
     }, { priority: 'metadata' });
   }
 
+  async listLiveStates(videoIds, { priority = 'live-watch' } = {}) {
+    if (videoIds.length > VIDEO_BATCH_SIZE) throw new Error('videos.list supports at most 50 video IDs');
+    return await this.request('videos', {
+      part: 'snippet,status,liveStreamingDetails', id: videoIds.join(','), maxResults: VIDEO_BATCH_SIZE,
+      fields: 'items(id,snippet(title,channelId,channelTitle,liveBroadcastContent),status(privacyStatus,uploadStatus),liveStreamingDetails(scheduledStartTime,actualStartTime,actualEndTime,activeLiveChatId))',
+    }, { bucket: 'general', priority });
+  }
+
   async batchGetStats(videoIds, method = 'batchGetStats') {
     if (videoIds.length > VIDEO_BATCH_SIZE) throw new Error('video statistics supports at most 50 video IDs');
     if (method === 'videos.list') {

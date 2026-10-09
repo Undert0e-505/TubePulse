@@ -34,10 +34,22 @@ test('Home scheduler defaults to fail-closed shadow mode', () => {
   assert.equal(config.remoteWriteEnabled, false);
   assert.equal(config.notificationsEnabled, false);
   assert.equal(config.alignedVideoNotificationsEnabled, false);
+  assert.equal(config.preciseLiveWatchEnabled, false);
+  assert.equal(config.preciseLiveWatchDailyCap, 2_000);
   assert.equal(config.workerBindings.TUBEPULSE_ALIGNED_VIDEO_NOTIFICATIONS_ENABLED, false);
   assert.equal(config.workerBindings.TUBEPULSE_NOTIFICATION_MODE, 'shadow');
   assert.equal(config.rssChannelTimeoutMs, 3_000);
   assert.equal(config.youtubeApiFallback.enabled, false);
+});
+
+test('precise live watch is default-off and independently capped', () => {
+  const config = readHomeSchedulerConfig({
+    ...readEnv,
+    TUBEPULSE_HOME_PRECISE_LIVE_WATCH_ENABLED: 'true',
+    TUBEPULSE_HOME_PRECISE_LIVE_WATCH_DAILY_CAP: '1234',
+  });
+  assert.equal(config.preciseLiveWatchEnabled, true);
+  assert.equal(config.preciseLiveWatchDailyCap, 1234);
 });
 
 test('YouTube API fallback is key-gated and can be explicitly disabled or capped', () => {

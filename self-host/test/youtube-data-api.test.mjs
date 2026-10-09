@@ -39,6 +39,27 @@ test('85 channels are split into exactly two 50-ID detector calls with partial f
   assert.ok(calls.every((url) => !url.pathname.includes('search')));
 });
 
+test('live-state lookup is one quota unit for up to 50 IDs and uses public partial fields', async () => {
+  const calls = [];
+  const reservations = [];
+  const api = new YouTubeDataApiClient({
+    apiKey: 'not-a-secret',
+    reserve: async (...args) => reservations.push(args),
+    fetchImpl: async (url) => { calls.push(new URL(url)); return response({ items: [] }); },
+  });
+  const ids = Array.from({ length: 50 }, (_, index) => `video${String(index).padStart(6, '0')}`);
+  await api.listLiveStates(ids);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].searchParams.get('part'), 'snippet,status,liveStreamingDetails');
+  assert.equal(calls[0].searchParams.get('id').split(',').length, 50);
+  assert.match(calls[0].searchParams.get('fields'), /actualStartTime/);
+  assert.match(calls[0].searchParams.get('fields'), /activeLiveChatId/);
+  assert.deepEqual(reservations, [['general', 1, 'live-watch']]);
+  await api.listLiveStates(['fallback'], { priority: 'scheduled-live-fallback' });
+  assert.deepEqual(reservations.at(-1), ['general', 1, 'scheduled-live-fallback']);
+  await assert.rejects(() => api.listLiveStates([...ids, 'overflow']), /at most 50/);
+});
+
 test('playlist reconciliation stops at known overlap and bounds no-overlap pagination', async () => {
   const pages = [];
   const api = {

@@ -270,11 +270,13 @@ TUBEPULSE_HOME_SCHEDULER_MODE=active
 TUBEPULSE_HOME_SCHEDULER_REMOTE_WRITE_ENABLED=true
 TUBEPULSE_HOME_SCHEDULER_NOTIFICATIONS_ENABLED=true
 TUBEPULSE_HOME_ALIGNED_VIDEO_NOTIFICATIONS_ENABLED=true
+TUBEPULSE_HOME_PRECISE_LIVE_WATCH_ENABLED=true
+TUBEPULSE_HOME_PRECISE_LIVE_WATCH_DAILY_CAP=2000
 TUBEPULSE_CLOUDFLARE_SCHEDULES_CONFIRMED_DISABLED=true
 TUBEPULSE_HOME_SCHEDULER_ACTIVATION_LATCH=CLOUDFLARE_SCHEDULES_CONFIRMED_DISABLED
 ```
 
-Leave D1 generation, API URL, Data API source, budgets, cadence, and unified-authority latch at verified production values. The current production notification owner also requires `TUBEPULSE_HOME_ALIGNED_VIDEO_NOTIFICATIONS_ENABLED=true`; it consolidates discovery and reminders on the five-minute raster and disables legacy rotating aux video nags. Never enable a Cloudflare scheduled notifier or a second Home scheduler alongside it. Start one stack:
+Leave D1 generation, API URL, Data API source, budgets, cadence, and unified-authority latch at verified production values. The current production notification owner requires both `TUBEPULSE_HOME_ALIGNED_VIDEO_NOTIFICATIONS_ENABLED=true` and `TUBEPULSE_HOME_PRECISE_LIVE_WATCH_ENABLED=true`; the former consolidates discovery and reminders on the five-minute raster, while the latter resumes public scheduled-livestream checks every 10 seconds only from T-5 through T+15. Both run inside the same Home lease. The precision timer must remain the sole owner between aligned five-minute ticks; a recovered minute aux loop is prewarn/recovery-only. The tracked examples remain false as deployment insurance. Never enable a Cloudflare scheduled notifier or a second Home scheduler alongside them. Start one stack:
 
 ```powershell
 docker compose --env-file .env.authority -f compose.authority.yaml up -d --force-recreate home-authority cloudflared
@@ -283,7 +285,7 @@ Invoke-RestMethod http://127.0.0.1:8789/_tubepulse/status
 docker compose --env-file .env.authority -f compose.authority.yaml run --rm --no-deps home-authority node src/home-authority-cli.mjs status
 ```
 
-Verify local/remote current on the same D1 generation/manifest, one scheduler lease, Data API source, a successful aligned cycle, no unexplained pending/transaction/error, unchanged public Worker health, Home-first authenticated feed matching D1 fallback, safe no-op mutation behavior if an existing inert canary exists, and no unexpected notification.
+Verify local/remote current on the same D1 generation/manifest, one scheduler lease, Data API source, a successful aligned cycle, precision flag/cap, no unexplained pending/transaction/error, unchanged public Worker health, Home-first authenticated feed matching D1 fallback, safe no-op mutation behavior if an existing inert canary exists, and no unexpected notification. The wallboard must show a separate `Live watch` capacity bar and no degraded signal while the watcher is idle/healthy. Its public aggregate may expose the normalized last trigger reason but never event IDs, titles, chat IDs, subscriber data or event-identifying times.
 
 One-off notification intent history cannot be reconstructed. Canonical recent/unwatched state prevents wholesale replay, but a lost local `sending` boundary cannot be proven sent/unsent. Accept the bounded possibility of one suppressed or duplicate one-off push around failure; never mass-clear or resend backlog to compensate. Reminder nags are not recovery backlog: the aligned owner rebuilds them from current unwatched and visible content on a later five-minute tick. The persisted activation timestamp and existing `lastNagAt` values prevent enabling the aligned owner from manufacturing a cutover backlog.
 

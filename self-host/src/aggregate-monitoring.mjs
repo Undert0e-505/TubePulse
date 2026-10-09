@@ -212,6 +212,12 @@ export async function collectAggregateMonitoring({
   const scheduler = localStatus?.scheduler || {};
   const youtube = scheduler.youtubeDataApi || {};
   const youtubeQuota = youtube.quota || {};
+  const liveWatch = scheduler.preciseLiveWatch || {};
+  const liveWatchUnits = Math.max(0, finite(liveWatch.quota?.units));
+  const liveWatchRequests = Math.max(0, finite(liveWatch.quota?.requests));
+  const liveWatchDailyCap = Math.max(0, finite(
+    config.preciseLiveWatchDailyCap ?? localStatus?.configuration?.preciseLiveWatchDailyCap,
+  ));
   const lastDelivery = scheduler.lastNotificationDelivery || {};
   const notificationIntents = scheduler.notificationIntents || {};
   const overduePending = Number.isFinite(Number(notificationIntents.overduePending))
@@ -287,6 +293,30 @@ export async function collectAggregateMonitoring({
         reserve: finite(config.youtubeStatisticsReserveUnits, 1_000),
       },
       resetsAt: youtubeQuota.general?.resetsAt || youtubeQuota.resetsAt || null,
+    },
+    liveWatch: {
+      enabled: Boolean(localStatus?.configuration?.preciseLiveWatchEnabled),
+      active: finite(liveWatch.activeWatcherCount),
+      inWindow: finite(liveWatch.inWindowCount),
+      lastPollAgeSeconds: ageSeconds(liveWatch.lastPollAt, nowMs),
+      lastOutcome: String(liveWatch.lastOutcome || 'not-started'),
+      lastTriggerReason: ['actual-start-time', 'live-broadcast-content', 'both'].includes(liveWatch.lastTriggerReason)
+        ? liveWatch.lastTriggerReason
+        : null,
+      transitions: finite(liveWatch.transitions),
+      cancellations: finite(liveWatch.cancellations),
+      completed: finite(liveWatch.completed),
+      timeouts: finite(liveWatch.timeouts),
+      reschedules: finite(liveWatch.reschedules),
+      requests: liveWatchRequests,
+      units: liveWatchUnits,
+      failures: finite(liveWatch.quota?.failures),
+      dailyCap: liveWatchDailyCap,
+      remaining: Math.max(0, liveWatchDailyCap - liveWatchUnits),
+      ratio: liveWatchDailyCap > 0 ? liveWatchUnits / liveWatchDailyCap : 0,
+      resetsAt: liveWatch.quota?.resetsAt || null,
+      degraded: Boolean(liveWatch.degraded),
+      degradedReason: liveWatch.degradedReason || null,
     },
     notifications: {
       queued: finite(lastDelivery.queued),

@@ -67,6 +67,31 @@ export function prometheusText({ snapshot, collector }) {
     metric('tubepulse_youtube_quota_reserve', host.youtube?.[quota]?.reserve, { quota });
     metric('tubepulse_youtube_api_failures', host.youtube?.[quota]?.failures, { quota });
   }
+  lines.push('# HELP tubepulse_live_watch_quota_units_used YouTube general quota units reserved by precise live monitoring in the current Pacific quota day.');
+  lines.push('# HELP tubepulse_live_watch_requests_total Public videos.list requests reserved by precise live monitoring in the current Pacific quota day.');
+  lines.push('# HELP tubepulse_live_watch_quota_daily_cap Configured Pacific-day precision monitoring quota cap.');
+  lines.push('# HELP tubepulse_live_watch_quota_remaining Precision monitoring quota units remaining before fallback to ordinary detection.');
+  lines.push('# HELP tubepulse_live_watch_quota_ratio Fraction of the configured precision monitoring quota cap used today.');
+  lines.push('# HELP tubepulse_live_watch_active_watchers Scheduled public events currently tracked by the host watcher.');
+  lines.push('# HELP tubepulse_live_watch_in_window_watchers Tracked events currently inside the precision window.');
+  lines.push('# HELP tubepulse_live_watch_degraded Whether precision monitoring is degraded and using ordinary detection fallback.');
+  const liveWatchUsed = number(host.liveWatch?.units);
+  const liveWatchCap = number(host.liveWatch?.dailyCap);
+  const liveWatchRemaining = host.liveWatch?.remaining === undefined
+    ? Math.max(0, liveWatchCap - liveWatchUsed)
+    : number(host.liveWatch.remaining);
+  const liveWatchRatio = host.liveWatch?.ratio === undefined
+    ? (liveWatchCap > 0 ? liveWatchUsed / liveWatchCap : 0)
+    : number(host.liveWatch.ratio);
+  metric('tubepulse_live_watch_enabled', bool(host.liveWatch?.enabled));
+  metric('tubepulse_live_watch_quota_units_used', liveWatchUsed);
+  metric('tubepulse_live_watch_requests_total', host.liveWatch?.requests);
+  metric('tubepulse_live_watch_quota_daily_cap', liveWatchCap);
+  metric('tubepulse_live_watch_quota_remaining', liveWatchRemaining);
+  metric('tubepulse_live_watch_quota_ratio', liveWatchRatio);
+  metric('tubepulse_live_watch_active_watchers', host.liveWatch?.active);
+  metric('tubepulse_live_watch_in_window_watchers', host.liveWatch?.inWindow);
+  metric('tubepulse_live_watch_degraded', bool(host.liveWatch?.degraded));
   for (const field of ['queued', 'sent', 'failed', 'suppressed', 'recovered', 'deduplicated']) metric(`tubepulse_notifications_${field}`, host.notifications?.[field]);
   for (const field of ['pending', 'oldestPendingAgeSeconds', 'durableBacklog', 'ambiguousSending', 'callbackPending', 'retainedFailures', 'retainedDeadTokens', 'transientNagsExpired']) {
     metric(`tubepulse_notifications_${field.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`)}`, host.notifications?.[field]);

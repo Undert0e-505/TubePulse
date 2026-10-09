@@ -81,6 +81,11 @@ export function readHomeSchedulerConfig(env = process.env, options = {}) {
     false,
     'TUBEPULSE_HOME_ALIGNED_VIDEO_NOTIFICATIONS_ENABLED',
   );
+  const preciseLiveWatchEnabled = booleanValue(
+    env.TUBEPULSE_HOME_PRECISE_LIVE_WATCH_ENABLED,
+    false,
+    'TUBEPULSE_HOME_PRECISE_LIVE_WATCH_ENABLED',
+  );
   const gatewayAdminToken = readSecret(
     env,
     'TUBEPULSE_HOME_SCHEDULER_GATEWAY_ADMIN_TOKEN',
@@ -233,6 +238,7 @@ export function readHomeSchedulerConfig(env = process.env, options = {}) {
     remoteWriteEnabled,
     notificationsEnabled,
     alignedVideoNotificationsEnabled,
+    preciseLiveWatchEnabled,
     notificationBarrier: {
       configured: Boolean(apiBaseUrl && (!gatewayConvergenceRequired
         || (gatewayAdminToken && gatewayAdminUrl && gatewayReconcileUrl))),
@@ -297,6 +303,11 @@ export function readHomeSchedulerConfig(env = process.env, options = {}) {
       1_000,
       'TUBEPULSE_HOME_SCHEDULER_YOUTUBE_QUOTA_RESERVE_UNITS',
     ),
+    preciseLiveWatchDailyCap: positiveInteger(
+      env.TUBEPULSE_HOME_PRECISE_LIVE_WATCH_DAILY_CAP,
+      2_000,
+      'TUBEPULSE_HOME_PRECISE_LIVE_WATCH_DAILY_CAP',
+    ),
     videoSourceMode,
     youtubeSafetyReconcileHours: positiveInteger(
       env.TUBEPULSE_HOME_SCHEDULER_YOUTUBE_SAFETY_RECONCILE_HOURS,
@@ -360,6 +371,8 @@ export function publicHomeSchedulerConfig(config) {
     remoteWriteEnabled: config.remoteWriteEnabled,
     notificationsEnabled: config.notificationsEnabled,
     alignedVideoNotificationsEnabled: config.alignedVideoNotificationsEnabled,
+    preciseLiveWatchEnabled: config.preciseLiveWatchEnabled,
+    preciseLiveWatchDailyCap: config.preciseLiveWatchDailyCap,
     notificationBarrierConfigured: Boolean(config.notificationBarrier?.configured),
     gatewayConvergenceRequired: Boolean(config.notificationBarrier?.gatewayConvergenceRequired),
     unifiedAuthorityEnabled: Boolean(config.authority?.enabled),

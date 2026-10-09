@@ -219,6 +219,9 @@ export class UnifiedHomeAuthorityService {
           videoSourceMode: this.config.videoSourceMode,
           postsCadenceMinutes: this.config.postsCadenceMinutes,
           notificationsEnabled: this.config.notificationsEnabled,
+          alignedVideoNotificationsEnabled: this.config.alignedVideoNotificationsEnabled,
+          preciseLiveWatchEnabled: this.config.preciseLiveWatchEnabled,
+          preciseLiveWatchDailyCap: this.config.preciseLiveWatchDailyCap,
           remoteWriteEnabled: this.config.remoteWriteEnabled,
           publicAppRoutes: false,
           periodicCanonicalPull: false,
@@ -237,7 +240,11 @@ export class UnifiedHomeAuthorityService {
         mode: this.config.mode,
         authority,
         scheduler: publicHomeSchedulerState(scheduler),
-        configuration: { videoSourceMode: this.config.videoSourceMode },
+        configuration: {
+          videoSourceMode: this.config.videoSourceMode,
+          preciseLiveWatchEnabled: this.config.preciseLiveWatchEnabled,
+          preciseLiveWatchDailyCap: this.config.preciseLiveWatchDailyCap,
+        },
       };
       const aggregate = await collectAggregateMonitoring({
         adapter: this.localAdapter,

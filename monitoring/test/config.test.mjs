@@ -62,6 +62,7 @@ test('wallboard is a readable one-screen calm health overview', () => {
   assert.match(status.targets[0].expr, /tubepulse_collector_collection_success/);
   assert.match(status.targets[0].expr, /tubepulse_authority_pending_backup_consecutive_samples < bool 2/);
   assert.match(status.targets[0].expr, /tubepulse_authority_transaction_active_consecutive_samples < bool 2/);
+  assert.match(status.targets[0].expr, /tubepulse_live_watch_degraded == bool 0/);
   assert.doesNotMatch(status.targets[0].expr, /tubepulse_youtube_api_failures/);
   assert.ok(status.options.text.valueSize >= 30);
 
@@ -81,7 +82,7 @@ test('wallboard is a readable one-screen calm health overview', () => {
   assert.match(attention.targets[0].expr, /tubepulse_notifications_durable_backlog/);
   assert.match(attention.targets[0].expr, /tubepulse_cloudflare_worker_errors/);
   assert.doesNotMatch(attention.targets[0].expr, /tubepulse_youtube_api_failures/);
-  for (const required of ['Core availability', 'D1 queue', 'D1 transaction', 'YouTube error']) {
+  for (const required of ['Core availability', 'D1 queue', 'D1 transaction', 'YouTube error', 'Live precision degraded']) {
     assert.ok(attention.targets.some(({ legendFormat }) => legendFormat === required));
   }
   for (const target of attention.targets) {
@@ -227,7 +228,10 @@ test('wallboard is a readable one-screen calm health overview', () => {
   assert.equal(capacity.type, 'bargauge');
   assert.equal(capacity.fieldConfig.defaults.unit, 'percent');
   assert.deepEqual(capacity.fieldConfig.defaults.thresholds.steps.map(({ value }) => value), [null, 70, 90]);
-  assert.equal(capacity.targets.length, 4);
+  assert.equal(capacity.targets.length, 5);
+  const liveWatch = capacity.targets.find(({ legendFormat }) => legendFormat === 'Live watch');
+  assert.ok(liveWatch);
+  assert.equal(liveWatch.expr, '100 * tubepulse_live_watch_quota_ratio');
 
   for (const title of ['Service traffic · 24h', 'Database activity · 24h', 'Notification delivery · 24h']) {
     const trend = byTitle.get(title);

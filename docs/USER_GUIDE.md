@@ -138,6 +138,12 @@ Choose how early TubePulse warns about a scheduled livestream or premiere: 15 or
 or 4 hours, or 1 day. A regular notification can still arrive when the scheduled item becomes
 current. A channel override can inherit or replace the global lead time.
 
+The prewarning is only a heads-up: tapping it opens the scheduled video without marking it seen or
+suppressing the later live notification. Near the published start time, the host checks the public
+event state more frequently and sends the normal compatible video notification promptly once YouTube
+confirms that it is live. If the broadcaster reschedules, the watcher follows the new time; temporary
+API failures or a single missing response do not cancel the event.
+
 ### Community posts
 
 Enable **Community posts** to include supported text, image and poll posts in the feed and initial

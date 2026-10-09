@@ -188,6 +188,35 @@ test('aligned owner emits exactly one current top-three intent and success advan
   assert.deepEqual(state.unwatched, ['A', 'B', 'C', 'D']);
 });
 
+test('a precise live transition evaluates only its candidate device/channel pairs', async () => {
+  const kv = new MemoryKv({
+    'nag:active': ['device|live-channel', 'device|other-channel'],
+    'device:device:profile': { fcmToken: 'token' },
+    'device:device:settings': { mode: 'relentless', nagInterval: 5 },
+    'device:device:state:live-channel': { unwatched: ['live'], lastNagAt: at('12:00'), nagCount: 0 },
+    'device:device:state:other-channel': { unwatched: ['other'], lastNagAt: at('12:00'), nagCount: 0 },
+    'channel:live-channel:meta': { name: 'Live channel' },
+    'channel:live-channel:recent': [{ ...video('live', '12:05'), type: 'live' }],
+    'channel:other-channel:meta': { name: 'Other channel' },
+    'channel:other-channel:recent': [video('other', '12:00')],
+  });
+  const intents = [];
+  const candidate = 'device|live-channel';
+  const result = await runAlignedVideoNotifications({
+    TUBEPULSE_KV: kv, TUBEPULSE_NOTIFICATION_MODE: 'shadow', TUBEPULSE_NOTIFICATION_DEFERRED: true,
+    FIREBASE_SERVICE_ACCOUNT: JSON.stringify({ project_id: 'project' }),
+    TUBEPULSE_SHADOW_NOTIFICATION_OBSERVER: async (intent) => intents.push(intent),
+  }, { waitUntil() {} }, at('12:05'), {
+    activationAt: at('11:00'),
+    newlyDetectedPairs: new Set([candidate]),
+    candidatePairs: new Set([candidate]),
+  });
+  assert.equal(result.checked, 1);
+  assert.equal(result.queued, 1);
+  assert.equal(intents.length, 1);
+  assert.equal(intents[0].channelId, 'live-channel');
+});
+
 test('aligned flag prevents the rotating aux owner from emitting a duplicate', async () => {
   const kv = new MemoryKv({
     'nag:active': ['device|channel'],

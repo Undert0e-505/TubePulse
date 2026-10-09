@@ -26,6 +26,7 @@ test('Prometheus exposition contains aggregate labels and excludes identifiers',
           perInstall: { mean: 2, p50: 2, p95: 2, max: 2, zero: 0 },
         },
         youtube: { general: {}, statistics: {} },
+        liveWatch: { enabled: true, units: 30, requests: 30, dailyCap: 2000, remaining: 1970, ratio: 0.015, active: 2, inWindow: 1, degraded: false },
         notifications: { pending: 2, oldestPendingAgeSeconds: 75, durableBacklog: 1 },
         authority: {
           pendingBackupKeys: 2,
@@ -57,5 +58,26 @@ test('Prometheus exposition contains aggregate labels and excludes identifiers',
   assert.match(metrics, /tubepulse_authority_pending_backup_consecutive_samples 1/);
   assert.match(metrics, /tubepulse_authority_transaction_active 1/);
   assert.match(metrics, /tubepulse_authority_transaction_active_consecutive_samples 1/);
+  assert.match(metrics, /# HELP tubepulse_live_watch_quota_units_used/);
+  assert.match(metrics, /tubepulse_live_watch_quota_units_used 30/);
+  assert.match(metrics, /tubepulse_live_watch_requests_total 30/);
+  assert.match(metrics, /tubepulse_live_watch_quota_daily_cap 2000/);
+  assert.match(metrics, /tubepulse_live_watch_quota_remaining 1970/);
+  assert.match(metrics, /tubepulse_live_watch_quota_ratio 0\.015/);
+  assert.match(metrics, /tubepulse_live_watch_active_watchers 2/);
+  assert.match(metrics, /tubepulse_live_watch_in_window_watchers 1/);
+  assert.match(metrics, /tubepulse_live_watch_degraded 0/);
   assert.doesNotMatch(metrics, /deviceId|channelId|fcmToken|UC[A-Za-z0-9_-]{20}/);
+});
+
+test('live-watch metrics fail safe to zero during older-host or restart windows', () => {
+  const metrics = prometheusText({
+    collector: { lastCollectionSuccess: false, errorsTotal: 1, limits: {} },
+    snapshot: { host: { youtube: { general: {}, statistics: {} } } },
+  });
+  assert.match(metrics, /tubepulse_live_watch_quota_units_used 0/);
+  assert.match(metrics, /tubepulse_live_watch_quota_daily_cap 0/);
+  assert.match(metrics, /tubepulse_live_watch_quota_ratio 0/);
+  assert.match(metrics, /tubepulse_live_watch_active_watchers 0/);
+  assert.match(metrics, /tubepulse_live_watch_degraded 0/);
 });

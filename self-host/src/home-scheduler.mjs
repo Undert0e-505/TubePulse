@@ -6,7 +6,10 @@ import { isCommunityPostsDebugEnabled, pollSingleCommunityChannel } from '../../
 import { pollSingleRssChannel, processChannelUploads } from '../../worker/tubepulse-rss-0/index.js';
 import { runAuxTick } from '../../worker/tubepulse-aux/index.js';
 import { runAlignedVideoNotifications } from '../../worker/tubepulse-aux/aligned-video-notifications.mjs';
-import { getKV, key, mergeRssUploadsIntoRecentVideos, putKVIfChanged, stableJson } from '../../worker/tubepulse-cron/shared.mjs';
+import {
+  getKV, key, mergeRssUploadsIntoRecentVideos, putKV, putKVIfChanged,
+  removeFromNagActive, stableJson,
+} from '../../worker/tubepulse-cron/shared.mjs';
 import { isSyncExcluded } from './exclusions.mjs';
 import { JsonStateFile } from './file-state.mjs';
 import {
@@ -43,6 +46,17 @@ import {
   pruneMetricPollToVisibleVideos,
   updateMetricPollObservation,
 } from './youtube-data-api.mjs';
+import {
+  chunkLiveWatchEvents,
+  advanceCancellationObservation,
+  classifyPublicLiveObservation,
+  liveWatchRequestPriority,
+  nextTenSecondBoundary,
+  normalizePreciseLiveWatchState,
+  planPreciseLiveWatch,
+  publicPreciseLiveWatchState,
+  shouldRunPreciseLiveWatchCycle,
+} from './precise-live-watch.mjs';
 
 const FIVE_MINUTES_MS = 5 * 60 * 1000;
 const MINUTE_MS = 60 * 1000;
@@ -71,6 +85,7 @@ function freshSchedulerState(mode = 'shadow') {
     overlapSkips: 0,
     rssHealth: normalizeRssHealthState(null),
     alignedVideoNotifications: { activatedAt: null },
+    preciseLiveWatch: normalizePreciseLiveWatchState(null),
   };
 }
 
@@ -101,6 +116,7 @@ export function publicHomeSchedulerState(state) {
     : state?.lastSweep;
   return {
     ...state,
+    preciseLiveWatch: publicPreciseLiveWatchState(state?.preciseLiveWatch),
     lastSweep,
     ...(youtube ? {
       youtubeDataApi: {
@@ -743,6 +759,8 @@ export class HomeSchedulerRunner {
     this.publication = null;
     this.running = false;
     this.timer = null;
+    this.preciseLiveTimer = null;
+    this.activePreciseLiveTick = null;
     this.activeTick = null;
     this.stopped = false;
     this.remoteConfirmationDueAt = null;
@@ -801,6 +819,10 @@ export class HomeSchedulerRunner {
       const state = await this.stateFile.read();
       state.rssHealth = normalizeRssHealthState(state.rssHealth, this.now());
       state.youtubeDataApi = normalizeYoutubeDataApiState(state.youtubeDataApi, this.now());
+      state.preciseLiveWatch = normalizePreciseLiveWatchState(state.preciseLiveWatch, this.now());
+      if (this.config.preciseLiveWatchEnabled && !state.preciseLiveWatch.enabledAt) {
+        state.preciseLiveWatch.enabledAt = iso(this.now());
+      }
       this.remoteConfirmationDueAt = state.rssHealth.independentProbe.nextConfirmationAt;
       const reconciledAt = Date.parse(authorityStatus?.manifest?.reconciledAt || '');
       const sweepStartedAt = Date.parse(state.currentSweep?.startedAt || '');
@@ -887,6 +909,7 @@ export class HomeSchedulerRunner {
   async reserveYoutubeQuota(bucket, units, priority) {
     const state = await this.stateFile.read();
     const health = normalizeYoutubeDataApiState(state.youtubeDataApi, this.now());
+    const precise = normalizePreciseLiveWatchState(state.preciseLiveWatch, this.now());
     const configured = bucket === 'statistics'
       ? Number(this.config.youtubeStatisticsDailyQuotaUnits || 10_000)
       : Number(this.config.youtubeDailyQuotaUnits || 10_000);
@@ -899,10 +922,27 @@ export class HomeSchedulerRunner {
         category: `${bucket}-quota-cap`, retryable: false,
       });
     }
+    if (priority === 'live-watch' && precise.quota.units + units > this.config.preciseLiveWatchDailyCap) {
+      precise.degraded = true;
+      precise.degradedReason = 'daily-cap';
+      precise.lastOutcome = 'quota-degraded';
+      state.preciseLiveWatch = precise;
+      await this.stateFile.write(state);
+      throw new YouTubeDataApiError('Precise live-watch daily quota cap reached', {
+        category: 'live-watch-quota-cap', retryable: false,
+      });
+    }
     health.quota[bucket].units += units;
     health.quota[bucket].requests++;
     health.quota[bucket].lastPriority = priority;
     health.quota[bucket].lastRequestAt = iso(this.now());
+    if (priority === 'live-watch') {
+      precise.quota.units += units;
+      precise.quota.requests++;
+      precise.degraded = false;
+      precise.degradedReason = null;
+      state.preciseLiveWatch = precise;
+    }
     state.youtubeDataApi = health;
     await this.stateFile.write(state);
   }
@@ -957,6 +997,225 @@ export class HomeSchedulerRunner {
       await putKVIfChanged(target, key.channelRecent(channelId), merged, recent);
       channelRecents.set(channelId, merged);
     }
+  }
+
+  async clearTerminalScheduledItem(env, target, event, { keepCompletedVideo = false, observation = null } = {}) {
+    const recentKey = key.channelRecent(event.channelId);
+    const recent = await getKV(target, recentKey) || [];
+    const nextRecent = keepCompletedVideo
+      ? recent.map((video) => video.videoId === event.videoId ? {
+        ...video,
+        type: 'video',
+        actualStartTime: observation?.actualStartTime
+          ? new Date(observation.actualStartTime).toISOString()
+          : video.actualStartTime || null,
+        actualEndTime: observation?.actualEndTime
+          ? new Date(observation.actualEndTime).toISOString()
+          : video.actualEndTime || null,
+      } : video)
+      : recent.filter((video) => video.videoId !== event.videoId);
+    await putKVIfChanged(target, recentKey, nextRecent, recent);
+
+    const subscribers = await getKV(target, key.channelSubs(event.channelId)) || [];
+    for (const deviceId of subscribers) {
+      const stateKey = key.deviceState(deviceId, event.channelId);
+      const deviceState = await getKV(target, stateKey);
+      if (!Array.isArray(deviceState?.unwatched) || !deviceState.unwatched.includes(event.videoId)) continue;
+      const unwatched = deviceState.unwatched.filter((id) => id !== event.videoId);
+      await putKV(target, stateKey, {
+        ...deviceState,
+        unwatched,
+        ...(unwatched.length === 0 ? { lastNagAt: null, nagCount: 0 } : {}),
+      });
+      if (unwatched.length === 0) await removeFromNagActive(env, deviceId, event.channelId);
+    }
+  }
+
+  async applyLiveTransition(target, event, item) {
+    const recentKey = key.channelRecent(event.channelId);
+    const recent = await getKV(target, recentKey) || [];
+    const details = item.liveStreamingDetails || {};
+    const nextRecent = recent.map((video) => video.videoId === event.videoId ? {
+      ...video,
+      title: item.snippet?.title || video.title,
+      type: 'live',
+      scheduledStartTime: details.scheduledStartTime || video.scheduledStartTime || new Date(event.scheduledFor).toISOString(),
+      actualStartTime: details.actualStartTime || iso(this.now()),
+    } : video);
+    await putKVIfChanged(target, recentKey, nextRecent, recent);
+  }
+
+  async applyLiveReschedule(target, event, scheduledStartTime, item) {
+    const recentKey = key.channelRecent(event.channelId);
+    const recent = await getKV(target, recentKey) || [];
+    const scheduledIso = new Date(scheduledStartTime).toISOString();
+    const nextRecent = recent.map((video) => video.videoId === event.videoId ? {
+      ...video,
+      title: item.snippet?.title || video.title,
+      type: 'live_scheduled',
+      publishedAt: scheduledIso,
+      published: scheduledIso,
+      scheduledStartTime: scheduledIso,
+    } : video);
+    await putKVIfChanged(target, recentKey, nextRecent, recent);
+  }
+
+  async runPreciseLiveWatchCycle(env, target, scheduledTime, { ordinaryFallback = false } = {}) {
+    const initialState = await this.stateFile.read();
+    let watch = normalizePreciseLiveWatchState(initialState.preciseLiveWatch, this.now());
+    const events = await getKV(target, key.upcomingEvents()) || [];
+    const plan = planPreciseLiveWatch(events, watch, scheduledTime, { ordinaryFallback });
+
+    for (const event of events) {
+      const scheduledFor = typeof event?.scheduledFor === 'number'
+        ? event.scheduledFor
+        : Date.parse(event?.scheduledFor || '');
+      if (!event?.videoId || !Number.isFinite(scheduledFor)) continue;
+      if (scheduledTime > scheduledFor + 15 * MINUTE_MS) {
+        const watcher = watch.watchers[event.videoId] || {};
+        if (Number(watcher.timedOutFor || 0) !== scheduledFor) {
+          watcher.timedOutFor = scheduledFor;
+          watch.watchers[event.videoId] = watcher;
+          watch.timeouts++;
+        }
+      }
+    }
+
+    if (plan.due.length === 0) {
+      watch.activeWatcherCount = events.length;
+      watch.inWindowCount = plan.inWindowCount;
+      watch.nextWindowAt = plan.nextWindowAt === null ? null : iso(plan.nextWindowAt);
+      const latest = await this.stateFile.read();
+      watch.quota = normalizePreciseLiveWatchState(latest.preciseLiveWatch, this.now()).quota;
+      latest.preciseLiveWatch = watch;
+      await this.stateFile.write(latest);
+      return { outcome: 'not-due', dueCount: 0, livePairs: new Set() };
+    }
+
+    const itemById = new Map();
+    const failedIds = new Set();
+    let requestCount = 0;
+    for (const batch of chunkLiveWatchEvents(plan.due, 50)) {
+      try {
+        const payload = await this.dataApiClient().listLiveStates(batch.map((event) => event.videoId), {
+          // Once the precision sub-cap is exhausted, only an ordinary aligned
+          // detector tick may continue this public check. The normal general
+          // reserve still applies, so it cannot starve channel discovery.
+          priority: liveWatchRequestPriority({
+            ordinaryFallback,
+            precisionUnits: watch.quota.units,
+            precisionDailyCap: this.config.preciseLiveWatchDailyCap,
+          }),
+        });
+        requestCount++;
+        for (const item of payload.items || []) itemById.set(item.id, item);
+      } catch (error) {
+        for (const event of batch) failedIds.add(event.videoId);
+        const latest = await this.stateFile.read();
+        const failedWatch = normalizePreciseLiveWatchState(latest.preciseLiveWatch, this.now());
+        failedWatch.quota.failures++;
+        failedWatch.lastPollAt = iso(scheduledTime);
+        failedWatch.lastOutcome = error?.category === 'live-watch-quota-cap' ? 'quota-degraded' : 'api-error';
+        failedWatch.degraded = error?.category === 'live-watch-quota-cap';
+        failedWatch.degradedReason = failedWatch.degraded ? 'daily-cap' : null;
+        latest.preciseLiveWatch = failedWatch;
+        await this.stateFile.write(latest);
+        if (error?.category !== 'live-watch-quota-cap') await this.recordYoutubeApiFailure('general', error);
+      }
+    }
+
+    let nextEvents = [...events];
+    const livePairs = new Set();
+    let transitions = 0;
+    let cancellations = 0;
+    let completed = 0;
+    let reschedules = 0;
+
+    for (const event of plan.due) {
+      if (failedIds.has(event.videoId)) continue;
+      const watcher = watch.watchers[event.videoId] || {};
+      watcher.lastPolledAt = iso(scheduledTime);
+      const item = itemById.get(event.videoId) || null;
+      const observation = classifyPublicLiveObservation(item, event);
+      watcher.lastOutcome = observation.outcome;
+
+      if (observation.outcome === 'live') {
+        await this.applyLiveTransition(target, event, item);
+        nextEvents = nextEvents.filter((candidate) => candidate.videoId !== event.videoId);
+        const subscribers = await getKV(target, key.channelSubs(event.channelId)) || [];
+        for (const deviceId of subscribers) livePairs.add(`${deviceId}|${event.channelId}`);
+        delete watch.watchers[event.videoId];
+        watch.lastTriggerReason = observation.triggerReason;
+        watch.transitions++;
+        transitions++;
+        continue;
+      }
+      if (observation.outcome === 'rescheduled') {
+        nextEvents = nextEvents.map((candidate) => candidate.videoId === event.videoId
+          ? { ...candidate, scheduledFor: observation.scheduledStartTime }
+          : candidate);
+        await this.applyLiveReschedule(target, event, observation.scheduledStartTime, item);
+        watcher.scheduledFor = observation.scheduledStartTime;
+        watcher.consecutiveCancellation = 0;
+        delete watcher.timedOutFor;
+        watch.reschedules++;
+        reschedules++;
+      } else if (observation.outcome === 'completed') {
+        await this.clearTerminalScheduledItem(env, target, event, { keepCompletedVideo: true, observation });
+        nextEvents = nextEvents.filter((candidate) => candidate.videoId !== event.videoId);
+        delete watch.watchers[event.videoId];
+        watch.completed++;
+        completed++;
+        continue;
+      } else if (observation.outcome === 'cancellation-like') {
+        const cancellation = advanceCancellationObservation(watcher, observation);
+        Object.assign(watcher, cancellation.watcher);
+        if (cancellation.terminal) {
+          await this.clearTerminalScheduledItem(env, target, event);
+          nextEvents = nextEvents.filter((candidate) => candidate.videoId !== event.videoId);
+          delete watch.watchers[event.videoId];
+          watch.cancellations++;
+          cancellations++;
+          continue;
+        }
+      } else {
+        Object.assign(watcher, advanceCancellationObservation(watcher, observation).watcher);
+      }
+      watcher.scheduledFor = Number(nextEvents.find((candidate) => candidate.videoId === event.videoId)?.scheduledFor || event.scheduledFor);
+      watch.watchers[event.videoId] = watcher;
+    }
+
+    await putKVIfChanged(target, key.upcomingEvents(), nextEvents, events);
+    const nextPlan = planPreciseLiveWatch(nextEvents, watch, scheduledTime, { ordinaryFallback: false });
+    watch.activeWatcherCount = nextEvents.length;
+    watch.inWindowCount = nextPlan.inWindowCount;
+    watch.nextWindowAt = nextPlan.nextWindowAt === null ? null : iso(nextPlan.nextWindowAt);
+    watch.lastPollAt = iso(scheduledTime);
+    watch.lastOutcome = failedIds.size > 0
+      ? (failedIds.size === plan.due.length ? 'api-error' : 'partial')
+      : transitions > 0 ? 'live-transition'
+        : reschedules > 0 ? 'rescheduled'
+          : cancellations > 0 ? 'cancelled'
+            : completed > 0 ? 'completed'
+              : 'upcoming';
+    const latest = await this.stateFile.read();
+    const latestWatch = normalizePreciseLiveWatchState(latest.preciseLiveWatch, this.now());
+    watch.quota = latestWatch.quota;
+    watch.degraded = latestWatch.degraded;
+    watch.degradedReason = latestWatch.degradedReason;
+    latest.preciseLiveWatch = watch;
+    await this.stateFile.write(latest);
+    return {
+      outcome: failedIds.size > 0 ? (failedIds.size === plan.due.length ? 'error' : 'partial') : 'ok',
+      dueCount: plan.due.length,
+      requestCount,
+      failedCount: failedIds.size,
+      transitions,
+      cancellations,
+      completed,
+      reschedules,
+      livePairs,
+    };
   }
 
   async runYoutubeDataApiCycle(env, target, scheduledTime, { force = false } = {}) {
@@ -1705,7 +1964,11 @@ export class HomeSchedulerRunner {
     return result;
   }
 
-  async runTick(scheduledTime = this.now(), { forceSweep = false, forcePosts = forceSweep } = {}) {
+  async runTick(scheduledTime = this.now(), {
+    forceSweep = false,
+    forcePosts = forceSweep,
+    preciseLiveOnly = false,
+  } = {}) {
     if (this.config.mode === 'standby') return { outcome: 'standby' };
     if (this.running) {
       this.overlapSkips++;
@@ -1739,24 +2002,36 @@ export class HomeSchedulerRunner {
       const env = this.createEnvironment(
         target, notifications, notificationQueue, pendingNotifications, alignedVideoDirty,
       );
-      const sweep = this.config.videoSourceMode === 'youtube-api'
+      const sweep = preciseLiveOnly ? null : this.config.videoSourceMode === 'youtube-api'
         ? await this.runYoutubeDataApiCycle(env, target, scheduledTime, { force: forceSweep })
         : forceSweep
           ? await this.runRssSweep(env, target, scheduledTime)
           : await this.runRssCohort(env, target, scheduledTime);
+      let preciseLiveWatch = { outcome: 'disabled', livePairs: new Set() };
+      if (this.config.preciseLiveWatchEnabled
+        && shouldRunPreciseLiveWatchCycle({ preciseLiveOnly, scheduledTime })) {
+        preciseLiveWatch = await this.runPreciseLiveWatchCycle(env, target, scheduledTime, {
+          ordinaryFallback: !preciseLiveOnly && Math.floor(scheduledTime / MINUTE_MS) % 5 === 0,
+        });
+        for (const pair of preciseLiveWatch.livePairs || []) alignedVideoDirty.add(pair);
+      }
       let alignedNotifications = { outcome: 'disabled' };
       if (this.config.alignedVideoNotificationsEnabled
-        && Math.floor(scheduledTime / MINUTE_MS) % 5 === 0
-        && sweep?.outcome !== 'error') {
+        && (preciseLiveWatch.livePairs?.size > 0
+          || (!preciseLiveOnly && Math.floor(scheduledTime / MINUTE_MS) % 5 === 0))
+        && (preciseLiveWatch.livePairs?.size > 0 || sweep?.outcome !== 'error')) {
         const alignedContext = new WaitUntilContext();
         alignedNotifications = await runAlignedVideoNotifications(env, alignedContext, scheduledTime, {
           activationAt: Number.isFinite(alignedActivationAt) ? alignedActivationAt : scheduledTime,
           newlyDetectedPairs: alignedVideoDirty,
+          ...(preciseLiveOnly ? { candidatePairs: alignedVideoDirty } : {}),
         });
         await alignedContext.flush();
       }
-      const minuteJobs = await this.runMinuteJobs(env, target, scheduledTime, { forcePosts });
-      minuteJobs.alignedVideoNotifications = alignedNotifications;
+      const minuteJobs = preciseLiveOnly
+        ? null
+        : await this.runMinuteJobs(env, target, scheduledTime, { forcePosts });
+      if (minuteJobs) minuteJobs.alignedVideoNotifications = alignedNotifications;
       let publication;
       let notificationPublication = null;
       let notificationDelivery;
@@ -1796,12 +2071,21 @@ export class HomeSchedulerRunner {
           notificationPublication,
         };
       }
-      state.lastMinuteJobs = minuteJobs;
+      if (minuteJobs) state.lastMinuteJobs = minuteJobs;
+      state.lastPreciseLiveWatch = {
+        ...preciseLiveWatch,
+        livePairs: undefined,
+        alignedNotifications,
+        notificationDelivery,
+        publication,
+        notificationPublication,
+        scheduledAt: iso(scheduledTime),
+      };
       state.lastNotificationDelivery = notificationDelivery;
       state.nextSweepAt = iso(nextFiveMinuteBoundary(this.now()));
       await this.stateFile.write(state);
       return {
-        outcome: 'ok', sweep, minuteJobs, seed, mutations: mutationSummary,
+        outcome: 'ok', sweep, minuteJobs, preciseLiveWatch, seed, mutations: mutationSummary,
         publication, notificationPublication, wouldNotify: notifications, notificationDelivery,
       };
     } catch (error) {
@@ -1845,6 +2129,45 @@ export class HomeSchedulerRunner {
     }
   }
 
+  async preciseLiveWatchDue(scheduledTime) {
+    if (!this.config.preciseLiveWatchEnabled || this.config.mode === 'standby') return false;
+    const state = await this.stateFile.read();
+    const watch = normalizePreciseLiveWatchState(state.preciseLiveWatch, scheduledTime);
+    if (watch.quota.units >= this.config.preciseLiveWatchDailyCap) {
+      watch.degraded = true;
+      watch.degradedReason = 'daily-cap';
+      watch.lastOutcome = 'quota-degraded';
+      state.preciseLiveWatch = watch;
+      await this.stateFile.write(state);
+      return false;
+    }
+    const target = new WorkerKvFacade(new LocalKvAdapter(await this.runtime.getLocalNamespace()));
+    const events = await getKV(target, key.upcomingEvents()) || [];
+    return planPreciseLiveWatch(events, watch, scheduledTime).due.length > 0;
+  }
+
+  armNextPreciseLiveWatch() {
+    if (this.stopped || this.config.mode === 'standby' || !this.config.preciseLiveWatchEnabled) return;
+    const now = this.now();
+    const next = nextTenSecondBoundary(now);
+    this.preciseLiveTimer = setTimeout(() => {
+      const active = (async () => {
+        if (!await this.preciseLiveWatchDue(next)) return;
+        await this.runTick(next, { preciseLiveOnly: true });
+      })()
+        .catch((error) => this.handleScheduledTickError(error, next))
+        .catch((error) => {
+          console.error(`TubePulse precise live-watch error handler failed: ${String(error?.message || error).slice(0, 300)}`);
+        });
+      this.activePreciseLiveTick = active;
+      void active.finally(() => {
+        if (this.activePreciseLiveTick === active) this.activePreciseLiveTick = null;
+        this.armNextPreciseLiveWatch();
+      });
+    }, Math.max(1, next + 250 - now));
+    this.preciseLiveTimer.unref?.();
+  }
+
   armNextMinute() {
     if (this.stopped || this.config.mode === 'standby') return;
     const now = this.now();
@@ -1866,6 +2189,7 @@ export class HomeSchedulerRunner {
 
   async run() {
     this.armNextMinute();
+    this.armNextPreciseLiveWatch();
   }
 
   async status() {
@@ -1880,9 +2204,12 @@ export class HomeSchedulerRunner {
     this.stopped = true;
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
+    if (this.preciseLiveTimer) clearTimeout(this.preciseLiveTimer);
+    this.preciseLiveTimer = null;
     let failure = null;
     try {
       if (this.activeTick) await this.activeTick;
+      if (this.activePreciseLiveTick) await this.activePreciseLiveTick;
       const state = await this.stateFile.read();
       state.stoppedAt = iso(this.now());
       if (state.lease) state.lease.state = 'released';
