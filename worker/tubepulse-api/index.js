@@ -117,6 +117,36 @@ async function putKVIfChanged(kv, k, value, existingValue) {
   await putKV(kv, k, value);
   return true;
 }
+
+const LAST_SEEN_REFRESH_INTERVAL_MS = 60 * 60 * 1000;
+
+export async function touchExistingDeviceActivity(env, deviceId, { now = Date.now() } = {}) {
+  if (!deviceId) return { profilePresent: false, touched: false, retryAfterMs: 0 };
+  const profileKey = key.deviceProfile(deviceId);
+  const existing = await getKV(env.TUBEPULSE_KV, profileKey);
+  if (!existing || Array.isArray(existing) || typeof existing !== 'object') {
+    return { profilePresent: false, touched: false, retryAfterMs: 0 };
+  }
+
+  const lastSeenAt = Number(existing.lastSeenAt);
+  if (Number.isFinite(lastSeenAt)) {
+    const ageMs = Math.max(0, now - lastSeenAt);
+    if (ageMs < LAST_SEEN_REFRESH_INTERVAL_MS) {
+      return {
+        profilePresent: true,
+        touched: false,
+        retryAfterMs: LAST_SEEN_REFRESH_INTERVAL_MS - ageMs,
+      };
+    }
+  }
+
+  const touched = await putKVIfChanged(env.TUBEPULSE_KV, profileKey, { ...existing, lastSeenAt: now }, existing);
+  return {
+    profilePresent: true,
+    touched,
+    retryAfterMs: LAST_SEEN_REFRESH_INTERVAL_MS,
+  };
+}
 async function deleteKVIfExists(kv, k) {
   const existing = await getKV(kv, k);
   if (existing === null) return false;
@@ -937,7 +967,7 @@ async function handleRegister(request, env) {
     || existing.notificationCapability !== baseProfile.notificationCapability
     || existing.createdAt !== baseProfile.createdAt;
   const lastSeenAgeMs = now - (Number(existing?.lastSeenAt) || 0);
-  const shouldRefreshLastSeen = !existing || profileFieldsChanged || lastSeenAgeMs >= 60 * 60 * 1000;
+  const shouldRefreshLastSeen = !existing || profileFieldsChanged || lastSeenAgeMs >= LAST_SEEN_REFRESH_INTERVAL_MS;
   const profile = {
     ...baseProfile,
     lastSeenAt: shouldRefreshLastSeen ? now : baseProfile.lastSeenAt,
@@ -963,6 +993,17 @@ async function handleRegister(request, env) {
   }
 
   return json({ ok: true, createdAt: profile.createdAt, fcmTokenPresent: effectiveFcmToken !== null });
+}
+
+async function handleInternalActivityTouch(request, env) {
+  if (String(env.TUBEPULSE_INTERNAL_ACTIVITY_TOUCH || '').toLowerCase() !== 'true') {
+    return errorResponse('Not found', 404);
+  }
+  const deviceId = getDeviceId(request);
+  if (!deviceId) return errorResponse('Missing Authorization: Bearer <device-id>', 401);
+  const result = await touchExistingDeviceActivity(env, deviceId);
+  if (!result.profilePresent) return errorResponse('Device not registered', 404);
+  return json({ ok: true, touched: result.touched, retryAfterMs: result.retryAfterMs });
 }
 
 // ─── POST /subscribe-channel ────────────────────────────────────────────
@@ -1803,6 +1844,9 @@ export const appWorker = {
       }
       if (path === '/channel-override' && request.method === 'POST') {
         return await handleChannelOverride(request, env);
+      }
+      if (path === '/_tubepulse/activity-touch' && request.method === 'POST') {
+        return await handleInternalActivityTouch(request, env);
       }
 
       if (path === '/' && request.method === 'GET') {

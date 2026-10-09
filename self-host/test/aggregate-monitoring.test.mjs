@@ -83,6 +83,27 @@ test('aggregate monitoring counts profiles and subscriptions without exposing re
   }
 });
 
+test('backend-seen rolling windows are derived from the coordinated profile lastSeenAt', async () => {
+  const now = Date.parse('2026-10-09T12:00:00.000Z');
+  const profileKey = 'device:private-install:profile';
+  const adapter = new MemoryAdapter({
+    [profileKey]: JSON.stringify({ createdAt: now - 30 * 86_400_000, lastSeenAt: now - 8 * 86_400_000 }),
+    'channels:active': '[]',
+  });
+  let payload = await collectAggregateMonitoring({ adapter, nowMs: now });
+  assert.equal(payload.installs.active.h24, 0);
+  assert.equal(payload.installs.active.d7, 0);
+
+  adapter.values.set(profileKey, JSON.stringify({
+    createdAt: now - 30 * 86_400_000,
+    lastSeenAt: now - 1_000,
+  }));
+  payload = await collectAggregateMonitoring({ adapter, nowMs: now });
+  assert.equal(payload.installs.active.h24, 1);
+  assert.equal(payload.installs.active.d7, 1);
+  assertAggregateMonitoringSafe(payload);
+});
+
 test('aggregate monitoring distinguishes a current YouTube error from cumulative failure history', async () => {
   const payload = await collectAggregateMonitoring({
     adapter: new MemoryAdapter({ 'channels:active': '[]' }),

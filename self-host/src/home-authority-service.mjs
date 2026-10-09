@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { appWorker } from '../../worker/tubepulse-api/index.js';
+import { appWorker, touchExistingDeviceActivity } from '../../worker/tubepulse-api/index.js';
 import { BufferedKvNamespace } from '../../worker/tubepulse-api/authority.mjs';
 import { AuthorityClient } from './authority-client.mjs';
 import {
@@ -149,8 +149,13 @@ export class UnifiedHomeAuthorityService {
             ...this.config.workerBindings,
             TUBEPULSE_KV: buffered,
             TUBEPULSE_DISABLE_WEBSUB: 'true',
+            TUBEPULSE_INTERNAL_ACTIVITY_TOUCH: 'true',
           }, context);
           await context.flush();
+          if (response.ok && path !== '/register' && path !== '/_tubepulse/activity-touch') {
+            const deviceId = authorization.startsWith('Bearer ') ? authorization.slice(7).trim() : '';
+            await touchExistingDeviceActivity({ TUBEPULSE_KV: buffered }, deviceId).catch(() => {});
+          }
           const responseBody = await response.text();
           return {
             response: { status: response.status, headers: responseHeaders(response), body: responseBody },

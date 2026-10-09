@@ -7,6 +7,7 @@ const AUTHORITY_VERSION = '1';
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
 const DEFAULT_LEASE_TTL_MS = 120_000;
 const AUTHORITY_MUTATION_ROUTES = new Set([
+  'POST /_tubepulse/activity-touch',
   'POST /register',
   'POST /subscribe-channel',
   'POST /unsubscribe',

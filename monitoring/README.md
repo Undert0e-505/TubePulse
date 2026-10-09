@@ -80,7 +80,7 @@ The host exposes `GET /_tubepulse/monitoring` only through its loopback/private 
 
 Readable snapshots and Prometheus metrics contain only:
 
-- registered, new, active, and push-capable installation counts;
+- registered, new, backend-seen, and push-capable installation counts. `Backend seen 24h/7d` is the unique-installation count with a successful authenticated backend contact in that rolling window; it includes notification taps that invoke `/seen`, but passive notification delivery alone is not counted;
 - aggregate app-version counts;
 - active-channel counts; configured device-side and inverse subscriber-index membership totals; anonymous directional/index-integrity counts; and mean/p50/p95/max/zero-channel distribution;
 - host readiness/current state, scheduler progress/outcome, sweep state, and YouTube quota/failure/freshness;

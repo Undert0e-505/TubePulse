@@ -1101,6 +1101,14 @@ const AUTHORITY_MUTATIONS = new Set([
   'POST /channel-override',
 ]);
 
+const AUTHENTICATED_APP_ROUTES = new Set([
+  ...AUTHORITY_MUTATIONS,
+  'GET /feed',
+  'GET /resolve',
+]);
+
+const ACTIVITY_TOUCH_ROUTE = '/_tubepulse/activity-touch';
+
 const INTERNAL_AUTHORITY_ROUTES = new Map([
   ['GET /_tubepulse/authority/status', { operation: 'authority-status', coordinatorPath: '/status' }],
   ['POST /_tubepulse/authority/publication/acquire', { operation: 'authority-publication-acquire', coordinatorPath: '/acquire' }],
@@ -1458,9 +1466,79 @@ async function canonicalFeedWithVersionRetry(appWorker, request, env, ctx, timeo
   return json({ error: 'Canonical feed is temporarily unavailable' }, 503);
 }
 
+async function coordinateActivityTouch(config, env, authorization) {
+  const leaseId = crypto.randomUUID();
+  let acquired;
+  try {
+    acquired = await acquireCoordinatorLease(env, leaseId, 'home-api', config.timeoutMs);
+  } catch {
+    throw new Error('activity-coordinator-unavailable');
+  }
+  if (!acquired.response.ok) throw new Error('activity-coordinator-busy');
+
+  let home;
+  try {
+    home = await homeAuthorityRequest(config, env, {
+      pathname: '/_tubepulse/authority/mutation',
+      operation: 'authority-mutation',
+      body: {
+        leaseId,
+        method: 'POST',
+        path: ACTIVITY_TOUCH_ROUTE,
+        body: '{}',
+        headers: { 'content-type': 'application/json' },
+      },
+      authorization,
+    });
+  } catch {
+    await coordinatorRequest(env, '/release', { leaseId }).catch(() => {});
+    throw new Error('activity-home-unavailable');
+  }
+
+  if (!home.response.ok || home.payload?.ok !== true || !home.payload?.response) {
+    await coordinatorRequest(env, '/release', { leaseId }).catch(() => {});
+    throw new Error('activity-home-rejected');
+  }
+  const status = Number(home.payload.response.status);
+  if (!Number.isInteger(status) || status < 200 || status > 599) {
+    await coordinatorRequest(env, '/release', { leaseId }).catch(() => {});
+    throw new Error('activity-home-invalid-response');
+  }
+  if (status >= 400) {
+    await coordinatorRequest(env, '/release', { leaseId }).catch(() => {});
+    return { profilePresent: false, touched: false, retryAfterMs: 0 };
+  }
+
+  const deltas = Array.isArray(home.payload.deltas) ? home.payload.deltas : null;
+  if (!deltas) {
+    await coordinatorRequest(env, '/release', { leaseId }).catch(() => {});
+    throw new Error('activity-home-invalid-deltas');
+  }
+  let committed;
+  try {
+    committed = deltas.length
+      ? await coordinatorRequest(env, '/commit', { leaseId, deltas })
+      : await coordinatorRequest(env, '/release', { leaseId });
+  } catch {
+    await coordinatorRequest(env, '/release', { leaseId }).catch(() => {});
+    throw new Error('activity-backup-unavailable');
+  }
+  if (!committed.response.ok) throw new Error('activity-backup-rejected');
+
+  let result = {};
+  try { result = JSON.parse(String(home.payload.response.body || '{}')); } catch { /* response is advisory */ }
+  return {
+    profilePresent: true,
+    touched: result.touched === true,
+    retryAfterMs: Math.max(0, Number(result.retryAfterMs) || 0),
+  };
+}
+
 export function createAuthorityWorker(appWorker, options = {}) {
   const replay = new Map();
   const logger = options.logger || console;
+  const activityTouchInFlight = new Map();
+  const activityTouchNotBefore = new Map();
   return {
     async fetch(request, env, ctx) {
       const config = readAuthorityConfig(env);
@@ -1520,6 +1598,35 @@ export function createAuthorityWorker(appWorker, options = {}) {
       // traffic latch changes application behaviour.
       if (!config.trafficEnabled) return await appWorker.fetch(request, appEnv, ctx);
 
+      const withActivityTouch = (response) => {
+        const authorization = request.headers.get('Authorization') || '';
+        const deviceId = authorization.startsWith('Bearer ') ? authorization.slice(7).trim() : '';
+        if (
+          !response.ok
+          || !deviceId
+          || route === 'POST /register'
+          || AUTHORITY_MUTATIONS.has(route)
+          || !AUTHENTICATED_APP_ROUTES.has(route)
+          || typeof ctx?.waitUntil !== 'function'
+        ) return response;
+
+        const now = Date.now();
+        if ((activityTouchNotBefore.get(deviceId) || 0) > now || activityTouchInFlight.has(deviceId)) return response;
+        const touch = coordinateActivityTouch(config, env, authorization)
+          .then((result) => {
+            if (result.profilePresent && result.retryAfterMs > 0) {
+              activityTouchNotBefore.set(deviceId, Date.now() + result.retryAfterMs);
+            }
+          })
+          .catch(() => {
+            logger.warn?.('[TubePulse authority] best-effort activity touch skipped');
+          })
+          .finally(() => activityTouchInFlight.delete(deviceId));
+        activityTouchInFlight.set(deviceId, touch);
+        ctx.waitUntil(touch);
+        return response;
+      };
+
       // Existing WebSub leases can continue to deliver briefly after the
       // local scheduler takes ownership. Acknowledge pushes without applying
       // writes or sending duplicate notifications. Verification handshakes
@@ -1547,17 +1654,17 @@ export function createAuthorityWorker(appWorker, options = {}) {
               authorization: request.headers.get('Authorization') || '',
             });
             if (home.response.ok && Array.isArray(home.payload?.channels)) {
-              return withAuthorityRoute(home.response, 'home');
+              return withActivityTouch(withAuthorityRoute(home.response, 'home'));
             }
             if ([400, 401, 403, 404].includes(home.response.status) && home.payload?.error) {
-              return withAuthorityRoute(home.response, 'home');
+              return withActivityTouch(withAuthorityRoute(home.response, 'home'));
             }
           } catch { /* bounded canonical fallback below */ }
         }
-        return await canonicalFeedWithVersionRetry(appWorker, request, appEnv, ctx, config.timeoutMs, status);
+        return withActivityTouch(await canonicalFeedWithVersionRetry(appWorker, request, appEnv, ctx, config.timeoutMs, status));
       }
 
-      if (!AUTHORITY_MUTATIONS.has(route)) return await appWorker.fetch(request, appEnv, ctx);
+      if (!AUTHORITY_MUTATIONS.has(route)) return withActivityTouch(await appWorker.fetch(request, appEnv, ctx));
       const authorization = request.headers.get('Authorization') || '';
       if (!authorization.startsWith('Bearer ') || authorization.slice(7).trim() === '') {
         return await appWorker.fetch(request, appEnv, ctx);
@@ -1633,7 +1740,7 @@ export function createAuthorityWorker(appWorker, options = {}) {
       if (!committed.response.ok) {
         return json({ error: 'Canonical mutation could not be persisted' }, 503);
       }
-      return withAuthorityRoute(response, 'home');
+      return withActivityTouch(withAuthorityRoute(response, 'home'));
     },
   };
 }

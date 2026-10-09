@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { appWorker } from './tubepulse-api/index.js';
+import {
+  appWorker,
+  touchExistingDeviceActivity,
+} from './tubepulse-api/index.js';
+
+const LAST_SEEN_REFRESH_INTERVAL_MS = 60 * 60 * 1000;
 
 class MemoryKV {
   constructor() {
@@ -65,4 +70,42 @@ test('released clients without a capability remain explicitly legacy', async () 
   }, {});
   const profile = await kv.get('device:secure:test-device:profile', 'json');
   assert.equal(profile.notificationCapability, null);
+});
+
+test('activity touch refreshes only a stale existing profile and preserves every other field', async () => {
+  const kv = new MemoryKV();
+  const now = 10 * LAST_SEEN_REFRESH_INTERVAL_MS;
+  const original = {
+    fcmToken: 'synthetic-token', platform: 'android', appVersion: '4.1.0',
+    notificationCapability: 'local-v1', createdAt: 123, lastSeenAt: now - LAST_SEEN_REFRESH_INTERVAL_MS,
+    futureProfileField: { preserved: true },
+  };
+  kv.entries.set('device:secure:test-device:profile', JSON.stringify(original));
+
+  const stale = await touchExistingDeviceActivity({ TUBEPULSE_KV: kv }, 'secure:test-device', { now });
+  assert.deepEqual(stale, {
+    profilePresent: true, touched: true, retryAfterMs: LAST_SEEN_REFRESH_INTERVAL_MS,
+  });
+  assert.deepEqual(await kv.get('device:secure:test-device:profile', 'json'), { ...original, lastSeenAt: now });
+  assert.equal(kv.puts, 1);
+
+  const fresh = await touchExistingDeviceActivity({ TUBEPULSE_KV: kv }, 'secure:test-device', {
+    now: now + LAST_SEEN_REFRESH_INTERVAL_MS - 1,
+  });
+  assert.equal(fresh.touched, false);
+  assert.equal(fresh.retryAfterMs, 1);
+  assert.equal(kv.puts, 1, 'a profile may be persisted at most once per installation per hour');
+});
+
+test('activity touch never creates a missing profile and its internal route is not public', async () => {
+  const kv = new MemoryKV();
+  const missing = await touchExistingDeviceActivity({ TUBEPULSE_KV: kv }, 'secure:missing-device', { now: 123 });
+  assert.deepEqual(missing, { profilePresent: false, touched: false, retryAfterMs: 0 });
+  assert.equal(kv.puts, 0);
+
+  const response = await appWorker.fetch(new Request('https://api.test/_tubepulse/activity-touch', {
+    method: 'POST', headers: { Authorization: 'Bearer secure:missing-device' }, body: '{}',
+  }), { TUBEPULSE_KV: kv }, {});
+  assert.equal(response.status, 404);
+  assert.equal(kv.puts, 0);
 });

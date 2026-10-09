@@ -506,8 +506,8 @@
     {
       "id": 8,
       "type": "stat",
-      "title": "Active 24h",
-      "description": "Audience & scale — active installations in the last 24 hours. Aggregate context only; this is not a fault threshold.",
+      "title": "Backend seen 24h",
+      "description": "Unique installations with a successful authenticated backend contact in the rolling 24-hour window, including notification taps that invoke /seen. Passive notification delivery alone is not counted. Aggregate context only; this is not a fault threshold.",
       "transparent": true,
       "gridPos": {
         "x": 0,
@@ -518,7 +518,7 @@
       "targets": [
         {
           "expr": "tubepulse_installs_active{window=\"h24\"}",
-          "legendFormat": "Active 24h",
+          "legendFormat": "Backend seen 24h",
           "refId": "A",
           "instant": false,
           "range": true
@@ -555,8 +555,8 @@
     {
       "id": 9,
       "type": "stat",
-      "title": "Active 7d",
-      "description": "Audience & scale — active installations in the last seven days. Aggregate context only; this is not a fault threshold.",
+      "title": "Backend seen 7d",
+      "description": "Unique installations with a successful authenticated backend contact in the rolling seven-day window, including notification taps that invoke /seen. Passive notification delivery alone is not counted. Aggregate context only; this is not a fault threshold.",
       "transparent": true,
       "gridPos": {
         "x": 2,
@@ -567,7 +567,7 @@
       "targets": [
         {
           "expr": "tubepulse_installs_active{window=\"d7\"}",
-          "legendFormat": "Active 7d",
+          "legendFormat": "Backend seen 7d",
           "refId": "A",
           "instant": false,
           "range": true

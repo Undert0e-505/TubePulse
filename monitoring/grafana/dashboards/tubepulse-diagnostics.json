@@ -47,12 +47,12 @@
       "options": { "colorMode": "value", "graphMode": "none", "orientation": "horizontal", "reduceOptions": { "calcs": ["lastNotNull"], "values": false } }
     },
     {
-      "type": "stat", "title": "Install aggregates", "description": "Aggregate-only registered, push-capable, active and newly registered installation counts.",
+      "type": "stat", "title": "Install aggregates", "description": "Aggregate-only registered, push-capable, newly registered and backend-seen installation counts. Backend seen means a successful authenticated backend contact; notification taps that invoke /seen count, but passive notification delivery alone does not.",
       "gridPos": { "x": 0, "y": 4, "w": 8, "h": 5 },
       "targets": [
         { "expr": "tubepulse_installs_total", "legendFormat": "registered", "refId": "A" },
         { "expr": "tubepulse_installs_push_capable", "legendFormat": "push capable", "refId": "B" },
-        { "expr": "tubepulse_installs_active{window=\"h24\"}", "legendFormat": "active 24h", "refId": "C" },
+        { "expr": "tubepulse_installs_active{window=\"h24\"}", "legendFormat": "backend seen 24h", "refId": "C" },
         { "expr": "tubepulse_installs_new{window=\"d7\"}", "legendFormat": "new 7d", "refId": "D" }
       ],
       "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },

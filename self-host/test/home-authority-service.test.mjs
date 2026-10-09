@@ -157,7 +157,10 @@ test('signed Home mutation runs real /seen semantics locally and the next Home f
   const videoId = 'video-unwatched';
   const stateKey = `device:${device}:state:${channelId}`;
   const namespace = new MemoryNamespace({
-    [`device:${device}:profile`]: JSON.stringify({ platform: 'android' }),
+    [`device:${device}:profile`]: JSON.stringify({
+      platform: 'android', appVersion: '4.1.0', createdAt: 123, lastSeenAt: 1,
+      futureProfileField: { preserved: true },
+    }),
     [`device:${device}:channels`]: JSON.stringify([channelId]),
     [`device:${device}:settings`]: JSON.stringify({ includeCommunityPosts: false }),
     [`channel:${channelId}:meta`]: JSON.stringify({ name: 'Seen test' }),
@@ -188,8 +191,14 @@ test('signed Home mutation runs real /seen semantics locally and the next Home f
   assert.equal(result.ok, true);
   assert.equal(result.response.status, 200);
   assert.equal(result.deltas.some((delta) => delta.key === stateKey), true);
+  assert.equal(result.deltas.some((delta) => delta.key === `device:${device}:profile`), true);
   assert.deepEqual(JSON.parse(namespace.values.get(stateKey)), { unwatched: [], lastNagAt: null, nagCount: 0 });
+  const touchedProfile = JSON.parse(namespace.values.get(`device:${device}:profile`));
+  assert.equal(touchedProfile.lastSeenAt > 1, true);
+  assert.deepEqual(touchedProfile.futureProfileField, { preserved: true });
+  assert.equal(touchedProfile.appVersion, '4.1.0');
 
+  namespace.values.set(`device:${device}:profile`, JSON.stringify({ ...touchedProfile, lastSeenAt: 1 }));
   const invalid = signed('/_tubepulse/authority/mutation', 'authority-mutation', {
     leaseId: 'home-seen-invalid-00001',
     method: 'POST',
@@ -202,6 +211,7 @@ test('signed Home mutation runs real /seen semantics locally and the next Home f
   const rejected = await response.json();
   assert.equal(rejected.response.status, 400);
   assert.deepEqual(rejected.deltas, []);
+  assert.equal(JSON.parse(namespace.values.get(`device:${device}:profile`)).lastSeenAt, 1);
   assert.equal((await service.gate.status()).lease, null);
 
   const authorization = `Bearer ${device}`;
@@ -220,4 +230,83 @@ test('signed Home mutation runs real /seen semantics locally and the next Home f
   const feed = await response.json();
   assert.equal(feed.channels[0].videos[0].unwatched, false);
   assert.equal(feed.channels[0].unwatchedCount, 0);
+});
+
+test('an activity-touch failure cannot fail an otherwise successful Home mutation', async (t) => {
+  const dataDir = await temporaryDirectory(t);
+  const device = 'synthetic-device';
+  const profileKey = `device:${device}:profile`;
+  const settingsKey = `device:${device}:settings`;
+  const namespace = new MemoryNamespace({ [profileKey]: '{invalid-json' });
+  const service = new UnifiedHomeAuthorityService(config(dataDir), {
+    runtime: new FakeRuntime(namespace, { realApi: true }),
+    runner: new FakeRunner(), host: '127.0.0.1', port: 0,
+  });
+  await service.start();
+  t.after(() => service.close());
+  await service.gate.reconcile({ manifestHash: contentHash('touch-failure-test'), recordCount: namespace.values.size });
+  const base = `http://127.0.0.1:${service.server.address().port}`;
+  const mutation = signed('/_tubepulse/authority/mutation', 'authority-mutation', {
+    leaseId: 'home-touch-failure-0001',
+    method: 'POST',
+    path: '/settings',
+    body: JSON.stringify({ settings: { mode: 'normal' } }),
+    headers: { 'content-type': 'application/json' },
+  });
+  const response = await fetch(`${base}/_tubepulse/authority/mutation`, { method: 'POST', ...mutation });
+  assert.equal(response.status, 200);
+  const result = await response.json();
+  assert.equal(result.response.status, 200);
+  assert.equal(result.deltas.some((delta) => delta.key === settingsKey), true);
+  assert.equal(result.deltas.some((delta) => delta.key === profileKey), false);
+  assert.equal(namespace.values.get(profileKey), '{invalid-json');
+  assert.deepEqual(JSON.parse(namespace.values.get(settingsKey)), { mode: 'normal' });
+});
+
+test('the signed read-follow-up route refreshes a stale profile once without changing other fields', async (t) => {
+  const dataDir = await temporaryDirectory(t);
+  const device = 'synthetic-device';
+  const profileKey = `device:${device}:profile`;
+  const namespace = new MemoryNamespace({
+    [profileKey]: JSON.stringify({
+      fcmToken: 'synthetic-token', platform: 'android', appVersion: '4.1.0',
+      createdAt: 123, lastSeenAt: 1, futureProfileField: 'preserved',
+    }),
+  });
+  const service = new UnifiedHomeAuthorityService(config(dataDir), {
+    runtime: new FakeRuntime(namespace, { realApi: true }),
+    runner: new FakeRunner(), host: '127.0.0.1', port: 0,
+  });
+  await service.start();
+  t.after(() => service.close());
+  await service.gate.reconcile({ manifestHash: contentHash('read-touch-test'), recordCount: namespace.values.size });
+  const base = `http://127.0.0.1:${service.server.address().port}`;
+  const activityRequest = (leaseId) => signed('/_tubepulse/authority/mutation', 'authority-mutation', {
+    leaseId,
+    method: 'POST',
+    path: '/_tubepulse/activity-touch',
+    body: '{}',
+    headers: { 'content-type': 'application/json' },
+  });
+
+  let request = activityRequest('home-read-touch-000001');
+  let response = await fetch(`${base}/_tubepulse/authority/mutation`, { method: 'POST', ...request });
+  assert.equal(response.status, 200);
+  let result = await response.json();
+  assert.equal(result.response.status, 200);
+  assert.equal(result.deltas.length, 1);
+  assert.equal(result.deltas[0].key, profileKey);
+  let profile = JSON.parse(namespace.values.get(profileKey));
+  assert.equal(profile.lastSeenAt > 1, true);
+  assert.equal(profile.futureProfileField, 'preserved');
+  assert.equal(profile.fcmToken, 'synthetic-token');
+
+  request = activityRequest('home-read-touch-000002');
+  response = await fetch(`${base}/_tubepulse/authority/mutation`, { method: 'POST', ...request });
+  assert.equal(response.status, 200);
+  result = await response.json();
+  assert.equal(result.response.status, 200);
+  assert.deepEqual(result.deltas, []);
+  profile = JSON.parse(namespace.values.get(profileKey));
+  assert.equal(profile.futureProfileField, 'preserved');
 });

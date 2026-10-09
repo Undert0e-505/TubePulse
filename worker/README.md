@@ -8,7 +8,7 @@ The [self-host runtime](../self-host/README.md) executes these same source files
 
 `self-host/compose.authority.yaml` is the production successor to the earlier scheduler shadow. One local runtime/store combines signed all-device mutation execution and scheduled work, publishes exact changed-key journals through a SQLite Durable Object coordinator, and serves all authenticated feeds over Workers VPC while current. It performs no periodic full pull. D1 commits are atomic and content-hash guarded. The coordinator conservatively caps scheduler publication at 45,000 estimated rows/day and total coordinated D1 writes at 50,000 estimated rows/day, leaving a 5,000-row app reserve; deferred keys are coalesced and later drained by the existing publication path. App mutations no longer depend on cloud canonical read availability. Semantic `4xx`/`5xx` responses discard the buffered overlay, Home transport failures fail closed, and deferred scheduler batches still suppress FCM. WebSub is acknowledged but suppressed while authority traffic owns detection. RSS0/1/2, posts, and aux deployments are retained but all five Cron Trigger lists are empty and their handlers require an explicit frozen-KV rollback latch.
 
-The current app-facing Worker deployment is version `0b654d00-ba60-4381-94fb-fedf78ffbdd7`. Deployment authentication is intentionally external to the repository.
+The current app-facing Worker deployment is version `3925dd9b-ef83-4d37-93eb-563dcba05c14`. Deployment authentication is intentionally external to the repository.
 
 ---
 
@@ -154,6 +154,8 @@ For each new video, the cron does the standard fan-out (which is identical to wh
 
 **Auth model:** Every authenticated endpoint requires `Authorization: Bearer <deviceId>`. The `deviceId` is a UUID generated on first launch (via `expo-secure-store` since v3.0.20; previously a random UUID, then `Application.getAndroidId()`). There is no login — the deviceId *is* the auth token. This is acceptable because the KV is private and the deviceId is unguessable (UUIDv4 / Android-ID / secure-store UUID).
 
+A successful authenticated app route for an existing profile is also an activity signal. Home refreshes only that profile's `lastSeenAt`, at most once per installation per hour, and publishes the changed key through the normal authority/D1 coordinator. Mutation routes coalesce the touch into their existing transaction; successful reads schedule a best-effort coordinated touch that cannot make the original response fail. Missing profiles, malformed/failed requests, WebSub, health, monitoring, internal authority and unknown routes never create or refresh a profile. This measures backend contact—including notification taps that invoke `/seen`—not passive push receipt.
+
 ### 4.2 Bootstrap-on-subscribe (the most important code path)
 
 When a new device subscribes to a channel, the authority uses the same structural Data API path as scheduled detection:
@@ -186,7 +188,7 @@ Home keeps the current working copy in its persistent local store. D1 generation
 | `channel:{channelId}:recent` | JSON array | `[{ videoId, title, publishedAt, thumbnail, type, link, views, likes, comments, dislikes, viewsLastCheckedHour?, likesLastCheckedHour? }]` — metrics are decimal strings when known and `null` when hidden/unavailable; persistence clocks gate canonical metric writes | Home Data API scheduler | API (feed, bootstrap), API (subscribe for first-time populate) |
 | `channel:{channelId}:recent:posts` | JSON array | `[{ activityId, kind, text, thumbnail, link, publishedAt, fetchedAt, likeCount, viewCount }, ...]`; normalized known engagement changes persist at most once per UTC hour, with hydration and a 24-hour forced refresh | Home posts sweep | API (feed) |
 | `channel:{channelId}:firstPollAt:posts` | string | ISO timestamp of the first posts sweep for this channel — drives the first-run guard (**v3.1**) | Home posts sweep | Home posts sweep |
-| `device:{deviceId}:profile` | JSON | `{ fcmToken, platform, appVersion, notificationCapability, createdAt, lastSeenAt }`; capability is `"local-v1"` or `null` | API (register) | API (any auth call), Home (FCM fan-out) |
+| `device:{deviceId}:profile` | JSON | `{ fcmToken, platform, appVersion, notificationCapability, createdAt, lastSeenAt }`; capability is `"local-v1"` or `null` | API register plus the hourly-throttled coordinated activity touch after successful authenticated app contact | API (any auth call), Home (FCM fan-out) |
 | `device:{deviceId}:settings` | JSON | `{ mode, nagInterval, dndEnabled, dndStart, dndEnd, dndTimezone, dndBypass, tapAction, includeCommunityPosts (v3.1), prewarnMinutes (v3.1), ... }` | API (settings) | Home (FCM fan-out filter) |
 | `device:{deviceId}:channels` | JSON array | `[channelId, ...]` | API (subscribe, unsubscribe) | API (feed filter) |
 | `device:{deviceId}:override:{channelId}` | JSON | per-channel notification override. May include `mode?`, `nagInterval?`, `dndBypass?`, `muted?`, `includeCommunityPosts?` (**v3.1**, tri-state null/true/false), `prewarnMinutes?` (**v3.1**, tri-state null/number) | API (channel-override) | Home (FCM fan-out filter) |

@@ -18,6 +18,12 @@ test('wallboard and diagnostics dashboards are valid, provisioned, and use one d
   assert.equal(diagnostics.title, 'TubePulse Diagnostics');
   assert.ok(wallboard.panels.length >= 7);
   assert.ok(diagnostics.panels.length >= 10);
+  const installAggregates = diagnostics.panels.find(({ title }) => title === 'Install aggregates');
+  assert.equal(
+    installAggregates.targets.find(({ expr }) => expr === 'tubepulse_installs_active{window="h24"}').legendFormat,
+    'backend seen 24h',
+  );
+  assert.match(installAggregates.description, /passive notification delivery alone does not/);
   assert.match(read('monitoring', 'grafana', 'provisioning', 'dashboards', 'default.yml'), /\/etc\/grafana\/dashboards/);
   assert.match(read('monitoring', 'grafana', 'provisioning', 'datasources', 'prometheus.yml'), /http:\/\/prometheus:9090/);
 });
@@ -88,7 +94,7 @@ test('wallboard is a readable one-screen calm health overview', () => {
   assert.equal(audience.transparent, true);
 
   const audienceTitles = [
-    'Active 24h', 'Active 7d', 'Registered', 'Push capable',
+    'Backend seen 24h', 'Backend seen 7d', 'Registered', 'Push capable',
     'Channels', 'Memberships', 'Max / install',
   ];
   const audiencePanels = audienceTitles.map((title) => {
@@ -120,6 +126,8 @@ test('wallboard is a readable one-screen calm health overview', () => {
       'tubepulse_channels_per_install{statistic="max"}',
     ],
   );
+  assert.match(byTitle.get('Backend seen 24h').description, /successful authenticated backend contact/);
+  assert.match(byTitle.get('Backend seen 24h').description, /Passive notification delivery alone is not counted/);
 
   assert.equal(byTitle.has('Audience activity · 24h'), false, 'grouped audience history must not duplicate per-metric graphs');
   assert.equal(byTitle.has('Channel scale · 24h'), false, 'grouped channel history must not duplicate per-metric graphs');

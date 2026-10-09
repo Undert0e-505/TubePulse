@@ -118,6 +118,14 @@ function appRequest(path, body = {}) {
   });
 }
 
+function capturingContext() {
+  const promises = [];
+  return {
+    waitUntil(promise) { promises.push(Promise.resolve(promise)); },
+    async flush() { await Promise.all(promises); },
+  };
+}
+
 async function signedInternalRequest(path, operation, body, overrides = {}) {
   const bodyText = JSON.stringify(body);
   const timestamp = overrides.timestamp ?? Date.now();
@@ -787,6 +795,108 @@ test('every authenticated device reads the unified Home store with canonical fal
   }), env, {});
   assert.equal((await response.json()).source, 'cloudflare');
   assert.equal(homeCalls, before, 'stale Home must not receive app reads');
+});
+
+test('successful authenticated feed contact schedules one throttled coordinated activity touch', async () => {
+  const fixture = coordinatorFixture();
+  await seedCoordinator(fixture);
+  let feedCalls = 0;
+  let touchCalls = 0;
+  const homeFetch = async (input) => {
+    const request = input instanceof Request ? input : new Request(input);
+    if (new URL(request.url).pathname === '/_tubepulse/authority/feed') {
+      feedCalls++;
+      return Response.json({ channels: [], source: 'home' });
+    }
+    const body = await request.json();
+    assert.equal(body.path, '/_tubepulse/activity-touch');
+    touchCalls++;
+    return Response.json({
+      ok: true,
+      response: {
+        status: 200, headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ ok: true, touched: false, retryAfterMs: 60 * 60 * 1000 }),
+      },
+      deltas: [],
+    });
+  };
+  const worker = createAuthorityWorker({
+    async fetch() { throw new Error('canonical fallback must not run'); },
+  }, { logger: { warn() {} } });
+  const env = authorityEnv(fixture, homeFetch);
+  const context = capturingContext();
+  const feed = () => worker.fetch(new Request('https://api.example.test/feed', {
+    headers: { Authorization: `Bearer ${DEVICE}` },
+  }), env, context);
+
+  const responses = await Promise.all([feed(), feed()]);
+  assert.equal(responses.every((response) => response.status === 200), true);
+  await context.flush();
+  assert.equal(feedCalls, 2);
+  assert.equal(touchCalls, 1, 'concurrent contacts must share one in-flight activity touch');
+
+  const laterContext = capturingContext();
+  const later = await worker.fetch(new Request('https://api.example.test/feed', {
+    headers: { Authorization: `Bearer ${DEVICE}` },
+  }), env, laterContext);
+  assert.equal(later.status, 200);
+  await laterContext.flush();
+  assert.equal(touchCalls, 1, 'the Home-provided retry window suppresses repeated no-op coordination');
+});
+
+test('activity touch failure never changes a successful primary response', async () => {
+  const fixture = coordinatorFixture();
+  await seedCoordinator(fixture);
+  let warnings = 0;
+  const worker = createAuthorityWorker({
+    async fetch() { throw new Error('canonical fallback must not run'); },
+  }, { logger: { warn() { warnings++; } } });
+  const env = authorityEnv(fixture, async (input) => {
+    const request = input instanceof Request ? input : new Request(input);
+    if (new URL(request.url).pathname === '/_tubepulse/authority/feed') {
+      return Response.json({ channels: [], source: 'home' });
+    }
+    throw new Error('synthetic activity origin failure');
+  });
+  const context = capturingContext();
+  const response = await worker.fetch(new Request('https://api.example.test/feed', {
+    headers: { Authorization: `Bearer ${DEVICE}` },
+  }), env, context);
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { channels: [], source: 'home' });
+  await context.flush();
+  assert.equal(warnings, 1);
+  const status = await callCoordinator(fixture.coordinator, '/status', undefined, 'GET');
+  assert.equal(status.payload.lease, null);
+  assert.equal(status.payload.pendingBackupKeys, 0);
+});
+
+test('unauthenticated, unknown and internal routes do not schedule activity touches', async () => {
+  const fixture = coordinatorFixture();
+  await seedCoordinator(fixture);
+  let touchCalls = 0;
+  const worker = createAuthorityWorker({
+    async fetch() { return Response.json({ ok: true }); },
+  }, { logger: { warn() {} } });
+  const env = authorityEnv(fixture, async (input) => {
+    const request = input instanceof Request ? input : new Request(input);
+    if (new URL(request.url).pathname === '/_tubepulse/authority/feed') {
+      return Response.json({ error: 'Authenticated device identity required' }, { status: 401 });
+    }
+    touchCalls++;
+    return Response.json({ error: 'unexpected' }, { status: 500 });
+  });
+  const context = capturingContext();
+  const unauthenticated = await worker.fetch(new Request('https://api.example.test/feed'), env, context);
+  assert.equal(unauthenticated.status, 401);
+  const unknown = await worker.fetch(new Request('https://api.example.test/unknown', {
+    headers: { Authorization: `Bearer ${DEVICE}` },
+  }), env, context);
+  assert.equal(unknown.status, 200);
+  const root = await worker.fetch(new Request('https://api.example.test/'), env, context);
+  assert.equal(root.status, 200);
+  await context.flush();
+  assert.equal(touchCalls, 0);
 });
 
 test('Home read semantic authentication errors are preserved instead of hidden by fallback', async () => {
