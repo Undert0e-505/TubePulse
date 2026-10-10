@@ -274,6 +274,14 @@ export async function fetchFeed(deviceId) {
 }
 
 /**
+ * Fetch the public, privacy-safe notification service status. This route is
+ * intentionally unauthenticated and contains no installation information.
+ */
+export async function fetchServiceStatus() {
+  return await apiFetch('/service-status');
+}
+
+/**
  * Bootstrap a newly added channel — fetches RSS + avatar from server synchronously.
  * Now POST instead of GET.
  */

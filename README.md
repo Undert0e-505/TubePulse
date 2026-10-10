@@ -10,7 +10,7 @@ YouTube channels into a focused feed, widget and configurable notification flow.
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 [Download the latest release](https://github.com/Undert0e-505/TubePulse/releases/latest) ·
-[What’s new in v4.1.0](RELEASE_NOTES_v4.1.0.md) · [User guide](docs/USER_GUIDE.md)
+[What’s new in v4.2.0](RELEASE_NOTES_v4.2.0.md) · [User guide](docs/USER_GUIDE.md)
 
 ## See your channels at a glance
 
@@ -84,7 +84,7 @@ its own channel list and settings; TubePulse does not provide cross-device sync.
 - Operational monitoring is aggregate-only. It is designed not to expose installation or channel
   identifiers, push tokens, titles or content.
 - Community posts are distinct from YouTube comments. Post detection depends on an unofficial web
-  surface; comment counts may be observed by the host but comments are not shown in the app.
+  surface; video rows may show the public comment total, but comment threads are not retrieved.
 - Push delivery, Android background behavior, YouTube availability and network connectivity can
   delay updates.
 - TubePulse is not affiliated with, endorsed by or sponsored by YouTube or Google.
@@ -102,7 +102,7 @@ See [SECURITY.md](SECURITY.md) for security reporting and the
 - [Aggregate monitoring](monitoring/README.md) — privacy boundary, dashboard and retention
 - [Cloud services](worker/README.md) and [Worker contracts](worker/CONTRACTS.md) — implementation,
   endpoints and canonical storage contracts
-- [Release process](RELEASE.md) and [release notes](RELEASE_NOTES_v4.1.0.md)
+- [Release process](RELEASE.md) and [release notes](RELEASE_NOTES_v4.2.0.md)
 - [Historical plans](MIGRATION_PLAN.md) — retained for context, not current operating instructions
 
 ## Build from source

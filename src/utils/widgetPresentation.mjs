@@ -1,9 +1,27 @@
 import {
   chooseLatestChannelContent,
   getPostSeenId,
+  resolveOptionalMetric,
   sortPostsNewestFirst,
   sortVideosNewestFirst,
 } from './feedPresentation.js';
+
+export function normalizeWidgetVideo(video = {}) {
+  return {
+    videoId: video.videoId,
+    title: video.title,
+    thumbnail: video.thumbnail,
+    link: video.link,
+    published: video.published || video.publishedAt,
+    publishedAt: video.publishedAt || video.published,
+    views: video.views || '',
+    likes: resolveOptionalMetric(video, 'likes'),
+    comments: resolveOptionalMetric(video, 'comments'),
+    dislikes: resolveOptionalMetric(video, 'dislikes'),
+    unwatched: video.unwatched,
+    kind: 'video',
+  };
+}
 
 function isVideoUnwatched(video, seenIds) {
   if (video?.unwatched === true) return true;

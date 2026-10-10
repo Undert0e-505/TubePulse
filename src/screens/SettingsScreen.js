@@ -12,7 +12,7 @@ import appConfig from '../../app.json';
 import { COLORS, NAG_INTERVALS, PREWARN_OPTIONS, VIDEOS_PER_CHANNEL_OPTIONS } from '../utils/constants';
 import TimeSpinner from '../components/TimeSpinner';
 import { getSettings, peekSettings, saveSettings } from '../utils/storage';
-import { updateSettings, getDeviceId } from '../utils/api';
+import { updateSettings, getDeviceId, fetchServiceStatus } from '../utils/api';
 import { IS_TUBEPULSE_PREVIEW } from '../utils/apiEndpointConfig';
 import UpdateAvailablePill from '../components/UpdateAvailablePill';
 import {
@@ -27,6 +27,14 @@ import {
 import {
   updatesMatch,
 } from '../utils/settingsBootstrap.mjs';
+import {
+  normalizeServiceStatus,
+  readCachedServiceStatus,
+  serviceStatusPresentation,
+  shouldRefreshServiceStatus,
+  unavailableServiceStatus,
+  writeCachedServiceStatus,
+} from '../utils/serviceStatus.mjs';
 
 const FOOTER_VISUAL_PADDING = 8;
 const UPDATE_ARGS = {
@@ -43,6 +51,37 @@ let warmedUpdatePromise = cachedAvailableUpdate(UPDATE_ARGS).then((value) => {
   warmedAvailableUpdate = value;
   return value;
 });
+let warmedServiceStatus = null;
+let serviceStatusLastAttemptAt = 0;
+let serviceStatusRefreshPromise = null;
+let warmedServiceStatusPromise = readCachedServiceStatus(AsyncStorage).then((value) => {
+  warmedServiceStatus = value;
+  return value;
+});
+
+async function refreshServiceStatusIfDue() {
+  const nowMs = Date.now();
+  if (serviceStatusRefreshPromise) return await serviceStatusRefreshPromise;
+  if (!shouldRefreshServiceStatus(warmedServiceStatus, { nowMs })
+    || nowMs - serviceStatusLastAttemptAt < 60_000) return warmedServiceStatus;
+  serviceStatusLastAttemptAt = nowMs;
+  serviceStatusRefreshPromise = fetchServiceStatus().then(async (result) => {
+    const checkedAt = Date.now();
+    const next = result.ok
+      ? normalizeServiceStatus(result, { nowMs: checkedAt, checkedAt })
+      : unavailableServiceStatus(warmedServiceStatus, { nowMs: checkedAt });
+    warmedServiceStatus = next;
+    warmedServiceStatusPromise = Promise.resolve(next);
+    await writeCachedServiceStatus(AsyncStorage, next).catch(() => {});
+    return next;
+  }).catch(() => {
+    const next = unavailableServiceStatus(warmedServiceStatus);
+    warmedServiceStatus = next;
+    warmedServiceStatusPromise = Promise.resolve(next);
+    return next;
+  }).finally(() => { serviceStatusRefreshPromise = null; });
+  return await serviceStatusRefreshPromise;
+}
 
 // ── Main Screen ───────────────────────────────────────────────────────────────
 export default function SettingsScreen() {
@@ -51,6 +90,8 @@ export default function SettingsScreen() {
   const [scrollEnabled, setScrollEnabled] = useState(true);
   const [settings, setSettings] = useState(() => peekSettings());
   const [availableUpdate, setAvailableUpdate] = useState(() => warmedAvailableUpdate);
+  const [serviceStatus, setServiceStatus] = useState(() => warmedServiceStatus);
+  const [serviceStatusClock, setServiceStatusClock] = useState(() => Date.now());
   const [settingsVisitId, setSettingsVisitId] = useState(0);
   const visitSequence = useRef(0);
   const hasFocused = useRef(false);
@@ -63,6 +104,7 @@ export default function SettingsScreen() {
       const firstFocus = !hasFocused.current;
       hasFocused.current = true;
       setSettingsVisitId(visitId);
+      setServiceStatusClock(Date.now());
 
       // This is normally a synchronous warm-cache hit. Only an unusually fast
       // tap during cold launch waits for the settings-only preload promise.
@@ -92,7 +134,19 @@ export default function SettingsScreen() {
         setAvailableUpdate((current) => (updatesMatch(current, update) ? current : update));
       }).catch(() => {});
 
-      return () => { active = false; };
+      warmedServiceStatusPromise.then((cached) => {
+        if (!active) return null;
+        setServiceStatus(cached);
+        return refreshServiceStatusIfDue();
+      }).then((fresh) => {
+        if (active && fresh) setServiceStatus(fresh);
+      }).catch(() => {});
+      const freshnessTimer = setInterval(() => setServiceStatusClock(Date.now()), 60_000);
+
+      return () => {
+        active = false;
+        clearInterval(freshnessTimer);
+      };
     }, [])
   );
 
@@ -140,6 +194,14 @@ export default function SettingsScreen() {
   };
 
   const mode = settings?.notificationMode || 'relentless';
+  const servicePresentation = serviceStatusPresentation(serviceStatus, { nowMs: serviceStatusClock });
+  const serviceStatusColor = {
+    healthy: COLORS.success,
+    degraded: COLORS.warning,
+    outage: COLORS.danger,
+    unknown: COLORS.textDim,
+    checking: COLORS.textDim,
+  }[servicePresentation.status];
 
   return (
     <View style={styles.container}>
@@ -150,6 +212,27 @@ export default function SettingsScreen() {
         nestedScrollEnabled
         scrollEnabled={scrollEnabled}
       >
+
+      <View
+        style={styles.serviceStatusCard}
+        accessible={Boolean(servicePresentation.label)}
+        accessibilityRole="text"
+        accessibilityLiveRegion="polite"
+        accessibilityLabel={servicePresentation.label
+          ? `${servicePresentation.label}. ${servicePresentation.freshness}`
+          : undefined}
+      >
+        <Text
+          style={[styles.serviceStatusText, { color: serviceStatusColor }]}
+          numberOfLines={1}
+          ellipsizeMode="tail"
+        >
+          {servicePresentation.label}
+        </Text>
+        <Text style={styles.serviceStatusFreshness} numberOfLines={1}>
+          {servicePresentation.freshness}
+        </Text>
+      </View>
 
       {/* Tap Action */}
       <Text style={[styles.sectionTitle, styles.sectionTitleFirst]}>On tap, open:</Text>
@@ -410,6 +493,30 @@ const styles = StyleSheet.create({
     letterSpacing: 0.5,
     marginTop: 12,
     marginBottom: 6,
+  },
+  serviceStatusCard: {
+    height: 38,
+    marginTop: 4,
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: COLORS.surface,
+    borderColor: COLORS.border,
+    borderWidth: 1,
+    borderRadius: 8,
+    paddingHorizontal: 12,
+  },
+  serviceStatusText: {
+    flex: 1,
+    minWidth: 0,
+    flexShrink: 1,
+    paddingRight: 8,
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  serviceStatusFreshness: {
+    flexShrink: 0,
+    color: COLORS.textDim,
+    fontSize: 12,
   },
   sectionTitleFirst: {
     marginTop: 4,

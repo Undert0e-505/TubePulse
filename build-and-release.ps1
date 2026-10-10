@@ -38,7 +38,9 @@ param(
 
     [switch]$Clean,
 
-    [switch]$ValidateOnly
+    [switch]$ValidateOnly,
+
+    [string]$BuildOnlyVersionCodeOverride = ''
 )
 
 # --- Constants ---
@@ -93,6 +95,14 @@ if ($ValidateOnly -and ($BuildOnly -or $Clean)) {
     Write-Error "-ValidateOnly cannot be combined with -BuildOnly or -Clean."
     exit 1
 }
+if ($BuildOnlyVersionCodeOverride -and -not $BuildOnly) {
+    Write-Error "-BuildOnlyVersionCodeOverride is allowed only with -BuildOnly."
+    exit 1
+}
+if ($BuildOnlyVersionCodeOverride -and $BuildOnlyVersionCodeOverride -notmatch '^[1-9][0-9]*$') {
+    Write-Error "-BuildOnlyVersionCodeOverride must be a positive integer."
+    exit 1
+}
 if ($BuildOnly -and $Clean) {
     Write-Error "-BuildOnly cannot be combined with -Clean."
     exit 1
@@ -118,6 +128,19 @@ if ($BuildOnly) {
     }
     $Version = $checkedInVersion.AppVersion
     $versionCode = $checkedInVersion.GradleVersionCode
+    $expectedApkVersionCode = $versionCode
+    if ($BuildOnlyVersionCodeOverride) {
+        $overrideCode = 0
+        if (-not [int]::TryParse($BuildOnlyVersionCodeOverride, [ref]$overrideCode)) {
+            Write-Error "-BuildOnlyVersionCodeOverride exceeds the supported Android integer range."
+            exit 1
+        }
+        if ($overrideCode -le [int]$versionCode) {
+            Write-Error "-BuildOnlyVersionCodeOverride ($overrideCode) must be greater than the checked-in versionCode ($versionCode)."
+            exit 1
+        }
+        $expectedApkVersionCode = [string]$overrideCode
+    }
 }
 # Branch
 $Branch = (git rev-parse --abbrev-ref HEAD 2>&1)
@@ -316,6 +339,9 @@ if ($Clean) {
 if ($BuildOnly) {
     Write-Host ""
     Write-Host "[1/7] Using checked-in version $Version (versionCode=$versionCode)..."
+    if ($BuildOnlyVersionCodeOverride) {
+        Write-Host "  manifest versionCode override: $expectedApkVersionCode"
+    }
     Write-Host "  app.json  unchanged"
     Write-Host "  build.gradle  unchanged"
 } else {
@@ -334,6 +360,7 @@ if ($BuildOnly) {
     $buildGradle = $buildGradle -replace 'versionCode \d+', "versionCode $versionCode"
     $buildGradle = $buildGradle -replace 'versionName "[^"]+"', "versionName `"$Version`""
     Write-File-NoBom $buildGradlePath $buildGradle
+    $expectedApkVersionCode = $versionCode
     Write-Host "  build.gradle (versionCode=$versionCode)  OK"
 }
 # --- Step 2: npm install ---
@@ -350,8 +377,42 @@ Write-Host "  done  OK"
 Write-Host ""
 Write-Host "[3/7] Building APK with Gradle..."
 Set-Location "$REPO_DIR\android"
-& .\gradlew.bat assembleRelease --no-daemon 2>&1 | Tee-Object -FilePath "$env:TEMP\gradle-build.log" | Select-Object -Last 10
-$gradleExit = $LASTEXITCODE
+$gradleArguments = @('assembleRelease', '--no-daemon')
+$previewVersionInitScriptPath = $null
+if ($BuildOnlyVersionCodeOverride) {
+    $previewVersionInitDirectory = Join-Path $REPO_DIR 'logs\build-runner'
+    New-Item -ItemType Directory -Path $previewVersionInitDirectory -Force | Out-Null
+    Get-ChildItem -LiteralPath $previewVersionInitDirectory -Filter 'feature-preview-version-code-*.init.gradle' -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTimeUtc -lt [DateTime]::UtcNow.AddHours(-12) } |
+        Remove-Item -Force
+    $previewVersionInitScriptPath = Join-Path $previewVersionInitDirectory ("feature-preview-version-code-{0}.init.gradle" -f [Guid]::NewGuid().ToString('N'))
+    $previewVersionInitScript = @"
+gradle.beforeProject { project ->
+    if (project.path == ':app' && project.rootProject == gradle.rootProject) {
+        project.plugins.withId('com.android.application') {
+            project.extensions.getByName('android').applicationVariants.all { variant ->
+                if (variant.buildType.name == 'release') {
+                    variant.outputs.all { output ->
+                        output.versionCodeOverride = $expectedApkVersionCode
+                    }
+                }
+            }
+        }
+    }
+}
+"@
+    [System.IO.File]::WriteAllText($previewVersionInitScriptPath, $previewVersionInitScript, $UTF8_NO_BOM)
+    $gradleArguments += @('--init-script', $previewVersionInitScriptPath)
+}
+try {
+    & .\gradlew.bat @gradleArguments 2>&1 | Tee-Object -FilePath "$env:TEMP\gradle-build.log" | Select-Object -Last 10
+    $gradleExit = $LASTEXITCODE
+}
+finally {
+    if ($previewVersionInitScriptPath -and (Test-Path -LiteralPath $previewVersionInitScriptPath)) {
+        Remove-Item -LiteralPath $previewVersionInitScriptPath -Force
+    }
+}
 Set-Location "$REPO_DIR"
 
 if ($gradleExit -ne 0) {
@@ -376,8 +437,8 @@ Write-Host "  Signed (v2/v3)  OK"
 $badging = (& $aapt.FullName dump badging $apkPath 2>&1) -join "`n"
 if ($badging -match "package: name='[^']*' versionCode='(\d+)' versionName='([^']+)'") {
     $apkVc = $Matches[1]; $apkVn = $Matches[2]
-    if ($apkVc -ne $versionCode -or $apkVn -ne $Version) {
-        Write-Error "APK version mismatch: got versionCode=$apkVc versionName=$apkVn, expected $versionCode/$Version"
+    if ($apkVc -ne $expectedApkVersionCode -or $apkVn -ne $Version) {
+        Write-Error "APK version mismatch: got versionCode=$apkVc versionName=$apkVn, expected $expectedApkVersionCode/$Version"
         Write-Host "  The build.gradle bump may not have been picked up. Try -Clean." -ForegroundColor Yellow
         exit 1
     }

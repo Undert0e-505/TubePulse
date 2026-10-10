@@ -4,6 +4,7 @@ import test from 'node:test';
 
 import { orderChannels } from '../src/utils/channelOrdering.mjs';
 import {
+  normalizeWidgetVideo,
   projectWidgetOrderingCache,
   selectWidgetChannelPresentation,
 } from '../src/utils/widgetPresentation.mjs';
@@ -43,6 +44,13 @@ test('an empty channel is safe and selects no row', () => {
   assert.deepEqual(selectWidgetChannelPresentation(), { selected: null, unseenCount: 0 });
 });
 
+test('widget video normalization preserves nullable comment totals including zero', () => {
+  assert.equal(normalizeWidgetVideo({ comments: '0' }).comments, '0');
+  assert.equal(normalizeWidgetVideo({ comments: '1200' }).comments, '1200');
+  assert.equal(normalizeWidgetVideo({ comments: null }).comments, null);
+  assert.equal(normalizeWidgetVideo({}).comments, null);
+});
+
 test('widget auto-order uses newest cached video or post while off preserves manual order', () => {
   const channels = [{ handle: 'manual-first' }, { handle: 'post-newest' }, { handle: 'video-middle' }];
   const cache = {
@@ -74,6 +82,10 @@ test('widget uses the proven non-collection container with one selected row per 
   assert.equal((widgetSource.match(/<PostRow\b/g) || []).length, 1);
   assert.match(handlerSource, /selected\?\.type === 'video' \? \[\{/);
   assert.match(handlerSource, /selected\?\.type === 'post' \? \[\{/);
+  assert.match(handlerSource, /cached\.videos\.map\(normalizeWidgetVideo\)/);
+  assert.match(widgetSource, /const commentLabel = hasKnownMetric\(video\.comments\) \? formatCompactCount\(video\.comments\) : null/);
+  assert.match(widgetSource, /likeLabel[\s\S]*THUMB_UP_SVG[\s\S]*commentLabel[\s\S]*COMMENT_SVG[\s\S]*video\.views/);
+  assert.match(widgetSource, /video\.timeAgo \|\| video\.views \|\| likeLabel \|\| commentLabel/);
   assert.equal(homeSource.includes('ListWidget'), false);
   assert.equal(homeSource.includes('selectWidgetChannelPresentation'), false);
   assert.match(handlerSource, /orderChannels\([\s\S]*widgetOrderingCache[\s\S]*settings\.autoOrderChannels === true/);

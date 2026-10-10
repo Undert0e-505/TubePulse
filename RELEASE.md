@@ -15,26 +15,32 @@ when the checkout is inside the authorised workspace. The repository therefore p
 current-user Task Scheduler runner. It runs on demand with an interactive token at **Limited** run
 level; it is not an administrator task and normal builds show no UAC prompt.
 
-Register or repair the three fixed tasks once:
+Register or repair the four fixed tasks once:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Install-AndroidBuildRunner.ps1
 ```
 
-Prove the Java/Gradle path, then start an official or demo-update preview build:
+Prove the Java/Gradle path, then start an official, demo-update, or dirty-tree feature preview build:
 
 ```powershell
 .\scripts\Start-AndroidBuildTask.ps1 -Mode Preflight
 .\scripts\Start-AndroidBuildTask.ps1 -Mode Official
 .\scripts\Start-AndroidBuildTask.ps1 -Mode Preview
+.\scripts\Start-AndroidBuildTask.ps1 -Mode FeaturePreview
 ```
 
-The tasks accept only those three fixed modes and the fixed `D:\dev\TubePulse` checkout. The runner
+The tasks accept only those four fixed modes and the fixed `D:\dev\TubePulse` checkout. The runner
 requires `master` to equal `origin/master`, validates the repository remote and version metadata,
-rejects source changes outside the local monitoring/log paths, clears public build overrides, and
-writes only ignored status/log files under `logs/build-runner/`. Preview mode enables the update-pill
-demo with the next patch tag; Official mode always disables it. Signing material stays at its existing
-path and is neither copied nor printed. Remove all three task registrations with:
+clears public build overrides, and writes only ignored status/log files under `logs/build-runner/`.
+Preflight, Official, and Preview retain strict clean-source checks. Preview enables the update-pill demo
+with the next patch tag. FeaturePreview is the standard route for testing reviewed, uncommitted feature
+work: it keeps the production package, endpoint, push, signing, and visible checked-in version; rejects secrets,
+signing/config/identity changes and APK inputs; never runs Git or GitHub actions; and writes a timestamped
+`dist/TubePulse-vX.Y.Z-feature-preview-*.apk`. To permit an in-place install over the current release,
+FeaturePreview alone injects checked-in Android `versionCode + 1` at build time without editing version
+files. That internal code is consumed: the next official APK must use a still-higher code. Signing material
+stays at its existing path and is neither copied nor printed. Remove all four task registrations with:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Install-AndroidBuildRunner.ps1 -Remove
@@ -61,6 +67,7 @@ The script is Windows-native. Full release and validate-only modes require a ver
 | `Version` | Required app version for full release and `-ValidateOnly`, for example `3.2.5` |
 | `-Message` | Optional custom commit message suffix |
 | `-BuildOnly` | Builds the checked-in app version, signs, verifies, and copies the APK without editing version files or running Git/GitHub release steps |
+| `-BuildOnlyVersionCodeOverride` | Build-only-only positive Android manifest code override; it must exceed the checked-in code and is used by the guarded FeaturePreview runner |
 | `-Clean` | Deletes local Gradle build/cache folders before building |
 | `-ValidateOnly` | Runs release preflight checks only, then exits without changing files or publishing |
 
@@ -71,6 +78,8 @@ Build the checked-in version without changing source files:
 ```
 
 Supplying `Version` with `-BuildOnly` is rejected because build-only always uses the checked-in app version.
+The manifest-code override is rejected outside `-BuildOnly`; it never changes `app.json`, Gradle source,
+the visible `versionName`, Git, or GitHub state.
 
 Current full-release behavior, in order:
 
@@ -102,7 +111,7 @@ The GitHub token is read from Git's credential helper. The script does not requi
 
 `-BuildOnly` runs tool verification, reads `app.json` `expo.version`, `android/app/build.gradle` `versionName`, and `android/app/build.gradle` `versionCode`, and requires the app JSON version to match Gradle `versionName`. It then builds, signs, verifies, and copies `dist/TubePulse-vCURRENT.apk` using the checked-in Gradle version metadata.
 
-`-BuildOnly` does not edit `app.json` or `android/app/build.gradle`, does not stage or commit files, does not push, and does not create or upload GitHub releases.
+`-BuildOnly` does not edit `app.json` or `android/app/build.gradle`, does not stage or commit files, does not push, and does not create or upload GitHub releases. When the guarded version-code override is present, the script generates a fixed temporary Gradle init hook scoped to the `:app` release output, removes it after Gradle exits, and requires the built APK to contain that exact higher code while retaining the checked-in `versionName`. Callers cannot supply init-script content or paths.
 
 ### Validate-Only Preflight
 

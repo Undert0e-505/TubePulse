@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('Preflight', 'Official', 'Preview')]
+    [ValidateSet('Preflight', 'Official', 'Preview', 'FeaturePreview')]
     [string]$Mode = 'Official'
 )
 

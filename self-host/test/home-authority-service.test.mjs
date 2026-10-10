@@ -95,6 +95,13 @@ test('unified service exposes only status and signed authority ingress over the 
   const status = await response.json();
   assert.equal(status.configuration.publicAppRoutes, false);
   assert.equal(status.configuration.periodicCanonicalPull, false);
+  response = await fetch(`${base}/service-status`);
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get('cache-control'), /max-age=60/);
+  assert.equal(response.headers.get('access-control-allow-origin'), '*');
+  const publicStatus = await response.json();
+  assert.deepEqual(Object.keys(publicStatus), ['status', 'message', 'observedAt', 'since']);
+  assert.equal(publicStatus.status, 'outage', 'standby fixtures cannot claim notification capability');
   response = await fetch(`${base}/_tubepulse/monitoring`);
   assert.equal(response.status, 200);
   const monitoring = await response.json();

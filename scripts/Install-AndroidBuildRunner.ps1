@@ -14,7 +14,8 @@ if (-not $repo.Equals($expectedRepo, [System.StringComparison]::OrdinalIgnoreCas
 $taskSpecs = @(
     @{ Name = 'TubePulse Android Build Preflight'; Mode = 'Preflight' },
     @{ Name = 'TubePulse Android Build Official'; Mode = 'Official' },
-    @{ Name = 'TubePulse Android Build Preview'; Mode = 'Preview' }
+    @{ Name = 'TubePulse Android Build Preview'; Mode = 'Preview' },
+    @{ Name = 'TubePulse Android Build FeaturePreview'; Mode = 'FeaturePreview' }
 )
 $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 $runner = Join-Path $repo 'scripts\Run-AndroidBuildTask.ps1'

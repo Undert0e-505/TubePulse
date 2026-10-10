@@ -1302,6 +1302,67 @@ function readAuthorityConfig(env) {
   };
 }
 
+const PUBLIC_SERVICE_STATUS_CACHE_CONTROL = 'public, max-age=60, stale-if-error=120';
+const PUBLIC_SERVICE_STATUSES = new Set(['healthy', 'degraded', 'outage', 'unknown']);
+
+function publicServiceStatusPayload(value, nowMs = Date.now()) {
+  const messages = {
+    healthy: 'Notifications are operating normally',
+    degraded: 'Notifications may be delayed',
+    outage: 'Notification service is unavailable',
+    unknown: 'Service status is unavailable',
+  };
+  const timestamp = (input) => {
+    const parsed = Date.parse(String(input || ''));
+    return Number.isFinite(parsed) ? new Date(parsed).toISOString() : null;
+  };
+  const reportedAt = timestamp(value?.observedAt);
+  const status = PUBLIC_SERVICE_STATUSES.has(value?.status) && reportedAt
+    ? value.status
+    : 'unknown';
+  return {
+    status,
+    message: messages[status],
+    observedAt: reportedAt || new Date(nowMs).toISOString(),
+    since: timestamp(value?.since),
+  };
+}
+
+function publicServiceStatusResponse(value, nowMs = Date.now()) {
+  return new Response(JSON.stringify(publicServiceStatusPayload(value, nowMs)), {
+    status: 200,
+    headers: {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+      'Cache-Control': PUBLIC_SERVICE_STATUS_CACHE_CONTROL,
+      'X-Content-Type-Options': 'nosniff',
+    },
+  });
+}
+
+async function fetchPublicServiceStatus(config, env) {
+  if (!config.enabled || !config.valid) return publicServiceStatusPayload(null);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), config.timeoutMs);
+  try {
+    const resource = `${config.origin}/service-status`;
+    const init = {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+      signal: controller.signal,
+    };
+    const response = config.transport === 'vpc'
+      ? await env.TUBEPULSE_HOME_VPC.fetch(new Request(resource, init))
+      : await fetch(resource, { ...init, redirect: 'error' });
+    if (!response.ok) return publicServiceStatusPayload(null);
+    return publicServiceStatusPayload(await response.json().catch(() => null));
+  } catch {
+    return publicServiceStatusPayload(null);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function coordinatorStub(env) {
   const namespace = env.TUBEPULSE_AUTHORITY_COORDINATOR;
   const id = namespace.idFromName('tubepulse-production-authority');
@@ -1542,8 +1603,11 @@ export function createAuthorityWorker(appWorker, options = {}) {
   return {
     async fetch(request, env, ctx) {
       const config = readAuthorityConfig(env);
-      if (!config.enabled) return await appWorker.fetch(request, env, ctx);
       const url = new URL(request.url);
+      if (request.method === 'GET' && url.pathname === '/service-status') {
+        return publicServiceStatusResponse(await fetchPublicServiceStatus(config, env));
+      }
+      if (!config.enabled) return await appWorker.fetch(request, env, ctx);
       const route = `${request.method.toUpperCase()} ${url.pathname}`;
       if (!config.valid) {
         logger.warn?.('[TubePulse authority] invalid enabled configuration');
@@ -1758,4 +1822,6 @@ export const authorityTestHelpers = {
   RSS_PROBE_MAX_BODY_BYTES,
   RSS_PROBE_MAX_RESPONSE_BYTES,
   rssProbeUrl,
+  publicServiceStatusPayload,
+  PUBLIC_SERVICE_STATUS_CACHE_CONTROL,
 };

@@ -73,4 +73,6 @@ export const COLORS = {
   newDot: '#4FC3F7',
   border: '#2A2A2A',
   danger: '#EF5350',
+  success: '#66BB6A',
+  warning: '#D7A84A',
 };

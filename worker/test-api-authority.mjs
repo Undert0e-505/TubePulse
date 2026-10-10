@@ -126,6 +126,66 @@ function capturingContext() {
   };
 }
 
+test('public service status proxies only the normalized Home schema with short public caching', async () => {
+  const fixture = coordinatorFixture();
+  const observedAt = new Date().toISOString();
+  let received;
+  const env = authorityEnv(fixture, async (request) => {
+    received = request;
+    return Response.json({
+      status: 'degraded', message: 'private reason', observedAt, since: observedAt,
+      deviceId: DEVICE, queueDepth: 99, host: 'private',
+    });
+  });
+  const worker = createAuthorityWorker({ async fetch() { throw new Error('must not delegate'); } });
+  const response = await worker.fetch(new Request('https://api.example.test/service-status'), env, {});
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get('cache-control'), /max-age=60/);
+  assert.equal(response.headers.get('access-control-allow-origin'), '*');
+  assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
+  assert.equal(received.method, 'GET');
+  assert.equal(new URL(received.url).pathname, '/service-status');
+  const payload = await response.json();
+  assert.deepEqual(payload, {
+    status: 'degraded', message: 'Notifications may be delayed', observedAt, since: observedAt,
+  });
+  assert.equal(JSON.stringify(payload).includes(DEVICE), false);
+  assert.equal(JSON.stringify(payload).includes('queue'), false);
+});
+
+test('public service status preserves explicit Home states', async (t) => {
+  for (const status of ['healthy', 'degraded', 'outage', 'unknown']) {
+    await t.test(status, async () => {
+      const fixture = coordinatorFixture();
+      const env = authorityEnv(fixture, async () => Response.json({
+        status, observedAt: new Date().toISOString(), since: null,
+      }));
+      const worker = createAuthorityWorker({ async fetch() { throw new Error('must not delegate'); } });
+      const response = await worker.fetch(new Request('https://api.example.test/service-status'), env, {});
+      assert.equal((await response.json()).status, status);
+    });
+  }
+});
+
+test('public service status returns normalized unknown when Home cannot be proven', async (t) => {
+  for (const [name, homeFetch] of [
+    ['transport failure', async () => { throw new Error('private connector unavailable'); }],
+    ['http failure', async () => Response.json({ error: 'offline' }, { status: 503 })],
+    ['invalid payload', async () => Response.json({ status: 'healthy', observedAt: 'invalid', deviceId: DEVICE })],
+  ]) {
+    await t.test(name, async () => {
+      const fixture = coordinatorFixture();
+      const env = authorityEnv(fixture, homeFetch);
+      const worker = createAuthorityWorker({ async fetch() { throw new Error('must not delegate'); } });
+      const response = await worker.fetch(new Request('https://api.example.test/service-status'), env, {});
+      const payload = await response.json();
+      assert.equal(response.status, 200);
+      assert.equal(payload.status, 'unknown');
+      assert.deepEqual(Object.keys(payload), ['status', 'message', 'observedAt', 'since']);
+    });
+  }
+});
+
 async function signedInternalRequest(path, operation, body, overrides = {}) {
   const bodyText = JSON.stringify(body);
   const timestamp = overrides.timestamp ?? Date.now();

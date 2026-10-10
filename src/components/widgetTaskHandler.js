@@ -7,33 +7,17 @@ import { fetchFeed, getDeviceId, markSeen } from '../utils/api';
 import {
   formatCompactAge,
   getPostSeenId,
-  resolveOptionalMetric,
 } from '../utils/feedPresentation';
 import { orderChannels } from '../utils/channelOrdering.mjs';
 import { enqueueSeenMutation, flushSeenMutationQueue } from '../utils/seenPersistence.mjs';
 import {
+  normalizeWidgetVideo,
   projectWidgetOrderingCache,
   selectWidgetChannelPresentation,
 } from '../utils/widgetPresentation.mjs';
 const nameToWidget = {
   TubePulseWidget: TubePulseWidget,
 };
-
-function normalizeVideo(video = {}) {
-  return {
-    videoId: video.videoId,
-    title: video.title,
-    thumbnail: video.thumbnail,
-    link: video.link,
-    published: video.published || video.publishedAt,
-    publishedAt: video.publishedAt || video.published,
-    views: video.views || '',
-    likes: resolveOptionalMetric(video, 'likes'),
-    dislikes: resolveOptionalMetric(video, 'dislikes'),
-    unwatched: video.unwatched,
-    kind: 'video',
-  };
-}
 
 function normalizePost(post = {}) {
   return {
@@ -89,7 +73,7 @@ async function buildWidgetData(fetchFresh = false) {
               const local = channelById[feed.channelId];
               const handle = local?.handle;
               if (!handle) continue;
-              const videos = (feed.videos || []).map(normalizeVideo);
+              const videos = (feed.videos || []).map(normalizeWidgetVideo);
               const prevEntry = cache[handle] || {};
 
               // Preserve last-known-good avatar: if the fresh fetch
@@ -149,8 +133,8 @@ async function buildWidgetData(fetchFresh = false) {
       const seenIds = lastSeen[ch.handle]?.seenIds || [];
 
       const allVideos = cached?.videos?.length
-        ? cached.videos.map(normalizeVideo)
-        : (cached?.latestVideo ? [normalizeVideo(cached.latestVideo)] : []);
+        ? cached.videos.map(normalizeWidgetVideo)
+        : (cached?.latestVideo ? [normalizeWidgetVideo(cached.latestVideo)] : []);
       const allPosts = (cached?.posts || []).map(normalizePost);
       const { selected, unseenCount } = selectWidgetChannelPresentation({
         videos: allVideos,

@@ -17,6 +17,7 @@ import {
 import { LocalKvAdapter } from './kv-adapters.mjs';
 import { TubePulseRuntime } from './runtime.mjs';
 import { collectAggregateMonitoring } from './aggregate-monitoring.mjs';
+import { classifyPublicServiceStatus } from './public-service-status.mjs';
 
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
 const HOP_BY_HOP_HEADERS = new Set([
@@ -205,6 +206,27 @@ export class UnifiedHomeAuthorityService {
 
   async handle(request, response) {
     const parsed = new URL(request.url, 'http://authority.local');
+    if (parsed.pathname === '/service-status') {
+      if (request.method !== 'GET') return await sendResponse(response, Response.json({ error: 'Method not allowed' }, { status: 405 }));
+      const [authority, scheduler] = await Promise.all([this.gate.status(), this.runner.status()]);
+      const status = classifyPublicServiceStatus({
+        status: this.ready ? 'ready' : 'starting',
+        mode: this.config.mode,
+        authority,
+        scheduler: publicHomeSchedulerState(scheduler),
+        configuration: {
+          notificationsEnabled: this.config.notificationsEnabled,
+          alignedVideoNotificationsEnabled: this.config.alignedVideoNotificationsEnabled,
+        },
+      });
+      return await sendResponse(response, new Response(JSON.stringify(status), {
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+          'Cache-Control': 'public, max-age=60, stale-if-error=120',
+        },
+      }));
+    }
     if (parsed.pathname === '/_tubepulse/status') {
       if (request.method !== 'GET') return await sendResponse(response, Response.json({ error: 'Method not allowed' }, { status: 405 }));
       const [authority, scheduler] = await Promise.all([this.gate.status(), this.runner.status()]);

@@ -36,8 +36,10 @@ prewarning. **Save** applies those controls; **Cancel** leaves the existing over
 ## Home feed and seen state
 
 The Home feed groups recent videos and community posts by channel. A blue dot marks unseen content.
-Video rows include the available thumbnail, publication age and engagement figures; post cards show
-the available text, image or poll summary.
+Video rows include the available thumbnail, publication age, likes, public comment total and views;
+missing or hidden engagement figures are omitted. Post cards show the available text, image or poll
+summary. A comment-only change does not cause an extra cloud update; the shown total advances when
+that video is otherwise refreshed, including the periodic refresh policy.
 
 Use **Videos shown per channel** in Settings to show one, two or three recent videos in each Home
 section. A per-channel display override can inherit or replace that global choice without changing
@@ -68,6 +70,12 @@ Community-post notifications open the channel's community surface. A livestream 
 the scheduled video but does not consume the later live-time notification.
 
 ## Notification settings
+
+Settings starts with a compact service-status row. It quietly shows whether notifications are
+operating normally, may be delayed, are unavailable, or cannot currently be checked, plus when the
+check was made. It is informational only: there is nothing to tap and no user action is required.
+The status contains no device, channel or operator details, and an offline phone is shown as unknown
+rather than being mistaken for a service outage.
 
 ### Tap action
 
@@ -162,7 +170,8 @@ order after channels with current content.
 Add the TubePulse widget through Android's widget picker. It shows at most one content item per
 displayed channel: the newest published cached video or community post, whether seen or unseen.
 Seen items are dimmed and unseen items retain their blue marker. Taps preserve the selected item's
-video, channel or post behavior, and automatic channel ordering follows the app setting.
+video, channel or post behavior, and automatic channel ordering follows the app setting. Video rows
+show the same available likes, public comment total and views as the Home feed.
 
 Widget refresh timing is subject to Android launcher and battery policies. Open or refresh the app
 if the widget remains stale after connectivity returns.

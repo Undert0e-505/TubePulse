@@ -8,7 +8,7 @@ The [self-host runtime](../self-host/README.md) executes these same source files
 
 `self-host/compose.authority.yaml` is the production successor to the earlier scheduler shadow. One local runtime/store combines signed all-device mutation execution and scheduled work, publishes exact changed-key journals through a SQLite Durable Object coordinator, and serves all authenticated feeds over Workers VPC while current. It performs no periodic full pull. D1 commits are atomic and content-hash guarded. The coordinator conservatively caps scheduler publication at 45,000 estimated rows/day and total coordinated D1 writes at 50,000 estimated rows/day, leaving a 5,000-row app reserve; deferred keys are coalesced and later drained by the existing publication path. App mutations no longer depend on cloud canonical read availability. Semantic `4xx`/`5xx` responses discard the buffered overlay, Home transport failures fail closed, and deferred scheduler batches still suppress FCM. WebSub is acknowledged but suppressed while authority traffic owns detection. RSS0/1/2, posts, and aux deployments are retained but all five Cron Trigger lists are empty and their handlers require an explicit frozen-KV rollback latch.
 
-The current app-facing Worker deployment is version `3925dd9b-ef83-4d37-93eb-563dcba05c14`. Deployment authentication is intentionally external to the repository.
+The current app-facing Worker deployment is version `7d418086-f904-494e-ae23-0498a9233ac8`. Deployment authentication is intentionally external to the repository.
 
 ---
 
@@ -110,7 +110,7 @@ Playlist items provide structural upload identity and publication data. Batched 
 2. Call `channels.list` in batches of at most 50 IDs. Production currently uses two requests per cycle.
 3. Reconcile a channel's cached uploads playlist when its baseline is missing, public `videoCount` changed, or its staggered six-hour safety check is due. A one-time migration marker ensures capturing a count baseline cannot suppress catch-up.
 4. Compare playlist IDs against the durable known/high-watermark state, fetch missing detail in 50-ID batches, and pass results through the existing recent/scheduled/live/notification path. New channels seed silently; established channels retain their watermark.
-5. Poll due video metrics adaptively in 50-ID batches for only each channel's current app-visible top three. Persist any normalized known view/like change at most once per UTC hour, hydrate missing values immediately, and force unchanged values fresh after 24 hours. Home keeps comment observations locally; comments may piggyback on an already-required canonical write but never trigger one.
+5. Poll due video metrics adaptively in 50-ID batches for only each channel's current app-visible top three. Persist any normalized known view/like change at most once per UTC hour, hydrate missing values immediately, and force unchanged values fresh after 24 hours. Home keeps comment observations locally; comments may piggyback on an already-required structural/view-like write or the existing forced refresh but never trigger one.
 
 **Normal detector quota cost: 576 general units/day.** Two one-unit `channels.list` calls every five minutes yield `2 × 288 = 576`. A six-hour first-page safety sweep adds up to `active channels × 4` general units/day; changed-channel playlist/detail calls are event-driven. `videos:batchGetStats` uses the separately accounted statistics bucket. Request counters persist across restart, reset at Pacific midnight, and enforce reserves. There is no active RSS fallback.
 

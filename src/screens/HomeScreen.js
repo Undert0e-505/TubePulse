@@ -67,6 +67,10 @@ const THUMB_DOWN_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 
   <path d="M7 11l4.5-8.5c.6-.1 1.2.1 1.6.5.4.5.5 1.1.4 1.7L12.5 9H20c.8 0 1.5.7 1.5 1.5l-1.5 9c-.1.7-.7 1.2-1.4 1.2H7" />
 </svg>`;
 
+const COMMENT_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#666666" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z" />
+</svg>`;
+
 export default function HomeScreen({ navigation, previewInitializationMarker = null }) {
   const [channels, setChannels] = useState([]);
   const [cache, setCache] = useState({});
@@ -181,6 +185,7 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
               unwatched: seenSnapshot.has(v.videoId) ? false : v.unwatched,
               views: v.views || existingByVideoId.get(v.videoId)?.views || '0',
               likes: resolveOptionalMetric(v, 'likes', existingByVideoId.get(v.videoId)?.likes),
+              comments: resolveOptionalMetric(v, 'comments', existingByVideoId.get(v.videoId)?.comments),
               dislikes: resolveOptionalMetric(v, 'dislikes', existingByVideoId.get(v.videoId)?.dislikes),
             }));
 
@@ -823,6 +828,7 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
         {videosToShow.map((video) => {
           const isSeen = !getUnseenVideos(item.handle).find(v => v.videoId === video.videoId);
           const hasLikeCount = hasKnownMetric(video.likes);
+          const hasCommentCount = hasKnownMetric(video.comments);
           const hasDislikeCount = hasKnownMetric(video.dislikes);
           return (
             <TouchableOpacity
@@ -841,7 +847,7 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
                 <Text style={[styles.videoTitle, !isSeen && { color: COLORS.text, fontWeight: 'bold' }]} numberOfLines={2}>
                   {video.title}
                 </Text>
-                {(video.published || video.views || video.likes || video.dislikes) && (
+                {(video.published || video.views || hasLikeCount || hasCommentCount || hasDislikeCount) && (
                   <View style={styles.videoMeta}>
                     <View style={styles.metaLeft}>
                       {video.published ? <Text style={styles.timeAgo}>{timeAgo(video.published)}</Text> : null}
@@ -849,6 +855,12 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
                         <View style={styles.metaLikeGroup}>
                           <SvgXml xml={THUMB_UP_SVG} width={12} height={12} style={styles.metaIcon} />
                           <Text style={styles.metaLikeCount}>{formatCount(video.likes)}</Text>
+                        </View>
+                      )}
+                      {hasCommentCount && (
+                        <View style={styles.metaLikeGroup}>
+                          <SvgXml xml={COMMENT_SVG} width={12} height={12} style={styles.metaIcon} />
+                          <Text style={styles.metaLikeCount}>{formatCount(video.comments)}</Text>
                         </View>
                       )}
                       {hasDislikeCount && String(video.dislikes) !== '0' && (

@@ -1,9 +1,9 @@
 # TubePulse - Project Status
 
-**Last updated:** 2026-10-07
+**Last updated:** 2026-10-10
 **Current repo branch:** `master`
-**Current app version in repo:** `4.1.0`
-**Android versionCode/versionName in repo:** `410` / `4.1.0`
+**Current app version in repo:** `4.2.0`
+**Android versionCode/versionName in repo:** `420` / `4.2.0`
 **Repo:** [Undert0e-505/TubePulse](https://github.com/Undert0e-505/TubePulse)
 **Platform:** Android only (React Native + Expo)
 
@@ -17,10 +17,11 @@ Repo evidence as of this document update:
 
 | Area | Current evidence |
 |---|---|
-| App version | `app.json` has `expo.version = 4.1.0` |
-| Android version | `android/app/build.gradle` has `versionCode 410`, `versionName "4.1.0"` |
+| App version | `app.json` has `expo.version = 4.2.0` |
+| Android version | `android/app/build.gradle` has `versionCode 420`, `versionName "4.2.0"` |
 | API base URL | `src/utils/api.js` uses `EXPO_PUBLIC_TUBEPULSE_API_URL` when built with one and otherwise preserves `https://tubepulse-api.jimothyoakley55.workers.dev`; optional fallback is disabled unless separately configured |
 | Release script | `build-and-release.ps1` is the current local release path |
+| Feature preview build | The limited, current-user `FeaturePreview` scheduled task signs a production-package APK from reviewed uncommitted feature work while rejecting secrets and app identity/signing/endpoint-policy changes; it keeps the checked-in visible versionName, injects checked-in versionCode + 1 without editing version files, and runs no Git/GitHub actions. The next official code must exceed the latest preview code. |
 | API worker config | `worker/tubepulse-api/wrangler.toml` defines worker `tubepulse-api`, active D1 binding/generation, Durable Object coordinator, VPC Service binding `TUBEPULSE_HOME_VPC`, and frozen legacy KV binding; the live `workers.dev` endpoint remains enabled without a committed custom route |
 | Scheduled worker configs | Cron Trigger arrays are empty for RSS0/1/2, posts, aux, API, and the retired combined cron; one local Home authority now owns scheduled work |
 | Home runtime and preview | `self-host/` contains the production unified Home authority plus isolated standalone/mirror preview tooling; production uses its persistent `data-authority` store and D1 coordinator path |
@@ -49,10 +50,10 @@ The scheduled Worker deployments below are retained rollback/history assets. The
 | `tubepulse-posts` | Version `ed33187c-9c79-4fa7-b215-72194117feb6`; deployment retained, Cron Triggers disabled at the Home cutover. Home checks posts hourly. |
 | `tubepulse-aux` | Version `ea9347cf-67db-4a49-a8d6-7bd671cedd08`; deployment retained, Cron Triggers disabled at the Home cutover. Home runs aux each minute. |
 | `tubepulse-cron` | Retired no-op retained under its historical name with `crons = []`. |
-| `tubepulse-api` | Version `3925dd9b-ef83-4d37-93eb-563dcba05c14`; serves the unchanged app URL. Every authenticated feed uses the unified Home store over VPC while current, with D1 fallback; authenticated mutations are Home-first with deferred atomic D1 backup. See the production D1 cutover section for the currently verified deployment. |
+| `tubepulse-api` | Version `7d418086-f904-494e-ae23-0498a9233ac8`; serves the unchanged app URL and the privacy-safe service-status route. Every authenticated feed uses the unified Home store over VPC while current, with D1 fallback; authenticated mutations are Home-first with deferred atomic D1 backup. See the production D1 cutover section for the currently verified deployment. |
 | `worker/archive/tubepulse-resolver` | Not deployed; archive remains reference-only. |
 
-The checked-in app version is `4.1.0` with Android `versionCode 410`. Worker deployment is separate from app APK release; this release does not imply a Worker deployment.
+The checked-in app version is `4.2.0` with Android `versionCode 420`. Worker deployment is separate from app APK release; this release does not imply a Worker deployment.
 
 Community-post worker/app support is enabled only when `TUBEPULSE_ENABLE_COMMUNITY_POSTS` is set to `1`, `true`, or `yes`. When enabled, cron polls active subscribed channels from `channels:active`. `TUBEPULSE_COMMUNITY_POST_CHANNEL_ALLOWLIST` is optional and narrows polling only when non-empty; missing or blank means all active channels are eligible. First-poll seeding remains silent to avoid old-post spam for newly added channels.
 
@@ -90,8 +91,8 @@ Safe read-only checks showed:
 
 Keep these version labels distinct:
 
-- App/release version evidence in this repo is `4.1.0` with Android `versionCode 410`.
-- API worker health response reports `version: "3.0.0"`; this appears to be a stale or independently versioned health label, not the app release version.
+- App/release version evidence in this repo is `4.2.0` with Android `versionCode 420`.
+- API worker health response reports Worker contract `version: "3.0.0"`; it is intentionally independent of the Android app release version.
 
 `worker/tubepulse-api/wrangler.toml` intentionally commits no custom route. The live `workers.dev` endpoint remains enabled and unchanged; route ownership is separate from the app release version.
 
@@ -123,7 +124,7 @@ Known risks and the intended safer target flow are documented in [RELEASE.md](RE
 - The self-host preview is additive and local-only until an operator configures it. Current APK behavior and production Worker deployments are unchanged by the preview.
 - The earlier single-device gateway/full-mirror experiment remains disabled. Its periodic full pull was replaced by the unified authority's one-time exact seed plus signed deltas; there is no canary selector in the production feed path.
 - The optional `selfhost` APK is separately identified as TubePulse Preview and debug-signed. It gates normal initialization on a health-tested runtime Home URL, permits later changes from Settings, and never falls back to production. Its isolated Compose pilot uses a separate `data-pilot` mount and a fail-closed local-only profile that disables Cloudflare synchronization/writes. Its generated Firebase metadata is a build shim only; this pilot sends a null token until `com.tubepulse.app.selfhost` is registered as a distinct Firebase Android app and push is explicitly enabled.
-- YouTube Data API usage now owns active video discovery, uploads-playlist reconciliation, metadata, and engagement statistics as well as handle/avatar/bootstrap work. Statistics polling is restricted dynamically to the app-visible top three videos per channel; a deletion/private transition promotes the next cached item immediately without weakening the durable known-video watermark or replaying a notification. Comment counts remain requested and are persisted only as local Home observations unless they can piggyback on a canonical write already required for structure or an allowed view/like update; comment-only movement publishes nothing. Community-post polling continues to use the isolated InnerTube helper.
+- YouTube Data API usage now owns active video discovery, uploads-playlist reconciliation, metadata, and engagement statistics as well as handle/avatar/bootstrap work. Statistics polling is restricted dynamically to the app-visible top three videos per channel; a deletion/private transition promotes the next cached item immediately without weakening the durable known-video watermark or replaying a notification. Comment counts remain requested and are persisted only as local Home observations unless they can piggyback on a canonical write already required for structure, an allowed view/like update, or the existing 24-hour forced refresh; comment-only movement publishes nothing. Community-post polling continues to use the isolated InnerTube helper.
 - Community-post structural changes remain immediate, while observation-only `fetchedAt`, relative-age labels, rotating thumbnail signatures, and same-hour engagement movement do not rewrite the canonical cache. Missing observations hydrate once; any normalized known metric change may persist at most once per UTC hour, with a forced refresh after 24 hours.
 - The active upload path no longer rewrites channel metadata solely to advance compatibility field `lastVideoId`. When the final subscriber removes a channel, the channel leaves `channels:active` and polling stops; display/subscriber state is cleaned through the bounded backup path while the known-video watermark remains for safe resubscription.
 - The app-facing Worker retains the unchanged public URL. Deployment credentials remain outside the repository.
