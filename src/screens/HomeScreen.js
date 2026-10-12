@@ -16,7 +16,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useFocusEffect } from '@react-navigation/native';
 import { COLORS } from '../utils/constants';
 import { getChannels, getSettings, getLastSeen, saveLastSeen, getChannelCache, saveChannelCache, getChannelDisplaySettings } from '../utils/storage';
-import { fetchFeed, markSeen, getDeviceId } from '../utils/api';
+import { fetchFeed, markSeen, markSeenBatch, getDeviceId } from '../utils/api';
 import {
   chooseLatestChannelContent,
   formatCompactAge,
@@ -53,7 +53,12 @@ import {
   resumeAllNotificationSound,
   resumeChannelNotificationSound,
   subscribeLocalNotificationSilence,
+  applyLocalNotificationAction,
 } from '../utils/localNotificationSilenceStorage';
+import { NOTIFICATION_ACTIONS } from '../utils/localNotificationSilence.mjs';
+import { dismissCoveredNotifications } from '../utils/notificationActionRuntime';
+import { subscribeLocalSeenChanges } from '../utils/localSeenEvents';
+import { collectChannelUnseenSnapshots, collectUnseenContentSnapshot } from '../utils/seenSnapshots.mjs';
 
 const THUMB_UP_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#666666" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
   <path d="M7 22V11" />
@@ -148,6 +153,7 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
           storage: AsyncStorage,
           deviceId,
           persist: markSeen,
+          persistBatch: markSeenBatch,
         }).catch(() => console.warn('[seen] queued retry remains pending'));
         const result = await fetchFeed(deviceId);
         if (result.ok && result.channels) {
@@ -394,6 +400,10 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
 
   useEffect(() => subscribeLocalNotificationSilence(setSilenceState), []);
 
+  useEffect(() => subscribeLocalSeenChanges(() => {
+    loadData().catch(() => {});
+  }), [loadData]);
+
   useEffect(() => {
     const expiresAt = nextNotificationSilenceExpiry(silenceState);
     if (!expiresAt) return undefined;
@@ -535,10 +545,15 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
 
   // Central helper: mark all items currently represented for a channel seen.
   // The remote intent contains those exact IDs rather than a delayed clearAll.
-  const markAllSeen = async ({ handle, channelId }) => {
-    // Add all current video/post IDs to recentlySeenRef
-    const allVideos = getVideos(handle);
-    const allPosts = getPosts(handle);
+  const markAllSeen = async ({ handle, channelId, contentIds = null, flush = true, updateSurface = true }) => {
+    // Snapshot only content represented as unseen at tap time. Exact IDs keep
+    // a delayed retry from consuming a newer arrival.
+    const allChannelVideos = getVideos(handle);
+    const allChannelPosts = getPosts(handle);
+    const allIds = contentIds || collectUnseenContentSnapshot(allChannelVideos, allChannelPosts);
+    const idSet = new Set(allIds);
+    const allVideos = allChannelVideos.filter((video) => idSet.has(video.videoId));
+    const allPosts = allChannelPosts.filter((post) => idSet.has(getPostSeenId(post)));
     for (const v of allVideos) {
       if (v.videoId) {
         recentlySeenRef.current.add(v.videoId);
@@ -554,10 +569,6 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
     // Update lastSeen
     const ls = await getLastSeen();
     if (!ls[handle]) ls[handle] = { seenIds: [] };
-    const allIds = [
-      ...allVideos.map(v => v.videoId).filter(Boolean),
-      ...allPosts.map(getPostSeenId).filter(Boolean),
-    ];
     ls[handle] = { seenIds: [...new Set([...(ls[handle].seenIds || []), ...allIds])] };
     await saveLastSeen(ls);
     setLastSeen(ls);
@@ -567,18 +578,22 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
     if (cached) {
       let updatedCache = { ...cacheRef.current, [handle]: { ...cached } };
       let changed = false;
-      if (cached.videos?.some((v) => v.unwatched)) {
+      if (cached.videos?.some((v) => v.unwatched && idSet.has(v.videoId))) {
         updatedCache[handle] = {
           ...updatedCache[handle],
-          videos: cached.videos.map((v) => ({ ...v, unwatched: false })),
-          latestVideo: cached.latestVideo ? { ...cached.latestVideo, unwatched: false } : cached.latestVideo,
+          videos: cached.videos.map((v) => idSet.has(v.videoId) ? { ...v, unwatched: false } : v),
+          latestVideo: cached.latestVideo && idSet.has(cached.latestVideo.videoId)
+            ? { ...cached.latestVideo, unwatched: false }
+            : cached.latestVideo,
         };
         changed = true;
       }
-      if (cached.posts?.some(isPostUnwatched)) {
+      if (cached.posts?.some((post) => isPostUnwatched(post) && idSet.has(getPostSeenId(post)))) {
         updatedCache[handle] = {
           ...updatedCache[handle],
-          posts: cached.posts.map((p) => ({ ...p, unwatched: false })),
+          posts: cached.posts.map((post) => idSet.has(getPostSeenId(post))
+            ? { ...post, unwatched: false }
+            : post),
         };
         changed = true;
       }
@@ -593,9 +608,43 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
     // which could incorrectly consume content that arrives after this tap.
     const deviceId = await getDeviceId();
     await enqueueSeenMutation({ storage: AsyncStorage, channelId, contentIds: allIds });
-    flushSeenMutationQueue({ storage: AsyncStorage, deviceId, persist: markSeen })
-      .catch(() => console.warn('[seen] queued retry remains pending'));
-    return true;
+    if (flush) {
+      flushSeenMutationQueue({ storage: AsyncStorage, deviceId, persist: markSeen, persistBatch: markSeenBatch })
+        .catch(() => console.warn('[seen] queued retry remains pending'));
+    }
+    if (updateSurface) {
+      try { await updateWidget('channel-mark-seen'); } catch {}
+      try { await dismissCoveredNotifications({ contentIds: allIds }); } catch {}
+    }
+    return allIds;
+  };
+
+  const markAllChannelsSeen = async () => {
+    // Freeze every channel's exact snapshot before the first await. An FCM
+    // arrival after this tap must remain unseen even if local processing takes
+    // long enough for the new item to reach the cache.
+    const snapshots = collectChannelUnseenSnapshots(channels, getVideos, getPosts);
+    const snapshotIds = [];
+    for (const snapshot of snapshots) {
+      const ids = await markAllSeen({
+        handle: snapshot.handle,
+        channelId: snapshot.channelId,
+        contentIds: snapshot.contentIds,
+        flush: false,
+        updateSurface: false,
+      });
+      snapshotIds.push(...ids);
+    }
+    const deviceId = await getDeviceId();
+    await flushSeenMutationQueue({
+      storage: AsyncStorage,
+      deviceId,
+      persist: markSeen,
+      persistBatch: markSeenBatch,
+      force: true,
+    });
+    try { await updateWidget('mark-all-seen'); } catch {}
+    try { await dismissCoveredNotifications({ contentIds: snapshotIds }); } catch {}
   };
 
   const handleChannelOpen = async (channel) => {
@@ -684,6 +733,11 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
     setSilenceState(state);
   };
 
+  const muteAll = async () => {
+    const state = await applyLocalNotificationAction(NOTIFICATION_ACTIONS.MUTE_ALL, null);
+    setSilenceState(state);
+  };
+
   const timeAgo = (dateStr) => {
     return formatCompactAge(dateStr, nowMs);
   };
@@ -733,29 +787,44 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
               </View>
             )}
           </TouchableOpacity>
-          <TouchableOpacity style={styles.channelNameBtn} onPress={() => handleChannelOpen(item)} activeOpacity={0.7}>
-            <Text
-              style={[styles.channelName, hasNew && styles.channelNameNew]}
-              numberOfLines={1}
-              ellipsizeMode="tail"
-            >
-              {displayName}
-            </Text>
-          </TouchableOpacity>
-          {silenceStatus && (
-            <>
-              <Text style={styles.silenceStatus} numberOfLines={1}>{silenceStatus}</Text>
-              <TouchableOpacity
-                style={styles.unmuteLozenge}
-                onPress={() => unmuteChannel(item.channelId)}
-                accessibilityRole="button"
-                accessibilityLabel={`${silenceStatus}. Unmute ${displayName}`}
-                hitSlop={6}
+          <View style={styles.channelHeaderContent}>
+            <TouchableOpacity style={styles.channelNameBtn} onPress={() => handleChannelOpen(item)} activeOpacity={0.7}>
+              <Text
+                style={[styles.channelName, hasNew && styles.channelNameNew]}
+                numberOfLines={1}
+                ellipsizeMode="tail"
               >
-                <Text style={styles.unmuteLozengeText}>Unmute</Text>
-              </TouchableOpacity>
-            </>
-          )}
+                {displayName}
+              </Text>
+            </TouchableOpacity>
+            {(silenceStatus || hasNew) && (
+              <View style={styles.channelActionRow}>
+                {silenceStatus && <Text style={styles.silenceStatus} numberOfLines={1}>{silenceStatus}</Text>}
+                {silenceStatus && (
+                  <TouchableOpacity
+                    style={styles.unmuteLozenge}
+                    onPress={() => unmuteChannel(item.channelId)}
+                    accessibilityRole="button"
+                    accessibilityLabel={`${silenceStatus}. Unmute ${displayName}`}
+                    hitSlop={6}
+                  >
+                    <Text style={styles.unmuteLozengeText}>Unmute</Text>
+                  </TouchableOpacity>
+                )}
+                {hasNew && (
+                  <TouchableOpacity
+                    style={styles.markSeenLozenge}
+                    onPress={() => markAllSeen({ handle: item.handle, channelId: item.channelId })}
+                    accessibilityRole="button"
+                    accessibilityLabel={`Mark ${displayName} channel seen`}
+                    hitSlop={6}
+                  >
+                    <Text style={styles.markSeenLozengeText}>Mark seen</Text>
+                  </TouchableOpacity>
+                )}
+              </View>
+            )}
+          </View>
         </View>
 
         {posts.length > 0 && (
@@ -931,21 +1000,34 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
             colors={[COLORS.accent]}
           />
         }
-        ListHeaderComponent={(silenceState.globalMuted || previewHeader) ? (
+        ListHeaderComponent={(channels.some((channel) => isNew(channel.handle)) || channels.length > 0 || previewHeader) ? (
           <View>
-            {silenceState.globalMuted && (
+            {channels.length > 0 && (
               <View style={styles.globalMuteRow}>
-                <Text style={styles.globalMuteText} numberOfLines={1}>All notifications</Text>
-                <Text style={styles.silenceStatus} numberOfLines={1}>
-                  {formatNotificationSilenceStatus(null)}
+                <Text style={styles.globalMuteText} numberOfLines={1}>
+                  {silenceState.globalMuted ? 'All notifications silent' : 'Channels'}
                 </Text>
+                {channels.some((channel) => isNew(channel.handle)) && (
+                  <TouchableOpacity
+                    style={styles.markSeenLozenge}
+                    onPress={markAllChannelsSeen}
+                    accessibilityRole="button"
+                    accessibilityLabel="Mark all content seen"
+                  >
+                    <Text style={styles.markSeenLozengeText}>Mark all seen</Text>
+                  </TouchableOpacity>
+                )}
                 <TouchableOpacity
                   style={styles.unmuteLozenge}
-                  onPress={unmuteAll}
+                  onPress={silenceState.globalMuted ? unmuteAll : muteAll}
                   accessibilityRole="button"
-                  accessibilityLabel="Silent. Unmute all TubePulse notifications"
+                  accessibilityLabel={silenceState.globalMuted
+                    ? 'Unmute all TubePulse notifications'
+                    : 'Mute all TubePulse notifications'}
                 >
-                  <Text style={styles.unmuteLozengeText}>Unmute all</Text>
+                  {silenceState.globalMuted
+                    ? <Text style={styles.unmuteLozengeText}>Unmute all</Text>
+                    : <Text style={styles.unmuteLozengeText}>Mute all</Text>}
                 </TouchableOpacity>
               </View>
             )}
@@ -1012,6 +1094,16 @@ const styles = StyleSheet.create({
     flexShrink: 1,
     minWidth: 0,
   },
+  channelHeaderContent: {
+    flex: 1,
+    minWidth: 0,
+  },
+  channelActionRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    minHeight: 32,
+  },
   unmuteLozenge: {
     borderColor: COLORS.accent,
     borderRadius: 14,
@@ -1025,6 +1117,21 @@ const styles = StyleSheet.create({
     color: COLORS.accent,
     fontSize: 12,
     fontWeight: '700',
+  },
+  markSeenLozenge: {
+    borderColor: COLORS.border,
+    borderRadius: 14,
+    borderWidth: 1,
+    flexShrink: 0,
+    justifyContent: 'center',
+    marginLeft: 8,
+    minHeight: 28,
+    paddingHorizontal: 10,
+  },
+  markSeenLozengeText: {
+    color: COLORS.accent,
+    fontSize: 12,
+    fontWeight: '600',
   },
   silenceStatus: {
     color: COLORS.textDim,

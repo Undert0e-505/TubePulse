@@ -502,7 +502,7 @@
       "gridPos": {
         "x": 0,
         "y": 4,
-        "w": 17,
+        "w": 24,
         "h": 1
       },
       "options": {
@@ -519,7 +519,7 @@
       "gridPos": {
         "x": 0,
         "y": 5,
-        "w": 5,
+        "w": 6,
         "h": 4
       },
       "targets": [
@@ -582,9 +582,9 @@
       "description": "Unique installations with a successful authenticated backend contact in the rolling seven-day window, including notification taps that invoke /seen. Passive notification delivery alone is not counted. Aggregate context only; this is not a fault threshold.",
       "transparent": true,
       "gridPos": {
-        "x": 5,
+        "x": 6,
         "y": 5,
-        "w": 4,
+        "w": 6,
         "h": 4
       },
       "targets": [
@@ -647,9 +647,9 @@
       "description": "Audience & scale — registered installations. Aggregate context only; this is not a fault threshold.",
       "transparent": true,
       "gridPos": {
-        "x": 9,
+        "x": 12,
         "y": 5,
-        "w": 4,
+        "w": 6,
         "h": 4
       },
       "targets": [
@@ -712,9 +712,9 @@
       "description": "Audience & scale — installations registered for push delivery. Aggregate context only; this is not a fault threshold.",
       "transparent": true,
       "gridPos": {
-        "x": 13,
+        "x": 18,
         "y": 5,
-        "w": 4,
+        "w": 6,
         "h": 4
       },
       "targets": [
@@ -779,7 +779,7 @@
       "gridPos": {
         "x": 0,
         "y": 9,
-        "w": 5,
+        "w": 6,
         "h": 4
       },
       "targets": [
@@ -842,7 +842,7 @@
       "description": "Audience & scale — configured channel memberships. Aggregate context only; this is not a fault threshold.",
       "transparent": true,
       "gridPos": {
-        "x": 5,
+        "x": 6,
         "y": 9,
         "w": 6,
         "h": 4
@@ -907,7 +907,7 @@
       "description": "Audience & scale — highest channel count on one installation. Aggregate context only; this is not a fault threshold.",
       "transparent": true,
       "gridPos": {
-        "x": 11,
+        "x": 12,
         "y": 9,
         "w": 6,
         "h": 4
@@ -971,9 +971,9 @@
       "title": "Capacity",
       "description": "Current and projected resource use against configured guardrails. Cyan is comfortable; amber and coral are reserved for genuine capacity risk.",
       "gridPos": {
-        "x": 17,
-        "y": 5,
-        "w": 7,
+        "x": 0,
+        "y": 13,
+        "w": 6,
         "h": 8
       },
       "targets": [
@@ -1061,9 +1061,9 @@
       "title": "Service traffic · 24h",
       "description": "Aggregate Worker requests in finalized five-minute windows. Disconnected clients are context rather than service failure.",
       "gridPos": {
-        "x": 0,
+        "x": 6,
         "y": 13,
-        "w": 8,
+        "w": 6,
         "h": 8
       },
       "targets": [
@@ -1137,9 +1137,9 @@
       "title": "Database activity · 24h",
       "description": "D1 rows read and written in delayed, finalized five-minute Cloudflare analytics windows.",
       "gridPos": {
-        "x": 8,
+        "x": 12,
         "y": 13,
-        "w": 8,
+        "w": 6,
         "h": 8
       },
       "targets": [
@@ -1217,107 +1217,139 @@
     },
     {
       "id": 7,
-      "type": "timeseries",
-      "title": "Notification delivery · 24h",
-      "description": "Aggregate delivery outcomes from recent notification cycles. Coral failures and amber backlog remain quiet unless non-zero.",
+      "type": "volkovlabs-echarts-panel",
+      "title": "Notifications Sent",
+      "description": "FCM outcomes between settled five-minute UTC collector samples. Collection runs at :30 after each boundary and normally attributes one aligned scheduler tick per interval; precise-live sends can occur between ticks. Blue means Firebase accepted the send; it does not confirm handset delivery. Coral shows failed attempts. Values are exact deltas from persisted counters; a failed collector sample is recovered by the next successful sample without loss or double counting.",
       "gridPos": {
-        "x": 16,
+        "x": 18,
         "y": 13,
-        "w": 8,
+        "w": 6,
         "h": 8
       },
       "targets": [
         {
-          "expr": "tubepulse_notifications_sent",
-          "legendFormat": "sent",
-          "refId": "A"
+          "expr": "tubepulse_notifications_fcm_accepted_interval",
+          "legendFormat": "accepted by FCM",
+          "refId": "A",
+          "instant": false,
+          "range": true
         },
         {
-          "expr": "tubepulse_notifications_failed",
-          "legendFormat": "failed",
-          "refId": "B"
-        },
-        {
-          "expr": "tubepulse_notifications_durable_backlog",
-          "legendFormat": "backlog",
-          "refId": "C"
+          "expr": "tubepulse_notifications_fcm_failed_interval",
+          "legendFormat": "failed FCM send",
+          "refId": "B",
+          "instant": false,
+          "range": true
         }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "custom": {
-            "axisColorMode": "text",
-            "axisGridShow": false,
-            "axisPlacement": "auto",
-            "drawStyle": "line",
-            "fillOpacity": 14,
-            "gradientMode": "opacity",
-            "lineInterpolation": "smooth",
-            "lineWidth": 2,
-            "showPoints": "never",
-            "spanNulls": false
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#4FC3F7"
           }
         },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "sent"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#4FC3F7"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "failed"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#EF5350"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "backlog"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#FFB74D"
-                }
-              }
-            ]
-          }
-        ]
+        "overrides": []
       },
       "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom",
-          "calcs": []
+        "renderer": "canvas",
+        "map": "none",
+        "editorMode": "code",
+        "followTheme": true,
+        "getOption": "const ACCEPTED = '#4FC3F7';\nconst FAILED = '#EF5350';\nconst MUTED = 'rgba(204, 217, 229, 0.62)';\nconst GRID = 'rgba(148, 163, 184, 0.13)';\nconst frames = context.panel.data.series || [];\nconst asArray = (field) => field?.values?.toArray ? field.values.toArray() : Array.from(field?.values ?? []);\nconst ref = (frame) => frame.refId || frame.meta?.custom?.refId || '';\nconst numberField = (frame) => frame.fields.find((field) => field.type === 'number');\nconst timeField = (frame) => frame.fields.find((field) => field.type === 'time');\nconst points = (refId) => frames.filter((frame) => ref(frame) === refId).flatMap((frame) => {\n  const times = asArray(timeField(frame));\n  const values = asArray(numberField(frame));\n  return times.map((time, index) => [Number(time), Number(values[index])]).filter(([time, value]) => Number.isFinite(time) && Number.isFinite(value));\n}).sort((left, right) => left[0] - right[0]);\nconst accepted = points('A');\nconst failed = points('B');\nconst rangeFrom = Number(context.panel.data.timeRange?.from?.valueOf?.()) || Date.now() - 24 * 60 * 60 * 1000;\nconst rangeTo = Number(context.panel.data.timeRange?.to?.valueOf?.()) || Date.now();\nconst utc = (value) => { const date = new Date(value); return `${String(date.getUTCDate()).padStart(2, '0')} ${String(date.getUTCHours()).padStart(2, '0')}:${String(date.getUTCMinutes()).padStart(2, '0')}`; };\nreturn {\n  animation: false,\n  backgroundColor: 'transparent',\n  grid: { left: 38, right: 14, top: 12, bottom: 42 },\n  legend: { bottom: 0, textStyle: { color: MUTED, fontSize: 10 }, itemWidth: 14, itemHeight: 2 },\n  tooltip: { trigger: 'axis', confine: true, backgroundColor: 'rgba(17, 24, 39, 0.96)', borderColor: 'rgba(79, 195, 247, 0.35)', textStyle: { color: '#E5EEF5', fontSize: 11 }, axisPointer: { type: 'line' }, formatter: (items) => { const rows = items.map((item) => `${item.marker}${item.seriesName}: ${Number(item.value[1]).toLocaleString('en-GB')}`); return `${utc(items[0]?.value?.[0])} UTC<br/>${rows.join('<br/>')}`; } },\n  xAxis: { type: 'time', min: rangeFrom, max: rangeTo, boundaryGap: false, axisLine: { lineStyle: { color: 'rgba(148, 163, 184, 0.32)' } }, axisTick: { show: false }, axisLabel: { color: MUTED, fontSize: 9, hideOverlap: true, formatter: (value) => utc(value).slice(3) }, splitLine: { show: false } },\n  yAxis: { type: 'value', min: 0, minInterval: 1, axisLine: { show: false }, axisTick: { show: false }, axisLabel: { color: MUTED, fontSize: 9 }, splitLine: { show: true, lineStyle: { color: GRID } } },\n  series: [\n    { name: 'accepted by FCM', type: 'line', data: accepted, step: 'end', showSymbol: false, connectNulls: false, lineStyle: { color: ACCEPTED, width: 2 }, itemStyle: { color: ACCEPTED }, areaStyle: { color: 'rgba(79, 195, 247, 0.12)' } },\n    { name: 'failed FCM send', type: 'line', data: failed, step: 'end', showSymbol: false, connectNulls: false, lineStyle: { color: FAILED, width: 2 }, itemStyle: { color: FAILED } }\n  ]\n};",
+        "editor": {
+          "format": "auto",
+          "height": 650
         },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
+        "themeEditor": {
+          "name": "default",
+          "config": "{}"
+        },
+        "visualEditor": {
+          "code": "return { dataset: context.editor.dataset, series: context.editor.series, xAxis: { type: 'time' }, yAxis: { type: 'value' } };",
+          "dataset": [],
+          "series": []
+        },
+        "baidu": {
+          "callback": "bmapReady",
+          "key": ""
+        },
+        "gaode": {
+          "key": "",
+          "plugin": "AMap.Scale,AMap.ToolBar"
+        },
+        "google": {
+          "callback": "gmapReady",
+          "key": ""
         }
-      }
+      },
+      "pluginVersion": "7.1.0"
+    },
+    {
+      "id": 17,
+      "type": "volkovlabs-echarts-panel",
+      "title": "Invalid tokens · 24h",
+      "description": "Audience & scale — unique FCM token lifecycles that returned a permanent invalid-token response and entered automatic cleanup in the rolling last 24 hours. This can indicate an uninstall or token rotation, but is not proof of an uninstall and is normal lifecycle evidence rather than a service fault.",
+      "transparent": true,
+      "gridPos": {
+        "x": 18,
+        "y": 9,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "tubepulse_notifications_invalid_token_events{event=\"cleanup\"}",
+          "legendFormat": "unique cleanup",
+          "refId": "A",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#4FC3F7"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "renderer": "canvas",
+        "map": "none",
+        "editorMode": "code",
+        "followTheme": true,
+        "getOption": "const CYAN = '#4FC3F7';\nconst MUTED = 'rgba(204, 217, 229, 0.62)';\nconst GRID = 'rgba(148, 163, 184, 0.13)';\nconst FIVE_MINUTES = 5 * 60 * 1000;\nconst DAY = 24 * 60 * 60 * 1000;\nconst frames = context.panel.data.series || [];\nconst asArray = (field) => field?.values?.toArray ? field.values.toArray() : Array.from(field?.values ?? []);\nconst rangeTo = Number(context.panel.data.timeRange?.to?.valueOf?.()) || Date.now();\nconst rangeFrom = rangeTo - DAY;\nconst counts = new Map();\nfor (const frame of frames) {\n  const field = frame.fields.find((candidate) => candidate.type === 'number');\n  const labels = field?.labels || frame.labels || {};\n  const bucket = Date.parse(labels.bucket);\n  const values = asArray(field);\n  const count = Number(values[values.length - 1]);\n  if (Number.isFinite(bucket) && bucket >= rangeFrom && bucket <= rangeTo && Number.isFinite(count)) {\n    counts.set(bucket, (counts.get(bucket) || 0) + count);\n  }\n}\nconst first = Math.ceil(rangeFrom / FIVE_MINUTES) * FIVE_MINUTES;\nconst last = Math.floor(rangeTo / FIVE_MINUTES) * FIVE_MINUTES;\nconst points = [];\nfor (let time = first; time <= last; time += FIVE_MINUTES) points.push([time, counts.get(time) || 0]);\nconst total = [...counts.values()].reduce((sum, value) => sum + value, 0);\nconst width = context.panel.chart.getWidth();\nconst valueSize = width < 210 ? 23 : width < 420 ? 32 : 38;\nconst graphLeft = width < 210 ? '44%' : '40%';\nconst timeLabel = (value, index) => {\n  if (width < 300 && index % 2 === 1) return '';\n  const date = new Date(value);\n  const hours = String(date.getUTCHours()).padStart(2, '0');\n  if (width < 300) return `${hours}h`;\n  return `${hours}:${String(date.getUTCMinutes()).padStart(2, '0')}`;\n};\nconst observedMax = points.length ? Math.max(...points.map((point) => point[1])) : 0;\nreturn {\n  animation: false,\n  backgroundColor: 'transparent',\n  graphic: [{\n    type: 'text', left: width < 210 ? '3%' : '5%', top: '31%', silent: true,\n    style: { text: new Intl.NumberFormat('en-GB').format(total), fill: CYAN, fontFamily: 'Inter, Roboto, sans-serif', fontSize: valueSize, fontWeight: 500 },\n  }],\n  grid: { left: graphLeft, right: 22, top: 8, bottom: 25, containLabel: false },\n  tooltip: { trigger: 'axis', confine: true, backgroundColor: 'rgba(17, 24, 39, 0.96)', borderColor: 'rgba(79, 195, 247, 0.35)', textStyle: { color: '#E5EEF5', fontSize: 11 }, valueFormatter: (value) => Number(value).toLocaleString('en-GB') },\n  xAxis: { type: 'time', show: true, boundaryGap: false, min: rangeFrom, max: rangeTo, splitNumber: width < 300 ? 2 : 3, minInterval: width < 300 ? 12 * 60 * 60 * 1000 : 6 * 60 * 60 * 1000, axisLine: { show: true, lineStyle: { color: 'rgba(148, 163, 184, 0.32)' } }, axisTick: { show: false }, axisLabel: { color: MUTED, fontSize: 9, hideOverlap: true, showMinLabel: true, showMaxLabel: true, margin: 7, formatter: timeLabel }, splitLine: { show: false } },\n  yAxis: { type: 'value', show: false, min: 0, max: Math.max(1, observedMax + 1), minInterval: 1, splitLine: { show: true, lineStyle: { color: GRID } } },\n  series: [{ name: 'unique cleanup', type: 'line', data: points, step: 'end', showSymbol: false, connectNulls: false, silent: false, lineStyle: { color: CYAN, width: 2 }, itemStyle: { color: CYAN }, areaStyle: { color: 'rgba(79, 195, 247, 0.15)' }, emphasis: { disabled: true } }],\n};",
+        "editor": {
+          "format": "auto",
+          "height": 650
+        },
+        "themeEditor": {
+          "name": "default",
+          "config": "{}"
+        },
+        "visualEditor": {
+          "code": "return { dataset: context.editor.dataset, series: context.editor.series, xAxis: { type: 'time' }, yAxis: { type: 'value' } };",
+          "dataset": [],
+          "series": []
+        },
+        "baidu": {
+          "callback": "bmapReady",
+          "key": ""
+        },
+        "gaode": {
+          "key": "",
+          "plugin": "AMap.Scale,AMap.ToolBar"
+        },
+        "google": {
+          "callback": "gmapReady",
+          "key": ""
+        }
+      },
+      "pluginVersion": "7.1.0"
     }
   ],
   "refresh": "30s",

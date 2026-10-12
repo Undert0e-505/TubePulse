@@ -334,6 +334,26 @@ export async function collectAggregateMonitoring({
       retainedFailures: finite(notificationIntents.failed),
       retainedDeadTokens: finite(notificationIntents.deadToken),
       transientNagsExpired: finite(notificationIntents.transientExpired),
+      fcmAcceptedTotal: finite(notificationIntents.fcmAcceptedTotal),
+      fcmFailedTotal: finite(notificationIntents.fcmFailedTotal),
+      permanentInvalidTokenResponsesTotal: finite(notificationIntents.permanentInvalidTokenResponsesTotal),
+      uniqueDeadTokenCleanupsTotal: finite(notificationIntents.uniqueDeadTokenCleanupsTotal),
+      invalidTokenMonitoringCutoverAt: notificationIntents.invalidTokenMonitoringCutoverAt
+        && timestamp(notificationIntents.invalidTokenMonitoringCutoverAt) !== null
+        ? new Date(timestamp(notificationIntents.invalidTokenMonitoringCutoverAt)).toISOString()
+        : null,
+      invalidTokenEvents: (Array.isArray(notificationIntents.invalidTokenEvents)
+        ? notificationIntents.invalidTokenEvents
+        : [])
+        .map((event) => ({
+          bucket: event?.bucket && timestamp(event.bucket) !== null
+            ? new Date(timestamp(event.bucket)).toISOString()
+            : null,
+          permanentResponses: Math.max(0, finite(event?.permanentResponses)),
+          uniqueCleanups: Math.max(0, finite(event?.uniqueCleanups)),
+        }))
+        .filter((event) => event.bucket)
+        .sort((left, right) => left.bucket.localeCompare(right.bucket)),
     },
     authority: {
       remoteAvailable: Boolean(remoteStatus?.ok),

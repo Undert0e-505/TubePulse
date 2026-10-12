@@ -2,7 +2,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   buildFcmMessage,
+  classifyPermanentFcmTokenError,
   normalizeNotificationCapability,
+  sendFCMPush,
 } from '../worker/tubepulse-cron/shared.mjs';
 
 const payloads = [
@@ -44,4 +46,42 @@ test('capability validation fails closed', () => {
   assert.equal(normalizeNotificationCapability('local-v1'), 'local-v1');
   assert.equal(normalizeNotificationCapability('local-v2'), null);
   assert.equal(normalizeNotificationCapability(true), null);
+});
+
+test('permanent FCM token errors classify only established cleanup outcomes', () => {
+  assert.equal(classifyPermanentFcmTokenError(404, '{}'), 'http-404');
+  assert.equal(classifyPermanentFcmTokenError(400, '{"errorCode":"UNREGISTERED"}'), 'unregistered');
+  assert.equal(classifyPermanentFcmTokenError(400, 'registration token is NotRegistered'), 'not-registered');
+  for (const [status, body] of [
+    [401, 'UNAUTHENTICATED'],
+    [403, 'PERMISSION_DENIED'],
+    [429, 'QUOTA_EXCEEDED'],
+    [500, 'INTERNAL'],
+    [503, 'UNAVAILABLE'],
+    [400, 'INVALID_ARGUMENT'],
+    [200, 'UNREGISTERED'],
+    [400, 'unregistered'],
+    [400, 'Not Registered'],
+  ]) {
+    assert.equal(classifyPermanentFcmTokenError(status, body), null, `${status} ${body}`);
+  }
+});
+
+test('FCM sender annotates permanent token invalidation without broadening transient failures', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => new Response('{"error":{"details":[{"errorCode":"UNREGISTERED"}]}}', { status: 400 });
+    const permanent = await sendFCMPush('access', 'project', 'token', payloads[0][1]);
+    assert.equal(permanent.sent, false);
+    assert.equal(permanent.deadToken, true);
+    assert.equal(permanent.permanentInvalidTokenClass, 'unregistered');
+
+    globalThis.fetch = async () => new Response('{"error":{"status":"UNAVAILABLE"}}', { status: 503 });
+    const transient = await sendFCMPush('access', 'project', 'token', payloads[0][1]);
+    assert.equal(transient.sent, false);
+    assert.equal(transient.deadToken, false);
+    assert.equal(transient.permanentInvalidTokenClass, undefined);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });

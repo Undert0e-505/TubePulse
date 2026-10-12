@@ -447,11 +447,12 @@ Remove channel from this device. Logic mirrors subscribe in reverse. If we're re
 
 Mark videos as seen.
 
-Request: `{ deviceId, channelId, videoIds?, clearAll? }`
+Request: legacy `{ channelId, videoIds?, clearAll? }`, or current snapshot batch
+`{ channels: [{ channelId, contentIds: [...] }, ...] }` with the device in bearer authentication.
 
 Logic:
 1. Read `device:{deviceId}:state:{channelId}`
-2. Remove specified videoIds (or all if `clearAll: true`)
+2. Remove only the specified exact IDs (or all if legacy `clearAll: true`)
 3. Write back
 4. If no unwatched content remains, remove the device/channel pair from `nag:active`; otherwise a later transient reminder is rebuilt from current visible state
 
@@ -500,7 +501,8 @@ Writes `device:{deviceId}:override:{channelId}` (or deletes it if the override i
 - Maintains local cache of subscribed channels and their recent videos in AsyncStorage
 - Renders the channel list and video list from local cache
 - Calls `/subscribe-channel` and `/unsubscribe` when user adds/removes channels
-- Calls `/seen` when user taps a video or "mark all seen" on a channel
+- Calls `/seen` for notification/Home/widget exact-snapshot actions. Global **Mark all seen** sends
+  every tapped channel snapshot in one batched request; retries cannot consume later arrivals.
 - Calls `/register` on first launch and on FCM token rotation
 - Calls `/feed` on pull-to-refresh and initial app load (after register)
 - Receives FCM pushes and updates local cache + UI
@@ -511,11 +513,15 @@ Writes `device:{deviceId}:override:{channelId}` (or deletes it if the override i
   normalize to no exceptions; enabling global mute again clears prior exceptions, while clearing
   global mute removes them as meaningless.
 - Registers the Expo response task before advertising `local-v1`; foreground and headless action
-  handling share one persist-before-dismiss path. Locally rendered notifications select normal
-  mute actions, channel `Unmute channel`, or global `Unmute channel` plus `Unmute all` from the same
+  handling share one persist-before-dismiss path. A normal notification exposes `Mute 1h`, `Mute
+  8h`, then `Mark seen`; channel bundles move `Mute all` into their available action set. Muted
+  notifications retain their applicable unmute actions and add `Mark seen` last. Prewarnings omit
+  seen actions because they do not enter unseen state. Locally rendered notifications select from the same
   expiry-normalized local state
   that chooses their audible/silent Android channel. Home exposes `Silent until HH:MM` with `Unmute`
-  per timed channel and `Silent` with `Unmute all` for the global state, refreshing on action,
+  per timed channel and `Silent` with `Unmute all` for the global state. Right-justified channel
+  **Mark seen** and conditional global **Mark all seen** controls have separate non-navigation hit
+  areas and update blue dots, widget and notification tray immediately, refreshing on action,
   focus/resume and the nearest saved expiry without backend traffic.
 
 ### 9.2 What the app does NOT do
@@ -544,8 +550,9 @@ FCM presentation is capability-gated for release compatibility:
    before any feed request, through the audible or silent channel.
 3. Foreground and background receipt reuse one presentation function. The existing tag is dismissed
    before replacement, and the notification retains the same tap/seen semantics.
-4. Notification action responses update only local sound state. Body taps alone enter navigation and
-   seen-state handling. A headless Expo task handles mute actions while backgrounded/terminated and
+4. Mute action responses update only local sound state. `Mark seen` queues exact represented IDs,
+   updates local cache/widget/tray, and uses the same path in foreground, background or terminated
+   state. Body taps retain navigation plus seen handling. A headless Expo task handles actions and
    ignores receipt events because RNFirebase owns message receipt.
 5. Feed/cache/widget refresh remains best effort after presentation.
 
@@ -597,14 +604,14 @@ Defense: write the inverse-view keys in a consistent order so partial failure le
 ### 10.3 FCM send fails
 
 Symptoms: notification never arrives.
-Recovery: don't update nag state until FCM ack received. Next cron tick will retry (up to a max retry count).
-Defense: log all FCM failures with the full payload to a `fcm_errors:{date}` key for diagnosis.
+Recovery: don't update notification watermarks until an FCM response is recorded. Durable one-off intents use the documented at-most-once claim boundary; transient reminders are regenerated from current canonical state.
+Defense: persist aggregate accepted/failed counters locally without notification payloads or user identifiers. Transient failures remain failures and never trigger device cleanup.
 
 ### 10.4 Device deleted from Play Store but FCM token still valid
 
 Symptoms: pushes continue forever to a phantom user.
-Recovery: FCM returns `NotRegistered` for uninstalled apps. On that error, delete `device:{deviceId}:*` keys and remove deviceId from all `channel:*:subscribers` arrays.
-Defense: include cleanup-on-FCM-error as part of the standard send path.
+Recovery: a permanent invalid-token response (`404`, canonical `UNREGISTERED`, or legacy `NotRegistered`) invokes the standard device cleanup, deleting the device-owned records and removing its subscriber memberships. This can also follow token rotation, so it is not itself proof of an uninstall.
+Defense: include cleanup-on-FCM-error as part of the standard send path. Persist privacy-safe raw-response and token-lifecycle-deduplicated cleanup totals plus short-lived aggregate occurrence buckets for monitoring; these metrics are not service-health faults and expose no device or token identity.
 
 ### 10.5 KV throttling
 
@@ -818,7 +825,7 @@ The final subscriber leaving removes the channel from `channels:active`, which s
 
 Host availability and disaster recovery are deliberately separate from this data-plane design. Compose health proves only HTTP liveness/service identity—not authority readiness/current state or scheduler progress. The checked-in Windows supervisor starts Docker minimized, applies Compose idempotently, and separately evaluates signed coordinator/D1 readiness and scheduler progress without clearing stale/pending state or restarting for dependency outages. Because Docker daemon restart does not replay Compose dependency ordering, the supervisor then performs one boot-identity-guarded restart of only the tunnel sidecar and requires connector registration before success; ordinary same-boot invocations skip it. The notification barrier remains the authenticated end-to-end VPC-route proof. A verified per-user Startup shortcut invokes the supervisor at interactive sign-in, and the next power recovery is the remaining full-path checkpoint. The elevated Scheduled Task route is optional because cross-account UAC task ACLs can exclude the auto-login profile. After total disk loss, GitHub plus active D1/DO and the existing cloud projects reconstruct canonical service; secrets rotate and host-only scheduler/quota/notification state follows conservative loss rules. See [`self-host/RECOVERY.md`](self-host/RECOVERY.md).
 
-Operational monitoring is a separate, non-authoritative Compose project. A bounded aggregate-only host endpoint and read-only Cloudflare GraphQL collector feed localhost Prometheus/Grafana; they cannot mutate canonical state and carry no authority credential. Five-minute UTC snapshots and time series remain under ignored repo-root `logs/`, with explicit retention limits. Monitoring startup is asynchronous/best-effort after authority readiness, so observability failure cannot block or restart production. See [`monitoring/README.md`](monitoring/README.md).
+Operational monitoring is a separate, non-authoritative Compose project. A bounded aggregate-only host endpoint and read-only Cloudflare GraphQL collector feed localhost Prometheus/Grafana; they cannot mutate canonical state and carry no authority credential. Five-minute UTC snapshots and time series remain under ignored repo-root `logs/`, with explicit retention limits. Each collection is wall-clock aligned to 30 seconds after the five-minute boundary and briefly waits, with a hard timeout, when Home still reports that boundary's sweep as active. This makes notification deltas normally correspond to one completed aligned cycle without delaying notification delivery; overlong or failed cycles remain honest and their monotonic counter delta is safely caught by a later successful sample. Monitoring startup is asynchronous/best-effort after authority readiness, so observability failure cannot block or restart production. See [`monitoring/README.md`](monitoring/README.md).
 
 The user-facing status path is deliberately smaller than operational monitoring. The Home authority serves unauthenticated `GET /service-status` from its already-loaded authority and scheduler state, without scanning canonical application data. It reports only `healthy`, `degraded`, `outage`, or `unknown` plus user-safe timestamps/copy. Fresh scheduler/YouTube progress, current authority, active lease and a clear notification barrier are required for healthy; progress ages through the wallboard's 11-minute degraded boundary before the 16-minute outage boundary, and superseded scheduler errors do not remain incidents. The public Worker proxies that normalized contract through the existing private VPC route with a bounded timeout and short cache header. A failed or unverifiable probe becomes `unknown`, because Worker or phone connectivity alone cannot prove that notification delivery is down. The Android Settings card caches only this four-field result, turns stale observations into `unknown`, and never exposes operator diagnostics.
 

@@ -11,7 +11,7 @@ import PreviewServerScreen from './src/screens/PreviewServerScreen';
 import { COLORS } from './src/utils/constants';
 import { getChannels, getSettings, getLastSeen, saveLastSeen, getChannelCache, saveChannelCache } from './src/utils/storage';
 import { requestPermissionAndGetToken, onTokenRefresh, onForegroundMessage, onNotificationOpenedApp, getInitialNotification, setBackgroundMessageHandler } from './src/utils/fcm';
-import { registerDevice, markSeen, getDeviceId, subscribeChannel, updateSettings, bootstrapChannel } from './src/utils/api';
+import { registerDevice, markSeen, markSeenBatch, getDeviceId, subscribeChannel, updateSettings, bootstrapChannel } from './src/utils/api';
 import { setupNotificationChannel } from './src/utils/notifications';
 import {
   presentRemoteMessageLocally,
@@ -21,7 +21,7 @@ import {
   LOCAL_NOTIFICATION_CAPABILITY,
   notificationResponseRoute,
 } from './src/utils/localNotificationSilence.mjs';
-import { processLocalNotificationActionResponse } from './src/utils/notificationActionRuntime';
+import { processLocalNotificationActionResponse, processNotificationSeenResponse } from './src/utils/notificationActionRuntime';
 import { ensureNotificationResponseTaskRegistered } from './src/utils/notificationBackgroundTask';
 import { ConfirmHost } from './src/components/Confirm';
 import SettingsCogIcon from './src/components/SettingsCogIcon';
@@ -225,6 +225,7 @@ function TubePulseApplication() {
           storage: AsyncStorage,
           deviceId,
           persist: markSeen,
+          persistBatch: markSeenBatch,
         }).catch(() => console.warn('[seen] startup retry remains pending'));
 
         if (fcmToken) {
@@ -434,6 +435,10 @@ function TubePulseApplication() {
           await processLocalNotificationActionResponse(messageOrResponse);
           return;
         }
+        if (route === 'seen') {
+          await processNotificationSeenResponse(messageOrResponse);
+          return;
+        }
         if (route === 'ignore') return;
       }
       const data = messageOrResponse?.data
@@ -510,6 +515,7 @@ function TubePulseApplication() {
             storage: AsyncStorage,
             deviceId,
             persist: markSeen,
+            persistBatch: markSeenBatch,
           })).catch(() => {
             console.warn('[seen] notification retry remains pending');
           });

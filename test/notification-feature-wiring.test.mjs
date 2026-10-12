@@ -20,6 +20,11 @@ test('data-only receipt displays before best-effort feed refresh', () => {
   assert.match(presentation, /LOCAL_NOTIFICATION_GLOBAL_MUTED_CATEGORY/);
   assert.match(presentation, /buttonTitle: 'Unmute channel'/);
   assert.match(presentation, /buttonTitle: 'Unmute all'/);
+  assert.match(presentation, /buttonTitle: 'Mark seen'/);
+  const normalCategory = presentation.match(/setNotificationCategoryAsync\(LOCAL_NOTIFICATION_CATEGORY, \[([\s\S]*?)\]\),/)?.[1] || '';
+  assert.ok(normalCategory.indexOf("buttonTitle: 'Mute 1h'") < normalCategory.indexOf("buttonTitle: 'Mute 8h'"));
+  assert.ok(normalCategory.indexOf("buttonTitle: 'Mute 8h'") < normalCategory.indexOf("buttonTitle: 'Mark seen'"));
+  assert.doesNotMatch(normalCategory, /buttonTitle: 'Mute all'/);
   assert.match(
     presentation,
     /setNotificationCategoryAsync\(LOCAL_NOTIFICATION_CHANNEL_MUTED_CATEGORY,[\s\S]*?UNMUTE_CHANNEL[\s\S]*?\]\),/,
@@ -34,7 +39,7 @@ test('data-only receipt displays before best-effort feed refresh', () => {
     'the interactive category must be ready before every local notification is posted',
   );
   assert.match(presentation, /silent \? 'new-videos-silent' : 'new-videos'/);
-  assert.match(presentation, /categoryIdentifier: localPresentation\.categoryIdentifier/);
+  assert.match(presentation, /notificationCategoryForData\(localPresentation, data\)/);
 });
 
 test('background action task loads before App and action taps exit before default handling', () => {
@@ -56,6 +61,13 @@ test('Home owns local sound recovery while Settings retains update accessibility
   assert.match(home, /styles\.silenceStatus/);
   assert.match(home, /ellipsizeMode="tail"/);
   assert.match(home, /channelNameBtn:\s*\{[\s\S]*?flexShrink: 1,[\s\S]*?minWidth: 0,/);
+  assert.match(home, /accessibilityLabel=\{`Mark \$\{displayName\} channel seen`\}/);
+  assert.match(home, /channelHeaderContent:\s*\{[\s\S]*?minWidth: 0,/);
+  assert.match(home, /channelActionRow:\s*\{[\s\S]*?justifyContent: 'flex-end'/);
+  assert.ok(home.indexOf('style={styles.channelNameBtn}') < home.indexOf('style={styles.markSeenLozenge}'));
+  assert.match(home, /accessibilityLabel="Mark all content seen"/);
+  assert.match(home, /subscribeLocalSeenChanges/);
+  assert.match(actionRuntime, /notifyLocalSeenChanged\(\)/);
   assert.match(home, /unmuteLozenge:\s*\{[\s\S]*?flexShrink: 0,/);
   assert.match(home, /nextNotificationSilenceExpiry/);
   assert.match(home, /AppState\.addEventListener/);

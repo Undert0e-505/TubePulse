@@ -6,7 +6,7 @@ function labels(values = {}) {
   return entries.length ? `{${entries.map(([key, value]) => `${key}="${escape(value)}"`).join(',')}}` : '';
 }
 
-export function prometheusText({ snapshot, collector }) {
+export function prometheusText({ snapshot, collector, nowMs = Date.now() }) {
   const lines = [];
   const metric = (name, value, metricLabels) => lines.push(`${name}${labels(metricLabels)} ${number(value)}`);
   const host = snapshot?.host || {};
@@ -92,6 +92,44 @@ export function prometheusText({ snapshot, collector }) {
   metric('tubepulse_live_watch_active_watchers', host.liveWatch?.active);
   metric('tubepulse_live_watch_in_window_watchers', host.liveWatch?.inWindow);
   metric('tubepulse_live_watch_degraded', bool(host.liveWatch?.degraded));
+  lines.push('# HELP tubepulse_notifications_fcm_accepted_total FCM send requests accepted successfully by Firebase; this does not confirm handset delivery.');
+  lines.push('# TYPE tubepulse_notifications_fcm_accepted_total counter');
+  metric('tubepulse_notifications_fcm_accepted_total', host.notifications?.fcmAcceptedTotal);
+  lines.push('# HELP tubepulse_notifications_fcm_failed_total FCM send attempts that returned or raised a failed outcome.');
+  lines.push('# TYPE tubepulse_notifications_fcm_failed_total counter');
+  metric('tubepulse_notifications_fcm_failed_total', host.notifications?.fcmFailedTotal);
+  lines.push('# HELP tubepulse_notifications_fcm_permanent_invalid_responses_total FCM attempt responses classified as permanent invalid-token outcomes that invoke cleanup.');
+  lines.push('# TYPE tubepulse_notifications_fcm_permanent_invalid_responses_total counter');
+  metric('tubepulse_notifications_fcm_permanent_invalid_responses_total', host.notifications?.permanentInvalidTokenResponsesTotal);
+  lines.push('# HELP tubepulse_notifications_dead_token_cleanups_total Unique FCM token lifecycles observed as permanently invalid and handed to the cleanup callback.');
+  lines.push('# TYPE tubepulse_notifications_dead_token_cleanups_total counter');
+  metric('tubepulse_notifications_dead_token_cleanups_total', host.notifications?.uniqueDeadTokenCleanupsTotal);
+  lines.push('# HELP tubepulse_notifications_invalid_token_monitoring_cutover_timestamp_seconds Timestamp when durable invalid-token monitoring began on this host state.');
+  lines.push('# TYPE tubepulse_notifications_invalid_token_monitoring_cutover_timestamp_seconds gauge');
+  metric(
+    'tubepulse_notifications_invalid_token_monitoring_cutover_timestamp_seconds',
+    host.notifications?.invalidTokenMonitoringCutoverAt
+      ? Date.parse(host.notifications.invalidTokenMonitoringCutoverAt) / 1000
+      : 0,
+  );
+  lines.push('# HELP tubepulse_notifications_invalid_token_events Privacy-safe five-minute occurrence buckets for permanent responses and unique cleanup lifecycles.');
+  lines.push('# TYPE tubepulse_notifications_invalid_token_events gauge');
+  for (const event of host.notifications?.invalidTokenEvents || []) {
+    metric('tubepulse_notifications_invalid_token_events', event.permanentResponses, {
+      bucket: event.bucket,
+      event: 'response',
+    });
+    metric('tubepulse_notifications_invalid_token_events', event.uniqueCleanups, {
+      bucket: event.bucket,
+      event: 'cleanup',
+    });
+  }
+  lines.push('# HELP tubepulse_notifications_fcm_accepted_interval FCM acceptances observed since the previous successful five-minute host collection.');
+  lines.push('# TYPE tubepulse_notifications_fcm_accepted_interval gauge');
+  metric('tubepulse_notifications_fcm_accepted_interval', host.notifications?.fcmAcceptedInterval);
+  lines.push('# HELP tubepulse_notifications_fcm_failed_interval Failed FCM outcomes observed since the previous successful five-minute host collection.');
+  lines.push('# TYPE tubepulse_notifications_fcm_failed_interval gauge');
+  metric('tubepulse_notifications_fcm_failed_interval', host.notifications?.fcmFailedInterval);
   for (const field of ['queued', 'sent', 'failed', 'suppressed', 'recovered', 'deduplicated']) metric(`tubepulse_notifications_${field}`, host.notifications?.[field]);
   for (const field of ['pending', 'oldestPendingAgeSeconds', 'durableBacklog', 'ambiguousSending', 'callbackPending', 'retainedFailures', 'retainedDeadTokens', 'transientNagsExpired']) {
     metric(`tubepulse_notifications_${field.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`)}`, host.notifications?.[field]);

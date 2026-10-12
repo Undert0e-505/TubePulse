@@ -203,6 +203,7 @@ Expected behavior:
 - Requires the release commit to be pushed.
 - Builds the APK into `dist/`.
 - Verifies APK version/signature.
+- Verifies action/API compatibility tests when a release changes notification or seen-state contracts.
 - Creates or updates the GitHub Release.
 - Uploads the exact `dist/` artifact.
 - Fails if commit or push state is not safe.
@@ -215,7 +216,7 @@ Purpose: deploy Cloudflare workers deliberately and separately.
 Expected behavior:
 
 - Deploy `worker/tubepulse-api` only when API worker changes require it.
-- Deploy Home-owned scheduler changes by rebuilding/recreating only `home-authority` with `self-host/compose.authority.yaml`, preserving `data-authority` and the scheduler lease.
+- Deploy host-owned scheduler changes by rebuilding/recreating only `home-authority` with `self-host/compose.authority.yaml`, preserving `data-authority` and the scheduler lease.
 - Keep the RSS/posts/aux Worker deployments triggerless. They are frozen rollback assets, not active scheduled workers; do not deploy or activate them during an ordinary release.
 - Apply D1 schema changes before any Worker version that depends on them, then verify the configured backend generation, exact manifest state, and coordinator readiness.
 - Keep `worker/tubepulse-cron` deployed as a no-op with `crons = []`; do not use it for background-worker releases.

@@ -10,7 +10,7 @@ YouTube channels into a focused feed, widget and configurable notification flow.
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 [Download the latest release](https://github.com/Undert0e-505/TubePulse/releases/latest) ·
-[What’s new in v4.2.0](RELEASE_NOTES_v4.2.0.md) · [User guide](docs/USER_GUIDE.md)
+[What’s new in v4.3.0](RELEASE_NOTES_v4.3.0.md) · [User guide](docs/USER_GUIDE.md)
 
 ## See your channels at a glance
 
@@ -45,6 +45,8 @@ seen or unseen state. Manual ordering stays yours even when automatic newest-fir
 - Shows videos and posts in a dark, recommendation-free Home feed with clear unseen markers.
 - Keeps failed seen-state updates in a silent local retry queue, so opening YouTube never waits on
   the network and blue dots do not return unexpectedly.
+- Provides exact-snapshot **Mark seen** actions on notifications and channel rows, plus one batched
+  **Mark all seen** Home action that cannot consume content arriving after the tap.
 - Supports saved manual channel order or automatic newest-first ordering across the app and widget.
 - Provides an Android home-screen widget with the newest published video or post for each displayed
   channel.
@@ -102,7 +104,7 @@ See [SECURITY.md](SECURITY.md) for security reporting and the
 - [Aggregate monitoring](monitoring/README.md) — privacy boundary, dashboard and retention
 - [Cloud services](worker/README.md) and [Worker contracts](worker/CONTRACTS.md) — implementation,
   endpoints and canonical storage contracts
-- [Release process](RELEASE.md) and [release notes](RELEASE_NOTES_v4.2.0.md)
+- [Release process](RELEASE.md) and [release notes](RELEASE_NOTES_v4.3.0.md)
 - [Historical plans](MIGRATION_PLAN.md) — retained for context, not current operating instructions
 
 ## Build from source

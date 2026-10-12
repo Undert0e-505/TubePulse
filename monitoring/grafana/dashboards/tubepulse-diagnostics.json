@@ -146,7 +146,7 @@
       "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
     },
     {
-      "type": "timeseries", "title": "Notification delivery", "description": "Aggregate last-cycle delivery outcomes only; no token, installation or channel labels.",
+      "type": "timeseries", "title": "Notification cycle diagnostics", "description": "Latest scheduler-cycle decisions and instantaneous intent state; not historical send volume or confirmed handset delivery.",
       "gridPos": { "x": 0, "y": 33, "w": 12, "h": 7 },
       "targets": [
         { "expr": "tubepulse_notifications_queued", "legendFormat": "queued", "refId": "A" },
@@ -224,6 +224,16 @@
         { "matcher": { "id": "byName", "options": "consistent (1=yes)" }, "properties": [{ "id": "thresholds", "value": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] } }] }
       ] },
       "options": { "colorMode": "value", "graphMode": "none", "orientation": "horizontal", "reduceOptions": { "calcs": ["lastNotNull"], "values": false } }
+    },
+    {
+      "type": "timeseries", "title": "Permanent invalid FCM tokens", "description": "Persisted cumulative evidence from actual FCM attempts. Raw responses count every permanent invalid-token response; unique cleanup lifecycles deduplicate the same token across staged intents, callback recovery and restart. These are normal token-lifecycle events, not confirmed uninstalls or a health fault.",
+      "gridPos": { "x": 0, "y": 53, "w": 12, "h": 6 },
+      "targets": [
+        { "expr": "tubepulse_notifications_fcm_permanent_invalid_responses_total", "legendFormat": "raw permanent responses", "refId": "A" },
+        { "expr": "tubepulse_notifications_dead_token_cleanups_total", "legendFormat": "unique cleanup lifecycles", "refId": "B" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 8, "lineInterpolation": "stepAfter" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
     }
   ],
   "refresh": "30s",

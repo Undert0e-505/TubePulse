@@ -59,6 +59,9 @@ test('notification intent summary exposes only aggregate backlog and outcome cou
     pending: 1, sending: 1, sent: 0, resolved: 1,
     callbackPending: 1, failed: 1, deadToken: 0, suppressed: 0,
     transientExpired: 0, overduePending: 0, oldestPendingAgeSeconds: 0,
+    fcmAcceptedTotal: 0, fcmFailedTotal: 1,
+    permanentInvalidTokenResponsesTotal: 0, uniqueDeadTokenCleanupsTotal: 0,
+    invalidTokenMonitoringCutoverAt: '1970-01-01T00:01:40.000Z', invalidTokenEvents: [],
   });
   const serialized = JSON.stringify(summary);
   assert.doesNotMatch(serialized, /synthetic-device|UC-synthetic|synthetic-fcm|video-/);
@@ -422,6 +425,246 @@ test('nags bypass durable storage and an invisible attempt can be reconsidered l
   assert.equal((await store.summary()).pending, 0);
 });
 
+test('FCM outcome totals cover every coordinator path and survive idle cycles and restart', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'tubepulse-notification-totals-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const store = new DurableNotificationIntentStore(directory);
+  const coordinator = new ProductionNotificationCoordinator({
+    ...barrierConfig, gatewayConvergenceRequired: false,
+  }, {
+    intentStore: store,
+    fetchImpl: async () => jsonResponse({
+      channels: [{
+        channelId: 'UC-synthetic',
+        videos: [
+          { videoId: 'video-new', unwatched: true },
+          { videoId: 'video-second', unwatched: true },
+          { videoId: 'video-live', unwatched: true },
+        ],
+        posts: [{ activityId: 'activity', unwatched: true }],
+      }],
+    }),
+    tokenProvider: async () => 'token',
+    sender: async (_token, _project, _fcm, payload) => ({
+      sent: payload.data?.type !== 'post',
+      deadToken: false,
+    }),
+  });
+  const intents = [
+    intent({ payload: { title: 'Upload', data: { type: 'video' }, tag: 'upload' } }),
+    intent({
+      contentIds: ['video-new', 'video-second'], dedupeVersion: 'batch',
+      payload: { title: 'Bundle', data: { type: 'batch' }, tag: 'bundle' },
+    }),
+    intent({
+      kind: 'community-post', contentIds: ['post:activity'], dedupeVersion: 'post',
+      payload: { title: 'Post', data: { type: 'post' }, tag: 'post' },
+    }),
+    intent({
+      kind: 'prewarn', contentIds: ['video-live'], dedupeVersion: 'prewarn:30',
+      payload: { title: 'Upcoming', data: { type: 'prewarn', prewarnMinutes: '30' }, tag: 'prewarn' },
+    }),
+    intent({
+      contentIds: ['video-live'], dedupeVersion: 'live-now',
+      payload: { title: 'Live now', data: { type: 'video', live: 'true' }, tag: 'live-now' },
+    }),
+    intent({
+      kind: 'nag', dedupeVersion: 'nag:1',
+      payload: { title: 'Reminder', data: { type: 'nag' }, tag: 'nag' },
+    }),
+  ];
+
+  const delivery = await coordinator.flush(intents, {});
+  assert.equal(delivery.sent, 5);
+  assert.equal(delivery.failed, 1);
+  assert.deepEqual(
+    (({ fcmAcceptedTotal, fcmFailedTotal }) => ({ fcmAcceptedTotal, fcmFailedTotal }))(await store.summary()),
+    { fcmAcceptedTotal: 5, fcmFailedTotal: 1 },
+  );
+
+  const idle = await coordinator.flush([], {});
+  assert.equal(idle.sent, 0);
+  assert.equal(idle.failed, 0);
+  const restarted = new DurableNotificationIntentStore(directory);
+  assert.deepEqual(
+    (({ fcmAcceptedTotal, fcmFailedTotal }) => ({ fcmAcceptedTotal, fcmFailedTotal }))(await restarted.summary()),
+    { fcmAcceptedTotal: 5, fcmFailedTotal: 1 },
+  );
+});
+
+test('durable outcome counting is idempotent and callback recovery does not count again', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'tubepulse-notification-idempotent-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const store = new DurableNotificationIntentStore(directory);
+  const [entry] = await store.stage([intent()]);
+  await store.claim(entry.id);
+  await store.sent(entry.id, { sent: true, deadToken: false });
+  await store.sent(entry.id, { sent: true, deadToken: false });
+  assert.equal((await store.summary()).fcmAcceptedTotal, 1);
+
+  const restarted = new ProductionNotificationCoordinator({
+    ...barrierConfig, gatewayConvergenceRequired: false,
+  }, {
+    intentStore: new DurableNotificationIntentStore(directory),
+    fetchImpl: async () => { throw new Error('no visibility check is needed for recovery'); },
+    tokenProvider: async () => { throw new Error('no token is needed for recovery'); },
+    sender: async () => { throw new Error('FCM must not be called during recovery'); },
+  });
+  const recovered = await restarted.flush([intent({ onResult: async () => {} })], {});
+  assert.equal(recovered.recovered, 1);
+  const summary = await restarted.intentStore.summary();
+  assert.equal(summary.fcmAcceptedTotal, 1);
+  assert.equal(summary.fcmFailedTotal, 0);
+});
+
+test('dead-token cleanup callback recovers after failure without recounting the FCM outcome', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'tubepulse-dead-token-callback-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  let sends = 0;
+  const createCoordinator = () => new ProductionNotificationCoordinator({
+    ...barrierConfig, gatewayConvergenceRequired: false,
+  }, {
+    intentStore: new DurableNotificationIntentStore(directory),
+    fetchImpl: async () => jsonResponse({
+      channels: [{ channelId: 'UC-synthetic', videos: [{ videoId: 'video-new', unwatched: true }], posts: [] }],
+    }),
+    tokenProvider: async () => 'token',
+    sender: async () => {
+      sends++;
+      return { sent: false, deadToken: true, permanentInvalidTokenClass: 'unregistered' };
+    },
+  });
+
+  const first = createCoordinator();
+  const failedCallback = await first.flush([intent({
+    onResult: async () => { throw new Error('synthetic cleanup interruption'); },
+  })], {});
+  assert.equal(failedCallback.callbackFailures, 1);
+  assert.equal(sends, 1);
+  let summary = await first.intentStore.summary();
+  assert.equal(summary.callbackPending, 1);
+  assert.equal(summary.permanentInvalidTokenResponsesTotal, 1);
+  assert.equal(summary.uniqueDeadTokenCleanupsTotal, 1);
+
+  let recoveredDelivery = null;
+  const restarted = createCoordinator();
+  const recovered = await restarted.flush([intent({
+    onResult: async (delivery) => { recoveredDelivery = delivery; },
+  })], {});
+  assert.equal(recovered.recovered, 1);
+  assert.equal(sends, 1, 'callback recovery must never make a second FCM attempt');
+  assert.deepEqual(recoveredDelivery, { sent: false, deadToken: true, recovered: true });
+  summary = await restarted.intentStore.summary();
+  assert.equal(summary.callbackPending, 0);
+  assert.equal(summary.permanentInvalidTokenResponsesTotal, 1);
+  assert.equal(summary.uniqueDeadTokenCleanupsTotal, 1);
+});
+
+test('permanent invalid-token responses count raw attempts and unique token lifecycles durably', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'tubepulse-invalid-token-totals-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  let now = Date.parse('2026-10-10T18:01:00Z');
+  const store = new DurableNotificationIntentStore(directory, { now: () => now });
+  const permanent = {
+    sent: false,
+    deadToken: true,
+    permanentInvalidTokenClass: 'unregistered',
+  };
+  const staged = await store.stage([
+    intent({ contentIds: ['video-one'] }),
+    intent({ contentIds: ['video-two'] }),
+  ]);
+  for (const entry of staged) {
+    await store.claim(entry.id);
+    await store.sent(entry.id, permanent);
+  }
+  // Re-applying a durable result is callback/restart recovery, not another
+  // FCM attempt, so neither raw nor unique totals may move.
+  await store.sent(staged[0].id, permanent);
+
+  let summary = await store.summary();
+  assert.equal(summary.fcmFailedTotal, 2);
+  assert.equal(summary.permanentInvalidTokenResponsesTotal, 2);
+  assert.equal(summary.uniqueDeadTokenCleanupsTotal, 1);
+  assert.deepEqual(summary.invalidTokenEvents, [{
+    bucket: '2026-10-10T18:00:00.000Z',
+    permanentResponses: 2,
+    uniqueCleanups: 1,
+  }]);
+  assert.equal(summary.invalidTokenMonitoringCutoverAt, '2026-10-10T18:01:00.000Z');
+  assert.doesNotMatch(JSON.stringify(summary), /synthetic-fcm|[a-f0-9]{64}/);
+
+  // Restart plus another transient intent for the same token is another raw
+  // FCM response but still the same cleaned token lifecycle.
+  now = Date.parse('2026-10-10T18:06:00Z');
+  const restarted = new DurableNotificationIntentStore(directory, { now: () => now });
+  await restarted.recordTransientOutcome(permanent, intent({ kind: 'nag' }));
+  summary = await restarted.summary();
+  assert.equal(summary.permanentInvalidTokenResponsesTotal, 3);
+  assert.equal(summary.uniqueDeadTokenCleanupsTotal, 1);
+
+  // A replacement registration token is a new lifecycle even on the same
+  // device and can later generate its own unique cleanup event.
+  await restarted.recordTransientOutcome(
+    { ...permanent, permanentInvalidTokenClass: 'http-404' },
+    intent({ kind: 'nag', fcmToken: 'replacement-fcm' }),
+  );
+  summary = await restarted.summary();
+  assert.equal(summary.permanentInvalidTokenResponsesTotal, 4);
+  assert.equal(summary.uniqueDeadTokenCleanupsTotal, 2);
+  assert.deepEqual(summary.invalidTokenEvents.at(-1), {
+    bucket: '2026-10-10T18:05:00.000Z',
+    permanentResponses: 2,
+    uniqueCleanups: 1,
+  });
+});
+
+test('invalid-token metrics exclude ordinary failures and age graph buckets without losing totals', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'tubepulse-invalid-token-aging-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  let now = Date.parse('2026-10-10T10:01:00Z');
+  const store = new DurableNotificationIntentStore(directory, { now: () => now });
+  await store.recordTransientOutcome({ sent: false, deadToken: false }, intent({ kind: 'nag' }));
+  await store.recordTransientOutcome({ sent: false, deadToken: true }, intent({ kind: 'nag' }));
+  await store.recordTransientOutcome({
+    sent: false, deadToken: true, permanentInvalidTokenClass: 'permission-denied',
+  }, intent({ kind: 'nag' }));
+  let summary = await store.summary();
+  assert.equal(summary.fcmFailedTotal, 3);
+  assert.equal(summary.permanentInvalidTokenResponsesTotal, 0);
+  assert.equal(summary.uniqueDeadTokenCleanupsTotal, 0);
+
+  await store.recordTransientOutcome({
+    sent: false, deadToken: true, permanentInvalidTokenClass: 'not-registered',
+  }, intent({ kind: 'nag' }));
+  assert.equal((await store.summary()).invalidTokenEvents.length, 1);
+  now += 49 * 60 * 60 * 1000;
+  await store.recordTransientOutcome({ sent: true, deadToken: false }, intent({ kind: 'nag' }));
+  summary = await store.summary();
+  assert.equal(summary.invalidTokenEvents.length, 0);
+  assert.equal(summary.permanentInvalidTokenResponsesTotal, 1);
+  assert.equal(summary.uniqueDeadTokenCleanupsTotal, 1);
+});
+
+test('malformed invalid-token observability state cannot block delivery accounting or cleanup callback work', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'tubepulse-invalid-token-best-effort-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const store = new DurableNotificationIntentStore(directory, { now: () => Date.parse('2026-10-10T18:01:00Z') });
+  await store.stateFile.write({
+    schemaVersion: 3,
+    records: {},
+    deliveryMetrics: { fcmAcceptedTotal: 0, fcmFailedTotal: 0 },
+    invalidTokenMetrics: 'malformed-observability-only-state',
+  });
+  await assert.doesNotReject(store.recordTransientOutcome({
+    sent: false, deadToken: true, permanentInvalidTokenClass: 'unregistered',
+  }, intent({ kind: 'nag' })));
+  const summary = await store.summary();
+  assert.equal(summary.fcmFailedTotal, 1, 'authoritative FCM outcome accounting remains available');
+  assert.equal(summary.permanentInvalidTokenResponsesTotal, 1, 'malformed optional monitoring is repaired safely');
+  assert.equal(summary.uniqueDeadTokenCleanupsTotal, 1);
+});
+
 test('a transient nag on the fallback route is discarded without a durable record', async (t) => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'tubepulse-route-nag-'));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
@@ -495,7 +738,10 @@ test('legacy pending nags expire without FCM or watermark callbacks', async (t) 
   assert.equal(state.records[id].delivery, 'expired');
   assert.equal(state.records[id].suppressionReason, 'transient-nag-expired');
   assert.equal(state.records[id].callbackApplied, true);
-  assert.equal((await store.summary()).transientExpired, 1);
+  const summary = await store.summary();
+  assert.equal(summary.transientExpired, 1);
+  assert.equal(summary.fcmAcceptedTotal, 0, 'legacy history is not reconstructed as a false counter spike');
+  assert.equal(summary.fcmFailedTotal, 0);
 });
 
 test('an already-claimed legacy nag remains immutable and is never replayed', async (t) => {

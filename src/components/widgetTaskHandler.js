@@ -3,7 +3,7 @@ import { Linking } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { TubePulseWidget } from './TubePulseWidget';
 import { getChannels, getSettings, getLastSeen, saveLastSeen, getChannelCache, saveChannelCache } from '../utils/storage';
-import { fetchFeed, getDeviceId, markSeen } from '../utils/api';
+import { fetchFeed, getDeviceId, markSeen, markSeenBatch } from '../utils/api';
 import {
   formatCompactAge,
   getPostSeenId,
@@ -204,7 +204,7 @@ async function markAllSeen(handle) {
     await enqueueSeenMutation({
       storage: AsyncStorage, channelId, contentIds: [...videoIds, ...postIds],
     });
-    flushSeenMutationQueue({ storage: AsyncStorage, deviceId, persist: markSeen }).catch(() => {});
+    flushSeenMutationQueue({ storage: AsyncStorage, deviceId, persist: markSeen, persistBatch: markSeenBatch }).catch(() => {});
   }
 }
 
@@ -229,7 +229,7 @@ async function markWidgetVideoSeen(handle, videoId) {
   const deviceId = await getDeviceId();
   if (channelId) {
     await enqueueSeenMutation({ storage: AsyncStorage, channelId, contentIds: [videoId] });
-    flushSeenMutationQueue({ storage: AsyncStorage, deviceId, persist: markSeen }).catch(() => {});
+    flushSeenMutationQueue({ storage: AsyncStorage, deviceId, persist: markSeen, persistBatch: markSeenBatch }).catch(() => {});
   }
 }
 
@@ -255,7 +255,7 @@ async function markWidgetPostSeen(handle, postId) {
   const deviceId = await getDeviceId();
   if (channelId) {
     await enqueueSeenMutation({ storage: AsyncStorage, channelId, contentIds: [postKey] });
-    flushSeenMutationQueue({ storage: AsyncStorage, deviceId, persist: markSeen }).catch(() => {});
+    flushSeenMutationQueue({ storage: AsyncStorage, deviceId, persist: markSeen, persistBatch: markSeenBatch }).catch(() => {});
   }
 }
 

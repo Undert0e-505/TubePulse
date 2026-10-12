@@ -273,6 +273,15 @@ export async function fetchFeed(deviceId) {
   });
 }
 
+/** Mark exact content snapshots across multiple channels in one request. */
+export async function markSeenBatch(deviceId, channels) {
+  return await apiFetch('/seen', {
+    method: 'POST',
+    deviceId,
+    body: { channels },
+  });
+}
+
 /**
  * Fetch the public, privacy-safe notification service status. This route is
  * intentionally unauthenticated and contains no installation information.

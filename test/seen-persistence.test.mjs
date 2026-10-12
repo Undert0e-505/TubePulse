@@ -96,11 +96,51 @@ test('concurrent enqueue during flush is not dropped when the snapshot succeeds'
   assert.deepEqual((await readSeenMutationQueue(storage)).intents[0].contentIds, ['video-b']);
 });
 
+test('batch flush sends channel snapshots once and preserves a concurrent newer ID', async () => {
+  const storage = new MemoryStorage();
+  await enqueueSeenMutation({ storage, channelId: 'channel-a', contentIds: ['a1'] });
+  await enqueueSeenMutation({ storage, channelId: 'channel-b', contentIds: ['b1'] });
+  let requests = 0;
+  const result = await flushSeenMutationQueue({
+    storage,
+    deviceId: 'device',
+    persistBatch: async (_deviceId, channels) => {
+      requests++;
+      assert.deepEqual(channels, [
+        { channelId: 'channel-a', contentIds: ['a1'] },
+        { channelId: 'channel-b', contentIds: ['b1'] },
+      ]);
+      await enqueueSeenMutation({ storage, channelId: 'channel-a', contentIds: ['newer'] });
+      return { ok: true };
+    },
+  });
+  assert.equal(requests, 1);
+  assert.equal(result.confirmed, 2);
+  const queue = await readSeenMutationQueue(storage);
+  assert.equal(queue.intents.length, 1);
+  assert.equal(queue.intents[0].channelId, 'channel-a');
+  assert.deepEqual(queue.intents[0].contentIds, ['newer']);
+});
+
+test('failed batch remains queued with bounded retry metadata', async () => {
+  const storage = new MemoryStorage();
+  await enqueueSeenMutation({ storage, channelId: 'channel-a', contentIds: ['a1'], now: () => 1_000 });
+  const result = await flushSeenMutationQueue({
+    storage, deviceId: 'device', persistBatch: async () => ({ ok: false }), now: () => 2_000,
+  });
+  assert.equal(result.confirmed, 0);
+  const queue = await readSeenMutationQueue(storage);
+  assert.equal(queue.intents[0].attempts, 1);
+  assert.ok(queue.intents[0].nextAttemptAt > 2_000);
+});
+
 test('Home no longer renders a persistence banner or queues delayed clearAll', async () => {
   const source = await fs.readFile(new URL('../src/screens/HomeScreen.js', import.meta.url), 'utf8');
   assert.equal(source.includes('Seen status wasn’t saved'), false);
   assert.equal(source.includes('contentIds: allIds'), true);
   assert.equal(source.includes('markSeen(deviceId, channelId, [], true)'), false);
+  assert.match(source, /videos: cached\.videos\.map\(\(v\) => idSet\.has\(v\.videoId\)/);
+  assert.match(source, /posts: cached\.posts\.map\(\(post\) => idSet\.has\(getPostSeenId\(post\)\)/);
 });
 
 test('notification and widget tap paths enqueue exact IDs instead of fire-and-forget clearAll', async () => {

@@ -248,6 +248,7 @@ async function runNag(env, ctx, now) {
           body: video?.title || 'Unwatched video',
           data: {
             videoId: itemId, channelId, channelName,
+            contentIds: JSON.stringify([itemId]),
             videoLink: video?.link || `https://www.youtube.com/watch?v=${itemId}`,
             type: 'nag', notificationTag: videoNotificationTag(channelId),
             tapAction: String(effective.tapAction),

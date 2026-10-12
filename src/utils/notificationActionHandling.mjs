@@ -1,7 +1,7 @@
-import { isNotificationAction } from './localNotificationSilence.mjs';
+import { isSilenceNotificationAction } from './localNotificationSilence.mjs';
 
 export function notificationActionDetails(response) {
-  if (!response || !isNotificationAction(response.actionIdentifier)) return null;
+  if (!response || !isSilenceNotificationAction(response.actionIdentifier)) return null;
   const request = response?.notification?.request;
   return {
     actionIdentifier: response.actionIdentifier,

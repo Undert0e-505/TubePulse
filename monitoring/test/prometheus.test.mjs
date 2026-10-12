@@ -27,7 +27,17 @@ test('Prometheus exposition contains aggregate labels and excludes identifiers',
         },
         youtube: { general: {}, statistics: {} },
         liveWatch: { enabled: true, units: 30, requests: 30, dailyCap: 2000, remaining: 1970, ratio: 0.015, active: 2, inWindow: 1, degraded: false },
-        notifications: { pending: 2, oldestPendingAgeSeconds: 75, durableBacklog: 1 },
+        notifications: {
+          pending: 2, oldestPendingAgeSeconds: 75, durableBacklog: 1,
+          fcmAcceptedTotal: 123, fcmFailedTotal: 4,
+          fcmAcceptedInterval: 3, fcmFailedInterval: 1,
+          permanentInvalidTokenResponsesTotal: 3,
+          uniqueDeadTokenCleanupsTotal: 2,
+          invalidTokenMonitoringCutoverAt: '2026-10-10T17:00:00.000Z',
+          invalidTokenEvents: [{
+            bucket: '2026-10-10T17:20:00.000Z', permanentResponses: 2, uniqueCleanups: 1,
+          }],
+        },
         authority: {
           pendingBackupKeys: 2,
           pendingBackupConsecutiveSamples: 1,
@@ -54,6 +64,23 @@ test('Prometheus exposition contains aggregate labels and excludes identifiers',
   assert.match(metrics, /tubepulse_notifications_pending 2/);
   assert.match(metrics, /tubepulse_notifications_oldest_pending_age_seconds 75/);
   assert.match(metrics, /tubepulse_notifications_durable_backlog 1/);
+  assert.match(metrics, /# HELP tubepulse_notifications_fcm_accepted_total FCM send requests accepted successfully by Firebase; this does not confirm handset delivery\./);
+  assert.match(metrics, /# TYPE tubepulse_notifications_fcm_accepted_total counter/);
+  assert.match(metrics, /tubepulse_notifications_fcm_accepted_total 123/);
+  assert.match(metrics, /# TYPE tubepulse_notifications_fcm_failed_total counter/);
+  assert.match(metrics, /tubepulse_notifications_fcm_failed_total 4/);
+  assert.match(metrics, /# TYPE tubepulse_notifications_fcm_permanent_invalid_responses_total counter/);
+  assert.match(metrics, /tubepulse_notifications_fcm_permanent_invalid_responses_total 3/);
+  assert.match(metrics, /# TYPE tubepulse_notifications_dead_token_cleanups_total counter/);
+  assert.match(metrics, /tubepulse_notifications_dead_token_cleanups_total 2/);
+  assert.match(metrics, /tubepulse_notifications_invalid_token_monitoring_cutover_timestamp_seconds 1791651600/);
+  assert.match(metrics, /# TYPE tubepulse_notifications_invalid_token_events gauge/);
+  assert.match(metrics, /tubepulse_notifications_invalid_token_events\{bucket="2026-10-10T17:20:00\.000Z",event="response"\} 2/);
+  assert.match(metrics, /tubepulse_notifications_invalid_token_events\{bucket="2026-10-10T17:20:00\.000Z",event="cleanup"\} 1/);
+  assert.match(metrics, /# TYPE tubepulse_notifications_fcm_accepted_interval gauge/);
+  assert.match(metrics, /tubepulse_notifications_fcm_accepted_interval 3/);
+  assert.match(metrics, /# TYPE tubepulse_notifications_fcm_failed_interval gauge/);
+  assert.match(metrics, /tubepulse_notifications_fcm_failed_interval 1/);
   assert.match(metrics, /tubepulse_authority_pending_backup_keys 2/);
   assert.match(metrics, /tubepulse_authority_pending_backup_consecutive_samples 1/);
   assert.match(metrics, /tubepulse_authority_transaction_active 1/);

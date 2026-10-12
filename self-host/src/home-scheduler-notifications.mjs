@@ -69,6 +69,11 @@ function isTransientIntent(intent) {
 // after an intent has remained pending long enough to miss the normal send
 // window. The raw pending count remains available for activity charts.
 const DURABLE_BACKLOG_GRACE_MS = 60_000;
+const INVALID_TOKEN_BUCKET_MS = 5 * 60 * 1000;
+const INVALID_TOKEN_HISTORY_RETENTION_MS = 48 * 60 * 60 * 1000;
+const INVALID_TOKEN_LIFECYCLE_RETENTION_MS = 365 * 24 * 60 * 60 * 1000;
+const MAX_INVALID_TOKEN_LIFECYCLES = 10_000;
+const PERMANENT_INVALID_TOKEN_CLASSES = new Set(['http-404', 'unregistered', 'not-registered']);
 
 function expirePendingTransientRecords(state, now, reason = 'transient-nag-expired') {
   let expired = 0;
@@ -85,11 +90,114 @@ function expirePendingTransientRecords(state, now, reason = 'transient-nag-expir
   return expired;
 }
 
+function ensureDeliveryMetrics(state) {
+  state.schemaVersion = Math.max(3, Number(state.schemaVersion) || 1);
+  state.deliveryMetrics ||= {};
+  state.deliveryMetrics.fcmAcceptedTotal = Math.max(0, Number(state.deliveryMetrics.fcmAcceptedTotal) || 0);
+  state.deliveryMetrics.fcmFailedTotal = Math.max(0, Number(state.deliveryMetrics.fcmFailedTotal) || 0);
+  return state.deliveryMetrics;
+}
+
+function bucketTimestamp(now) {
+  return new Date(Math.floor(Number(now) / INVALID_TOKEN_BUCKET_MS) * INVALID_TOKEN_BUCKET_MS).toISOString();
+}
+
+function tokenLifecycleKey(intent) {
+  const projectId = String(intent?.projectId || '');
+  const fcmToken = String(intent?.fcmToken || '');
+  if (!fcmToken) return null;
+  return crypto.createHash('sha256').update(`${projectId}\0${fcmToken}`).digest('hex');
+}
+
+function ensureInvalidTokenMetrics(state, now) {
+  if (!state.invalidTokenMetrics || typeof state.invalidTokenMetrics !== 'object' || Array.isArray(state.invalidTokenMetrics)) {
+    state.invalidTokenMetrics = {};
+  }
+  const metrics = state.invalidTokenMetrics;
+  if (!Number.isFinite(Date.parse(metrics.cutoverAt))) metrics.cutoverAt = new Date(now).toISOString();
+  metrics.permanentResponseTotal = Math.max(0, Number(metrics.permanentResponseTotal) || 0);
+  metrics.uniqueCleanupTotal = Math.max(0, Number(metrics.uniqueCleanupTotal) || 0);
+  metrics.cleanupLifecycles = metrics.cleanupLifecycles
+    && typeof metrics.cleanupLifecycles === 'object'
+    && !Array.isArray(metrics.cleanupLifecycles)
+    ? metrics.cleanupLifecycles
+    : {};
+  metrics.buckets = metrics.buckets && typeof metrics.buckets === 'object' && !Array.isArray(metrics.buckets)
+    ? metrics.buckets
+    : {};
+
+  const historyCutoff = now - INVALID_TOKEN_HISTORY_RETENTION_MS;
+  for (const [bucket, counts] of Object.entries(metrics.buckets)) {
+    const timestamp = Date.parse(bucket);
+    if (!Number.isFinite(timestamp) || timestamp < historyCutoff || timestamp > now + INVALID_TOKEN_BUCKET_MS) {
+      delete metrics.buckets[bucket];
+      continue;
+    }
+    counts.permanentResponses = Math.max(0, Number(counts.permanentResponses) || 0);
+    counts.uniqueCleanups = Math.max(0, Number(counts.uniqueCleanups) || 0);
+  }
+
+  const lifecycleCutoff = now - INVALID_TOKEN_LIFECYCLE_RETENTION_MS;
+  for (const [lifecycle, observedAt] of Object.entries(metrics.cleanupLifecycles)) {
+    if (!/^[a-f0-9]{64}$/.test(lifecycle) || Number(observedAt) < lifecycleCutoff) {
+      delete metrics.cleanupLifecycles[lifecycle];
+    }
+  }
+  const lifecycleEntries = Object.entries(metrics.cleanupLifecycles);
+  if (lifecycleEntries.length > MAX_INVALID_TOKEN_LIFECYCLES) {
+    lifecycleEntries
+      .sort((left, right) => Number(left[1]) - Number(right[1]))
+      .slice(0, lifecycleEntries.length - MAX_INVALID_TOKEN_LIFECYCLES)
+      .forEach(([lifecycle]) => { delete metrics.cleanupLifecycles[lifecycle]; });
+  }
+  return metrics;
+}
+
+function recordPermanentInvalidTokenOutcome(state, result, intent, now) {
+  if (!result?.deadToken || !PERMANENT_INVALID_TOKEN_CLASSES.has(result?.permanentInvalidTokenClass)) return;
+  // This is deliberately best-effort within the already-required intent-state
+  // write. A malformed observability field must never block the established
+  // dead-token callback and canonical cleanup path.
+  try {
+    const metrics = ensureInvalidTokenMetrics(state, now);
+    const bucket = bucketTimestamp(now);
+    metrics.buckets[bucket] ||= { permanentResponses: 0, uniqueCleanups: 0 };
+    metrics.permanentResponseTotal++;
+    metrics.buckets[bucket].permanentResponses++;
+    const lifecycle = tokenLifecycleKey(intent);
+    if (lifecycle && !Object.hasOwn(metrics.cleanupLifecycles, lifecycle)) {
+      metrics.cleanupLifecycles[lifecycle] = now;
+      metrics.uniqueCleanupTotal++;
+      metrics.buckets[bucket].uniqueCleanups++;
+    } else if (lifecycle) {
+      metrics.cleanupLifecycles[lifecycle] = now;
+    }
+  } catch {
+    // Cleanup remains authoritative; monitoring cannot make notification
+    // scheduling or dead-device cleanup fail.
+  }
+}
+
+function recordDeliveryOutcome(state, result, intent, now) {
+  const metrics = ensureDeliveryMetrics(state);
+  if (result?.sent) metrics.fcmAcceptedTotal++;
+  else metrics.fcmFailedTotal++;
+  recordPermanentInvalidTokenOutcome(state, result, intent, now);
+}
+
 export class DurableNotificationIntentStore {
   constructor(dataDir, { now = Date.now, maxRecords = 2000 } = {}) {
     this.stateFile = new JsonStateFile(path.join(dataDir, 'home-notification-intents.json'), {
-      schemaVersion: 1,
+      schemaVersion: 3,
       records: {},
+      deliveryMetrics: { fcmAcceptedTotal: 0, fcmFailedTotal: 0 },
+      invalidTokenMetrics: {
+        cutoverAt: null,
+        permanentResponseTotal: 0,
+        uniqueCleanupTotal: 0,
+        cleanupLifecycles: {},
+        buckets: {},
+      },
     });
     this.now = now;
     this.maxRecords = maxRecords;
@@ -99,6 +207,8 @@ export class DurableNotificationIntentStore {
     const state = await this.stateFile.read();
     state.records ||= {};
     const now = this.now();
+    ensureDeliveryMetrics(state);
+    ensureInvalidTokenMetrics(state, now);
     // Reminder notifications are regenerated from current canonical state on
     // every aux cycle. Pending records written by older versions are retained
     // for audit, but must never block or be replayed after this migration.
@@ -158,6 +268,24 @@ export class DurableNotificationIntentStore {
       pending: 0, sending: 0, sent: 0, resolved: 0,
       callbackPending: 0, failed: 0, deadToken: 0, suppressed: 0,
       transientExpired: 0, overduePending: 0, oldestPendingAgeSeconds: 0,
+      fcmAcceptedTotal: Math.max(0, Number(state.deliveryMetrics?.fcmAcceptedTotal) || 0),
+      fcmFailedTotal: Math.max(0, Number(state.deliveryMetrics?.fcmFailedTotal) || 0),
+      permanentInvalidTokenResponsesTotal: Math.max(0, Number(state.invalidTokenMetrics?.permanentResponseTotal) || 0),
+      uniqueDeadTokenCleanupsTotal: Math.max(0, Number(state.invalidTokenMetrics?.uniqueCleanupTotal) || 0),
+      invalidTokenMonitoringCutoverAt: state.invalidTokenMetrics?.cutoverAt || null,
+      invalidTokenEvents: Object.entries(state.invalidTokenMetrics?.buckets || {})
+        .map(([bucket, counts]) => ({
+          bucket,
+          permanentResponses: Math.max(0, Number(counts?.permanentResponses) || 0),
+          uniqueCleanups: Math.max(0, Number(counts?.uniqueCleanups) || 0),
+        }))
+        .filter(({ bucket }) => {
+          const observedAt = Date.parse(bucket);
+          return Number.isFinite(observedAt)
+            && observedAt >= now - INVALID_TOKEN_HISTORY_RETENTION_MS
+            && observedAt <= now + INVALID_TOKEN_BUCKET_MS;
+        })
+        .sort((left, right) => left.bucket.localeCompare(right.bucket)),
     };
     for (const record of Object.values(state.records || {})) {
       if (Object.hasOwn(summary, record.status)) summary[record.status]++;
@@ -166,7 +294,10 @@ export class DurableNotificationIntentStore {
         summary.oldestPendingAgeSeconds = Math.max(summary.oldestPendingAgeSeconds, ageMs / 1000);
         if (ageMs >= DURABLE_BACKLOG_GRACE_MS) summary.overduePending++;
       }
-      if (!record.callbackApplied && ['sending', 'sent'].includes(record.status)) summary.callbackPending++;
+      if (
+        !record.callbackApplied
+        && (['sending', 'sent'].includes(record.status) || record.delivery === 'dead-token')
+      ) summary.callbackPending++;
       if (record.delivery === 'indeterminate') summary.failed++;
       if (record.delivery === 'dead-token') summary.deadToken++;
       if (record.delivery === 'suppressed') summary.suppressed++;
@@ -198,11 +329,25 @@ export class DurableNotificationIntentStore {
   }
 
   async sent(id, result) {
-    return await this.update(id, (record) => {
-      record.status = result?.sent ? 'sent' : 'resolved';
-      record.delivery = result?.sent ? 'sent' : result?.deadToken ? 'dead-token' : 'indeterminate';
-      record.completedAt = this.now();
-    });
+    const state = await this.stateFile.read();
+    const record = state.records?.[id];
+    if (!record) throw new Error('Notification intent record is missing');
+    if (!record.deliveryOutcomeCounted) {
+      recordDeliveryOutcome(state, result, record.intent, this.now());
+      record.deliveryOutcomeCounted = true;
+    }
+    record.status = result?.sent ? 'sent' : 'resolved';
+    record.delivery = result?.sent ? 'sent' : result?.deadToken ? 'dead-token' : 'indeterminate';
+    record.completedAt = this.now();
+    record.updatedAt = this.now();
+    await this.stateFile.write(state);
+    return record;
+  }
+
+  async recordTransientOutcome(result, intent) {
+    const state = await this.stateFile.read();
+    recordDeliveryOutcome(state, result, intent, this.now());
+    await this.stateFile.write(state);
   }
 
   async callbackApplied(id) {
@@ -213,8 +358,14 @@ export class DurableNotificationIntentStore {
     if (kind !== 'nag') return 0;
     const state = await this.stateFile.read();
     state.records ||= {};
-    const expired = expirePendingTransientRecords(state, this.now(), reason);
-    if (expired > 0) await this.stateFile.write(state);
+    const now = this.now();
+    const needsMetricsInitialization = !state.invalidTokenMetrics
+      || typeof state.invalidTokenMetrics !== 'object'
+      || !Number.isFinite(Date.parse(state.invalidTokenMetrics.cutoverAt));
+    ensureDeliveryMetrics(state);
+    ensureInvalidTokenMetrics(state, now);
+    const expired = expirePendingTransientRecords(state, now, reason);
+    if (expired > 0 || needsMetricsInitialization) await this.stateFile.write(state);
     return expired;
   }
 
@@ -237,7 +388,18 @@ export class DurableNotificationIntentStore {
 class MemoryNotificationIntentStore extends DurableNotificationIntentStore {
   constructor() {
     super('.', {});
-    this.state = { schemaVersion: 1, records: {} };
+    this.state = {
+      schemaVersion: 3,
+      records: {},
+      deliveryMetrics: { fcmAcceptedTotal: 0, fcmFailedTotal: 0 },
+      invalidTokenMetrics: {
+        cutoverAt: null,
+        permanentResponseTotal: 0,
+        uniqueCleanupTotal: 0,
+        cleanupLifecycles: {},
+        buckets: {},
+      },
+    };
     this.stateFile = {
       read: async () => structuredClone(this.state),
       write: async (value) => { this.state = structuredClone(value); },
@@ -478,9 +640,13 @@ export class ProductionNotificationCoordinator {
       // restart: the FCM call may have escaped before the process stopped.
       // Apply the deterministic local watermark through the freshly-created
       // callback, but never call FCM again.
-      if (!entry.record.callbackApplied && ['sending', 'sent'].includes(entry.record.status)) {
+      const recoverableCallback = ['sending', 'sent'].includes(entry.record.status)
+        || (entry.record.status === 'resolved' && entry.record.delivery === 'dead-token');
+      if (!entry.record.callbackApplied && recoverableCallback) {
         try {
-          await entry.intent.onResult?.({ sent: true, deadToken: false, recovered: true });
+          await entry.intent.onResult?.(entry.record.delivery === 'dead-token'
+            ? { sent: false, deadToken: true, recovered: true }
+            : { sent: true, deadToken: false, recovered: true });
           await this.intentStore.callbackApplied(entry.id);
         } catch { callbackFailures++; }
       }
@@ -543,6 +709,8 @@ export class ProductionNotificationCoordinator {
       }
       if (!entry.transient) {
         await this.intentStore.sent(entry.id, result || { sent: false, deadToken: false });
+      } else {
+        await this.intentStore.recordTransientOutcome(result || { sent: false, deadToken: false }, intent);
       }
       if (result?.sent) sent++;
       else failed++;

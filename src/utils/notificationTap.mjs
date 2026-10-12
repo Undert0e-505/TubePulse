@@ -19,7 +19,11 @@ function normalizeIds(value) {
 export function parseNotificationContentIds(data = {}) {
   const contentIds = normalizeIds(data.contentIds);
   if (contentIds.length) return contentIds;
-  return normalizeIds(data.videoIds);
+  const videoIds = normalizeIds(data.videoIds);
+  if (videoIds.length) return videoIds;
+  if (typeof data.activityId === 'string' && data.activityId.trim()) return [`post:${data.activityId.trim()}`];
+  if (typeof data.videoId === 'string' && data.videoId.trim()) return [data.videoId.trim()];
+  return [];
 }
 
 export function resolveNotificationTapAction(payloadAction, localAction = 'video') {

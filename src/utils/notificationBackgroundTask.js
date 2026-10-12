@@ -1,7 +1,11 @@
 import * as Notifications from 'expo-notifications';
 import * as TaskManager from 'expo-task-manager';
 import { isNotificationAction } from './localNotificationSilence.mjs';
-import { processLocalNotificationActionResponse } from './notificationActionRuntime';
+import {
+  processLocalNotificationActionResponse,
+  processNotificationSeenResponse,
+} from './notificationActionRuntime';
+import { NOTIFICATION_ACTIONS } from './localNotificationSilence.mjs';
 import { createRetryableAsyncSetup } from './retryableAsyncSetup.mjs';
 
 export const LOCAL_NOTIFICATION_RESPONSE_TASK = 'TUBEPULSE_LOCAL_NOTIFICATION_RESPONSE';
@@ -12,7 +16,11 @@ if (!TaskManager.isTaskDefined(LOCAL_NOTIFICATION_RESPONSE_TASK)) {
   TaskManager.defineTask(LOCAL_NOTIFICATION_RESPONSE_TASK, async ({ data, error }) => {
     if (error || !data || typeof data !== 'object' || !('actionIdentifier' in data)) return;
     if (!isNotificationAction(data.actionIdentifier)) return;
-    await processLocalNotificationActionResponse(data);
+    if (data.actionIdentifier === NOTIFICATION_ACTIONS.MARK_SEEN) {
+      await processNotificationSeenResponse(data);
+    } else {
+      await processLocalNotificationActionResponse(data);
+    }
   });
 }
 

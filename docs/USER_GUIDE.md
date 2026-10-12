@@ -49,6 +49,8 @@ the backend's detection or notification behavior.
 - Tap a community post to open that channel's community surface.
 - Long-press a video to copy its link.
 - Pull to refresh to request the current feed.
+- Use the right-aligned **Mark seen** control on a channel heading to clear that channel without
+  opening YouTube. **Mark all seen** appears above the list only while unseen content exists.
 
 TubePulse updates seen state locally first. If the service or network is unavailable, exact content
 IDs remain in a durable local queue and retry later on normal app lifecycle and refresh
@@ -115,24 +117,28 @@ different quiet hours from the global settings.
 
 ### Temporarily mute notification sound
 
-Expand a TubePulse notification to use **Mute channel 1hr**, **Mute channel 8hr** or **Mute all**.
-These controls are device-local and affect sound only: later notifications still arrive, remain in
+Expand a normal single-item TubePulse notification to use **Mute 1h**, **Mute 8h** or **Mark seen**,
+in that order. **Mark seen** clears exactly the item represented by that notification without
+opening YouTube. A channel bundle clears exactly its bundled snapshot. Newer content that arrives
+after the notification was created remains unseen.
+The mute controls are device-local and affect sound only: later notifications still arrive, remain in
 the Android notification shade, update the feed/widget, and keep their ordinary unseen/reminder
 state. Pressing a mute action does not open YouTube or mark anything seen.
 After the local mute is saved, the notification you acted on is dismissed as acknowledgement. If
 local storage fails, the notification remains visible instead of pretending the mute succeeded.
-While that channel is locally silent, later notifications offer **Unmute channel** instead of more
-mute actions. During **Mute all**, a still-silent channel offers **Unmute channel** and **Unmute
-all**. The first makes only that channel audible while global silence remains active; the second
+While that channel is locally silent, later notifications offer **Unmute channel** and **Mark seen**.
+During **Mute all**, a still-silent channel offers **Unmute channel**, **Unmute all** and **Mark seen**.
+The first makes only that channel audible while global silence remains active; the second
 clears global silence, timed channel mutes and audible exceptions. Successful unmute actions also
 dismiss only the notification used for the action.
 
-Android can collapse several TubePulse alerts under an automatic summary. The summary itself is
-system-generated and does not carry TubePulse controls; expand the group and then the individual
-notification to reveal its mute actions.
+Channel bundle notifications expose **Mute all** and exact-snapshot **Mark seen** alongside the
+channel mute action. Livestream prewarnings intentionally omit **Mark seen** because a prewarning
+does not participate in unseen state.
 
 Temporary channel mutes expire automatically using their saved end time and survive an app or phone
-restart. While a channel is muted, its Home feed heading shows **Silent until HH:MM** and **Unmute**.
+restart. Home always provides a compact **Mute all** control. While a channel is muted, its Home feed
+heading shows **Silent until HH:MM** and **Unmute**.
 During **Mute all**, each still-silent channel instead shows **Silent** and **Unmute**; unmuting a row
 makes that channel an audible exception without disabling global silence. **Mute all** lasts until
 **Unmute all** is pressed at the top of Home; that button clears both global and channel-specific

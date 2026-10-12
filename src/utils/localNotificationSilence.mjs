@@ -2,6 +2,8 @@ export const LOCAL_NOTIFICATION_CAPABILITY = 'local-v1';
 export const LOCAL_NOTIFICATION_CATEGORY = 'tubepulse_local_mute';
 export const LOCAL_NOTIFICATION_CHANNEL_MUTED_CATEGORY = 'tubepulse_local_channel_muted';
 export const LOCAL_NOTIFICATION_GLOBAL_MUTED_CATEGORY = 'tubepulse_local_global_muted';
+export const LOCAL_NOTIFICATION_GROUP_CATEGORY = 'tubepulse_local_group';
+export const LOCAL_NOTIFICATION_PREWARN_CATEGORY = 'tubepulse_local_prewarn';
 export const LOCAL_NOTIFICATION_SILENCE_STORAGE_KEY = '@tubepulse/local-notification-silence-v1';
 
 export const NOTIFICATION_ACTIONS = Object.freeze({
@@ -10,6 +12,7 @@ export const NOTIFICATION_ACTIONS = Object.freeze({
   MUTE_ALL: 'TUBEPULSE_MUTE_ALL',
   UNMUTE_CHANNEL: 'TUBEPULSE_UNMUTE_CHANNEL',
   UNMUTE_ALL: 'TUBEPULSE_UNMUTE_ALL',
+  MARK_SEEN: 'TUBEPULSE_MARK_SEEN',
 });
 
 const ACTION_DURATIONS_MS = Object.freeze({
@@ -143,7 +146,20 @@ export function isNotificationAction(actionIdentifier) {
   return Object.values(NOTIFICATION_ACTIONS).includes(actionIdentifier);
 }
 
+export function notificationCategoryForData(localPresentation, data = {}) {
+  if (localPresentation?.silent) return localPresentation.categoryIdentifier;
+  if (data.type === 'prewarn') return LOCAL_NOTIFICATION_PREWARN_CATEGORY;
+  if (data.type === 'batch') return LOCAL_NOTIFICATION_GROUP_CATEGORY;
+  return localPresentation?.categoryIdentifier || LOCAL_NOTIFICATION_CATEGORY;
+}
+
+export function isSilenceNotificationAction(actionIdentifier) {
+  return isNotificationAction(actionIdentifier)
+    && actionIdentifier !== NOTIFICATION_ACTIONS.MARK_SEEN;
+}
+
 export function notificationResponseRoute(actionIdentifier, defaultActionIdentifier) {
-  if (isNotificationAction(actionIdentifier)) return 'silence';
+  if (actionIdentifier === NOTIFICATION_ACTIONS.MARK_SEEN) return 'seen';
+  if (isSilenceNotificationAction(actionIdentifier)) return 'silence';
   return actionIdentifier === defaultActionIdentifier ? 'default' : 'ignore';
 }

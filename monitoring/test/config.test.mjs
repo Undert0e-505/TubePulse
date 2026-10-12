@@ -53,7 +53,7 @@ test('wallboard is a readable one-screen calm health overview', () => {
   const byTitle = new Map(dashboard.panels.map((panel) => [panel.title, panel]));
   for (const title of [
     'TubePulse status', 'Data freshness', 'Host authority', 'Attention', 'Audience & scale', 'Capacity',
-    'Service traffic · 24h', 'Database activity · 24h', 'Notification delivery · 24h',
+    'Service traffic · 24h', 'Database activity · 24h', 'Notifications Sent', 'Invalid tokens · 24h',
   ]) assert.ok(byTitle.has(title), `wallboard is missing ${title}`);
 
   const status = byTitle.get('TubePulse status');
@@ -93,17 +93,33 @@ test('wallboard is a readable one-screen calm health overview', () => {
   const audience = byTitle.get('Audience & scale');
   assert.equal(audience.type, 'text');
   assert.equal(audience.transparent, true);
+  assert.deepEqual(audience.gridPos, { x: 0, y: 4, w: 24, h: 1 });
 
   const audienceTitles = [
     'Backend seen 24h', 'Backend seen 7d', 'Registered', 'Push capable',
-    'Channels', 'Memberships', 'Max / install',
+    'Channels', 'Memberships', 'Max / install', 'Invalid tokens · 24h',
   ];
   const audiencePanels = audienceTitles.map((title) => {
     const panel = byTitle.get(title);
     assert.ok(panel, `audience overview is missing ${title}`);
     return panel;
   });
-  for (const panel of audiencePanels) {
+  assert.deepEqual(
+    audiencePanels.map(({ gridPos: { x, y, w, h } }) => ({ x, y, w, h })),
+    [
+      { x: 0, y: 5, w: 6, h: 4 },
+      { x: 6, y: 5, w: 6, h: 4 },
+      { x: 12, y: 5, w: 6, h: 4 },
+      { x: 18, y: 5, w: 6, h: 4 },
+      { x: 0, y: 9, w: 6, h: 4 },
+      { x: 6, y: 9, w: 6, h: 4 },
+      { x: 12, y: 9, w: 6, h: 4 },
+      { x: 18, y: 9, w: 6, h: 4 },
+    ],
+    'Audience & scale must remain an exact two-row by four-column compact metric grid',
+  );
+  const trendAudiencePanels = audiencePanels.filter(({ title }) => title !== 'Invalid tokens · 24h');
+  for (const panel of trendAudiencePanels) {
     assert.equal(panel.type, 'volkovlabs-echarts-panel');
     assert.equal(panel.pluginVersion, '7.1.0');
     assert.equal(panel.transparent, true, `${panel.title} should read as part of one quiet group`);
@@ -216,6 +232,7 @@ test('wallboard is a readable one-screen calm health overview', () => {
       'tubepulse_channels_active',
       'tubepulse_subscriptions_configured_memberships',
       'tubepulse_channels_per_install{statistic="max"}',
+      'tubepulse_notifications_invalid_token_events{event="cleanup"}',
     ],
   );
   assert.match(byTitle.get('Backend seen 24h').description, /successful authenticated backend contact/);
@@ -232,14 +249,138 @@ test('wallboard is a readable one-screen calm health overview', () => {
   const liveWatch = capacity.targets.find(({ legendFormat }) => legendFormat === 'Live watch');
   assert.ok(liveWatch);
   assert.equal(liveWatch.expr, '100 * tubepulse_live_watch_quota_ratio');
+  assert.deepEqual(
+    ['Capacity', 'Service traffic · 24h', 'Database activity · 24h', 'Notifications Sent']
+      .map((title) => ({ title, ...byTitle.get(title).gridPos })),
+    [
+      { title: 'Capacity', x: 0, y: 13, w: 6, h: 8 },
+      { title: 'Service traffic · 24h', x: 6, y: 13, w: 6, h: 8 },
+      { title: 'Database activity · 24h', x: 12, y: 13, w: 6, h: 8 },
+      { title: 'Notifications Sent', x: 18, y: 13, w: 6, h: 8 },
+    ],
+    'the operational row must remain four equal panels below Audience & scale',
+  );
 
-  for (const title of ['Service traffic · 24h', 'Database activity · 24h', 'Notification delivery · 24h']) {
+  for (const title of ['Service traffic · 24h', 'Database activity · 24h']) {
     const trend = byTitle.get(title);
     assert.equal(trend.type, 'timeseries');
     assert.ok(trend.gridPos.h >= 8);
     assert.equal(trend.fieldConfig.defaults.custom.axisGridShow, false);
     assert.equal(trend.options.legend.placement, 'bottom');
   }
+
+  const notificationSends = byTitle.get('Notifications Sent');
+  assert.equal(notificationSends.type, 'volkovlabs-echarts-panel');
+  assert.equal(notificationSends.pluginVersion, '7.1.0');
+  assert.deepEqual(
+    notificationSends.targets.map(({ expr, legendFormat, instant, range }) => ({ expr, legendFormat, instant, range })),
+    [
+      {
+        expr: 'tubepulse_notifications_fcm_accepted_interval',
+        legendFormat: 'accepted by FCM',
+        instant: false,
+        range: true,
+      },
+      {
+        expr: 'tubepulse_notifications_fcm_failed_interval',
+        legendFormat: 'failed FCM send',
+        instant: false,
+        range: true,
+      },
+    ],
+  );
+  assert.match(notificationSends.description, /settled five-minute UTC collector samples/);
+  assert.match(notificationSends.description, /Collection runs at :30/);
+  assert.match(notificationSends.description, /precise-live sends can occur between ticks/);
+  assert.match(notificationSends.description, /does not confirm handset delivery/);
+  assert.match(notificationSends.description, /exact deltas from persisted counters/);
+  const renderNotifications = new Function('context', notificationSends.options.getOption);
+  const chart = renderNotifications({ panel: { data: {
+    timeRange: {
+      from: { valueOf: () => Date.parse('2026-10-09T17:24:18.325Z') },
+      to: { valueOf: () => Date.parse('2026-10-10T17:35:30Z') },
+    },
+    series: [
+      {
+        refId: 'A',
+        fields: [
+          { type: 'time', values: [Date.parse('2026-10-10T17:25:00Z'), Date.parse('2026-10-10T17:30:30Z')] },
+          { type: 'number', values: [0, 17] },
+        ],
+      },
+      {
+        refId: 'B',
+        fields: [
+          { type: 'time', values: [Date.parse('2026-10-10T17:25:00Z')] },
+          { type: 'number', values: [0] },
+        ],
+      },
+    ],
+  } } });
+  assert.equal(chart.series[0].name, 'accepted by FCM');
+  assert.equal(chart.series[1].name, 'failed FCM send');
+  assert.equal(chart.series[0].step, 'end');
+  assert.ok(chart.series[0].data.some(([time, value]) => time === Date.parse('2026-10-10T17:30:30Z') && value === 17));
+  assert.doesNotMatch(JSON.stringify(notificationSends.targets), /tubepulse_notifications_(sent|failed)\"/);
+  assert.match(JSON.stringify(byTitle.get('Attention').targets), /tubepulse_notifications_durable_backlog/);
+
+  const invalidTokens = byTitle.get('Invalid tokens · 24h');
+  assert.equal(invalidTokens.type, 'volkovlabs-echarts-panel');
+  assert.equal(invalidTokens.pluginVersion, '7.1.0');
+  assert.equal(invalidTokens.transparent, true);
+  assert.equal(invalidTokens.fieldConfig.defaults.color.fixedColor, '#4FC3F7');
+  assert.deepEqual(invalidTokens.gridPos, { x: 18, y: 9, w: 6, h: 4 });
+  assert.deepEqual(invalidTokens.targets, [{
+    expr: 'tubepulse_notifications_invalid_token_events{event="cleanup"}',
+    legendFormat: 'unique cleanup', refId: 'A', instant: true, range: false,
+  }]);
+  assert.match(invalidTokens.description, /not proof of an uninstall/);
+  assert.match(invalidTokens.description, /normal lifecycle evidence rather than a service fault/);
+  assert.doesNotMatch(JSON.stringify(status.targets), /invalid_token|dead_token/);
+  assert.doesNotMatch(JSON.stringify(attention.targets), /invalid_token|dead_token/);
+  const renderInvalidTokens = new Function('context', invalidTokens.options.getOption);
+  assert.match(invalidTokens.options.getOption, /const valueSize = width < 210 \? 23 : width < 420 \? 32 : 38/);
+  assert.match(invalidTokens.options.getOption, /const graphLeft = width < 210 \? '44%' : '40%'/);
+  assert.match(invalidTokens.options.getOption, /xAxis: \{ type: 'time', show: true/);
+  assert.match(invalidTokens.options.getOption, /splitNumber: width < 300 \? 2 : 3/);
+  assert.match(invalidTokens.options.getOption, /width < 300 && index % 2 === 1/);
+  const invalidChart = renderInvalidTokens({
+    panel: {
+      chart: { getWidth: () => 200 },
+      data: {
+        timeRange: {
+          from: { valueOf: () => Date.parse('2026-10-09T18:00:00Z') },
+          to: { valueOf: () => Date.parse('2026-10-10T18:00:00Z') },
+        },
+        series: [
+          { fields: [{ type: 'number', labels: { bucket: '2026-10-09T17:55:00.000Z' }, values: [9] }] },
+          { fields: [{ type: 'number', labels: { bucket: '2026-10-10T17:50:00.000Z' }, values: [1] }] },
+          { fields: [{ type: 'number', labels: { bucket: '2026-10-10T17:55:00.000Z' }, values: [3] }] },
+        ],
+      },
+    },
+  });
+  assert.equal(invalidChart.graphic[0].style.text, '4');
+  assert.equal(invalidChart.xAxis.min, Date.parse('2026-10-09T18:00:00Z'));
+  assert.equal(invalidChart.xAxis.max, Date.parse('2026-10-10T18:00:00Z'));
+  assert.ok(invalidChart.series[0].data.some(([time, value]) => (
+    time === Date.parse('2026-10-10T17:50:00Z') && value === 1
+  )));
+  assert.ok(invalidChart.series[0].data.some(([time, value]) => (
+    time === Date.parse('2026-10-10T17:55:00Z') && value === 3
+  )));
+  assert.equal(invalidChart.series[0].data.some(([time]) => time < Date.parse('2026-10-09T18:00:00Z')), false);
+
+  const invalidDiagnostics = new Map(
+    JSON.parse(read('monitoring', 'grafana', 'dashboards', 'tubepulse-diagnostics.json'))
+      .panels.map((panel) => [panel.title, panel]),
+  ).get('Permanent invalid FCM tokens');
+  assert.ok(invalidDiagnostics);
+  assert.match(invalidDiagnostics.description, /not confirmed uninstalls or a health fault/);
+  assert.deepEqual(invalidDiagnostics.targets.map(({ expr }) => expr), [
+    'tubepulse_notifications_fcm_permanent_invalid_responses_total',
+    'tubepulse_notifications_dead_token_cleanups_total',
+  ]);
 
   const serialized = JSON.stringify(dashboard);
   for (const sensitive of ['deviceId', 'channelId', 'fcmToken', 'installationId']) {
@@ -329,7 +470,11 @@ test('every dashboard target is well formed and references an exported or record
       host: {
         host: {}, installs: { new: { h24: 0 }, active: { h24: 0 }, appVersions: [{ version: '4.0.0', count: 0 }] },
         subscriptions: { integrityIssues: {}, perInstall: {} }, youtube: { general: {}, statistics: {} },
-        notifications: {}, authority: { estimatedRows: {}, limits: {} },
+        notifications: {
+          invalidTokenEvents: [{
+            bucket: '2026-10-06T00:00:00.000Z', permanentResponses: 1, uniqueCleanups: 1,
+          }],
+        }, authority: { estimatedRows: {}, limits: {} },
       },
       cloudflare: {
         window: { workers: [{ script: 'active', status: 'success' }], d1: {}, durableObjects: {} },
@@ -367,6 +512,8 @@ test('compose keeps collector and Prometheus on loopback and defaults Grafana to
   assert.match(compose, /GF_PLUGINS_PREINSTALL_SYNC:\s*volkovlabs-echarts-panel@7\.1\.0/);
   assert.doesNotMatch(compose, /volkovlabs-echarts-panel@(latest|7\.2\.)/);
   assert.match(compose, /retention\.size=5GB/);
+  assert.doesNotMatch(compose, /TUBEPULSE_NOTIFICATION_BACKFILL_FILE/);
+  assert.doesNotMatch(read('monitoring', 'Dockerfile'), /COPY backfill/);
 });
 
 test('Grafana LAN firewall helper is narrowly scoped and supports safe dry-run', { skip: process.platform !== 'win32' }, () => {
@@ -397,7 +544,15 @@ test('production supervisor starts monitoring asynchronously and best-effort', (
   assert.match(source, /function Start-MonitoringBestEffort/);
   assert.match(source, /Start-Process[^\n]+-WindowStyle Hidden/);
   assert.match(source, /production authority remains unaffected/);
-  assert.match(source, /if \(\$evaluation\.Success\)[\s\S]{0,400}Start-MonitoringBestEffort/);
+  const invocations = [...source.matchAll(/Start-MonitoringBestEffort/g)].map(({ index }) => index);
+  assert.equal(invocations.length, 2, 'monitoring helper should have one definition and one invocation');
+  const invocation = invocations.at(-1);
+  const successGuard = source.lastIndexOf('if ($evaluation.Success)', invocation);
+  assert.ok(successGuard >= 0 && successGuard < invocation, 'monitoring startup must remain in the successful authority path');
+  assert.match(
+    source.slice(invocation - 200, invocation + 100),
+    /Write-SupervisorLog[^\n]+\$evaluation\.Message\s+Start-MonitoringBestEffort\s+exit 0/,
+  );
 });
 
 test('tracked launchers never contain a token value or secret argument', () => {

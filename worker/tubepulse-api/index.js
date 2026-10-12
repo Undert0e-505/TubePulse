@@ -21,7 +21,7 @@ export { TubePulseAuthorityCoordinator };
  *   POST /register          — Register/update device profile (FCM token)
  *   POST /subscribe-channel — Add a channel to this device
  *   POST /unsubscribe       — Remove a channel from this device
- *   POST /seen              — Mark video(s) as watched
+ *   POST /seen              — Mark exact content IDs as seen
  *   GET  /feed              — Get current feed data for all tracked channels
  *   GET  /resolve           — Handle → channelId resolution
  *   POST /bootstrap         — Fetch RSS + avatar for a new channel (sync)
@@ -1176,50 +1176,55 @@ async function handleSeen(request, env) {
   let body;
   try { body = await request.json(); } catch { return errorResponse('Invalid JSON body'); }
 
-  const { channelId, videoIds, clearAll } = body;
-  if (!channelId) return errorResponse('channelId is required');
-  if (!clearAll && !Array.isArray(videoIds)) return errorResponse('Provide videoIds array or clearAll: true');
+  const batched = Array.isArray(body.channels);
+  const requested = batched
+    ? body.channels
+    : [{ channelId: body.channelId, contentIds: body.videoIds, clearAll: body.clearAll }];
+  if (requested.length === 0 || requested.length > 200) return errorResponse('Provide 1-200 channels');
 
-  const existingState = await getKV(env.TUBEPULSE_KV, key.deviceState(deviceId, channelId));
-  // IMPORTANT: create a NEW object, not a reference to existingState.
-  // putKVIfChanged compares state vs existingState — if they're the same
-  // object reference, jsonEqual returns true and the write is silently
-  // skipped, even though we mutated state.unwatched in-place.
-  const state = existingState
-    ? { ...existingState, unwatched: [...(existingState.unwatched || [])] }
-    : { unwatched: [], lastNagAt: null, nagCount: 0 };
-
-  if (clearAll) {
-    state.unwatched = [];
-  } else {
-    const removeSet = new Set(videoIds);
-    state.unwatched = (state.unwatched || []).filter((id) => !removeSet.has(id));
+  const normalized = [];
+  for (const entry of requested) {
+    const channelId = String(entry?.channelId || '').trim();
+    const clearAll = entry?.clearAll === true;
+    const ids = entry?.contentIds ?? entry?.videoIds;
+    if (!channelId) return errorResponse('channelId is required');
+    if (!clearAll && !Array.isArray(ids)) return errorResponse('Provide contentIds array or clearAll: true');
+    const contentIds = [...new Set((Array.isArray(ids) ? ids : [])
+      .map((id) => String(id || '').trim()).filter(Boolean))].slice(0, 100);
+    if (!clearAll && contentIds.length === 0) continue;
+    normalized.push({ channelId, contentIds, clearAll });
   }
 
-  // Reset nag counters when all items are seen, so the next unread item
-  // starts fresh nag cadence (e.g. 5-min relentless resets to 5-min, not
-  // backed-off 15-min from stale nagCount).
-  if (state.unwatched.length === 0) {
-    state.nagCount = 0;
-    state.lastNagAt = null;
-  }
-
-  await putKVIfChanged(env.TUBEPULSE_KV, key.deviceState(deviceId, channelId), state, existingState);
-
-  // Nag counters are reset when unwatched becomes empty, so the next
-  // unread item starts a fresh nag cadence.
-
-  // Remove from nag:active when unwatched becomes empty
-  if (state.unwatched.length === 0) {
-    const nagActive = await getKV(env.TUBEPULSE_KV, key.nagActive()) || [];
-    const entry = `${deviceId}|${channelId}`;
-    const filtered = nagActive.filter((e) => e !== entry);
-    if (filtered.length !== nagActive.length) {
-      await putKV(env.TUBEPULSE_KV, key.nagActive(), filtered);
+  const clearedEntries = new Set();
+  const results = [];
+  for (const { channelId, contentIds, clearAll } of normalized) {
+    const existingState = await getKV(env.TUBEPULSE_KV, key.deviceState(deviceId, channelId));
+    const state = existingState
+      ? { ...existingState, unwatched: [...(existingState.unwatched || [])] }
+      : { unwatched: [], lastNagAt: null, nagCount: 0 };
+    if (clearAll) state.unwatched = [];
+    else {
+      const removeSet = new Set(contentIds);
+      state.unwatched = state.unwatched.filter((id) => !removeSet.has(id));
     }
+    if (state.unwatched.length === 0) {
+      state.nagCount = 0;
+      state.lastNagAt = null;
+      clearedEntries.add(`${deviceId}|${channelId}`);
+    }
+    await putKVIfChanged(env.TUBEPULSE_KV, key.deviceState(deviceId, channelId), state, existingState);
+    results.push({ channelId, unwatchedCount: state.unwatched.length });
   }
 
-  return json({ ok: true, unwatchedCount: state.unwatched.length });
+  if (clearedEntries.size) {
+    const nagActive = await getKV(env.TUBEPULSE_KV, key.nagActive()) || [];
+    const filtered = nagActive.filter((entry) => !clearedEntries.has(entry));
+    if (filtered.length !== nagActive.length) await putKV(env.TUBEPULSE_KV, key.nagActive(), filtered);
+  }
+
+  return json(batched
+    ? { ok: true, channels: results }
+    : { ok: true, unwatchedCount: results[0]?.unwatchedCount || 0 });
 }
 
 // ─── GET /feed ──────────────────────────────────────────────────────────

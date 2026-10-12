@@ -555,6 +555,16 @@ export function buildFcmMessage(fcmToken, payload, notificationCapability = null
   };
 }
 
+export function classifyPermanentFcmTokenError(status, responseText = '') {
+  const httpStatus = Number(status);
+  if (httpStatus >= 200 && httpStatus < 300) return null;
+  if (httpStatus === 404) return 'http-404';
+  const text = String(responseText || '');
+  if (/\bUNREGISTERED\b/.test(text)) return 'unregistered';
+  if (/\bNotRegistered\b/.test(text)) return 'not-registered';
+  return null;
+}
+
 export async function sendFCMPush(accessToken, projectId, fcmToken, payload, notificationCapability = null) {
   if (accessToken === SHADOW_FCM_ACCESS_TOKEN) {
     return { sent: false, deadToken: false, shadow: true };
@@ -575,8 +585,15 @@ export async function sendFCMPush(accessToken, projectId, fcmToken, payload, not
     const errText = await resp.text();
     const errSummary = errText.length > 300 ? `${errText.slice(0, 300)}...` : errText;
     console.error(`FCM push failed: ${resp.status} ${errSummary}`);
-    if (resp.status === 404 || errText.includes('UNREGISTERED') || errText.includes('NotRegistered')) {
-      return { sent: false, deadToken: true, status: resp.status, error: errSummary };
+    const permanentInvalidTokenClass = classifyPermanentFcmTokenError(resp.status, errText);
+    if (permanentInvalidTokenClass) {
+      return {
+        sent: false,
+        deadToken: true,
+        permanentInvalidTokenClass,
+        status: resp.status,
+        error: errSummary,
+      };
     }
     return { sent: false, deadToken: false, status: resp.status, error: errSummary };
   }

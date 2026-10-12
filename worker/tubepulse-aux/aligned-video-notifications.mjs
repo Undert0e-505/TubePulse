@@ -73,6 +73,7 @@ export function buildAlignedVideoPayload({ channelId, channelName, videos, effec
         videoId: video.videoId,
         channelId,
         channelName,
+        contentIds: JSON.stringify(ids),
         videoLink: video.link || `https://www.youtube.com/watch?v=${video.videoId}`,
         type: kind === 'video' ? (video.type || 'video') : 'nag',
         tapAction: String(effective.tapAction),

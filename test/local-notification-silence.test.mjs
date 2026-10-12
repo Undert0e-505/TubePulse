@@ -14,6 +14,9 @@ import {
   nextNotificationSilenceExpiry,
   notificationSilencePresentation,
   notificationResponseRoute,
+  notificationCategoryForData,
+  LOCAL_NOTIFICATION_GROUP_CATEGORY,
+  LOCAL_NOTIFICATION_PREWARN_CATEGORY,
   resumeChannelSound,
   resumeGlobalSound,
 } from '../src/utils/localNotificationSilence.mjs';
@@ -161,6 +164,17 @@ test('notification actions never route through the default tap path', () => {
   assert.equal(notificationResponseRoute(NOTIFICATION_ACTIONS.MUTE_CHANNEL_1H, 'expo_default'), 'silence');
   assert.equal(notificationResponseRoute(NOTIFICATION_ACTIONS.UNMUTE_CHANNEL, 'expo_default'), 'silence');
   assert.equal(notificationResponseRoute(NOTIFICATION_ACTIONS.UNMUTE_ALL, 'expo_default'), 'silence');
+  assert.equal(notificationResponseRoute(NOTIFICATION_ACTIONS.MARK_SEEN, 'expo_default'), 'seen');
   assert.equal(notificationResponseRoute('expo_default', 'expo_default'), 'default');
   assert.equal(notificationResponseRoute('unknown', 'expo_default'), 'ignore');
+});
+
+test('normal, bundle, prewarn and muted notifications select adaptive action categories', () => {
+  const audible = { silent: false, categoryIdentifier: LOCAL_NOTIFICATION_CATEGORY };
+  const muted = { silent: true, categoryIdentifier: LOCAL_NOTIFICATION_GLOBAL_MUTED_CATEGORY };
+  assert.equal(notificationCategoryForData(audible, { type: 'video' }), LOCAL_NOTIFICATION_CATEGORY);
+  assert.equal(notificationCategoryForData(audible, { type: 'batch' }), LOCAL_NOTIFICATION_GROUP_CATEGORY);
+  assert.equal(notificationCategoryForData(audible, { type: 'prewarn' }), LOCAL_NOTIFICATION_PREWARN_CATEGORY);
+  assert.equal(notificationCategoryForData(muted, { type: 'batch' }), LOCAL_NOTIFICATION_GLOBAL_MUTED_CATEGORY);
+  assert.equal(notificationCategoryForData(muted, { type: 'prewarn' }), LOCAL_NOTIFICATION_GLOBAL_MUTED_CATEGORY);
 });

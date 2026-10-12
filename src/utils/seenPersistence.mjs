@@ -3,6 +3,8 @@ export const SEEN_MUTATION_QUEUE_KEY = 'tubepulse_seen_mutation_queue_v1';
 const MAX_ATTEMPTS_EXPONENT = 6;
 const BASE_RETRY_MS = 15_000;
 const MAX_RETRY_MS = 15 * 60_000;
+const MAX_INTENTS = 200;
+const MAX_IDS_PER_INTENT = 100;
 let queueMutex = Promise.resolve();
 
 function withQueueLock(operation) {
@@ -23,13 +25,13 @@ function normalizeQueue(parsed) {
     schemaVersion: 1,
     intents: intents.map((intent) => ({
       channelId: String(intent?.channelId || ''),
-      contentIds: normalizeSeenContentIds(intent?.contentIds),
+      contentIds: normalizeSeenContentIds(intent?.contentIds).slice(0, MAX_IDS_PER_INTENT),
       createdAt: Number(intent?.createdAt || 0),
       updatedAt: Number(intent?.updatedAt || 0),
       attempts: Math.max(0, Number(intent?.attempts || 0)),
       nextAttemptAt: Math.max(0, Number(intent?.nextAttemptAt || 0)),
       revision: Math.max(1, Number(intent?.revision || 1)),
-    })).filter((intent) => intent.channelId && intent.contentIds.length),
+    })).filter((intent) => intent.channelId && intent.contentIds.length).slice(0, MAX_INTENTS),
   };
 }
 
@@ -53,11 +55,15 @@ export async function enqueueSeenMutation({ storage, channelId, contentIds, now 
     const existing = queue.intents.find((intent) => intent.channelId === normalizedChannelId);
     const timestamp = Number(now());
     if (existing) {
-      existing.contentIds = normalizeSeenContentIds([...existing.contentIds, ...normalizedIds]);
+      const mergedIds = normalizeSeenContentIds([...existing.contentIds, ...normalizedIds]);
+      if (mergedIds.length > MAX_IDS_PER_INTENT) throw new Error('Seen retry queue item is full');
+      existing.contentIds = mergedIds;
       existing.updatedAt = timestamp;
       existing.nextAttemptAt = Math.min(existing.nextAttemptAt || timestamp, timestamp);
       existing.revision++;
     } else {
+      if (queue.intents.length >= MAX_INTENTS) throw new Error('Seen retry queue is full');
+      if (normalizedIds.length > MAX_IDS_PER_INTENT) throw new Error('Seen retry queue item is full');
       queue.intents.push({
         channelId: normalizedChannelId,
         contentIds: normalizedIds,
@@ -78,9 +84,58 @@ function retryDelay(attempts) {
 }
 
 export async function flushSeenMutationQueue({
-  storage, deviceId, persist, now = Date.now, force = false, maxIntents = 20,
+  storage, deviceId, persist, persistBatch, now = Date.now, force = false, maxIntents = 20,
 }) {
-  if (!deviceId || typeof persist !== 'function') return { attempted: 0, confirmed: 0, remaining: null };
+  if (!deviceId || (typeof persist !== 'function' && typeof persistBatch !== 'function')) {
+    return { attempted: 0, confirmed: 0, remaining: null };
+  }
+  if (typeof persistBatch === 'function') {
+    const candidates = await withQueueLock(async () => {
+      const queue = await readSeenMutationQueue(storage);
+      const timestamp = Number(now());
+      return queue.intents
+        .filter((entry) => force || entry.nextAttemptAt <= timestamp)
+        .slice(0, maxIntents)
+        .map((entry) => ({ ...entry, contentIds: [...entry.contentIds] }));
+    });
+    if (candidates.length === 0) {
+      return { attempted: 0, confirmed: 0, remaining: (await readSeenMutationQueue(storage)).intents.length };
+    }
+    let ok = false;
+    try {
+      const result = await persistBatch(deviceId, candidates.map(({ channelId, contentIds }) => ({
+        channelId, contentIds,
+      })));
+      ok = result?.ok === true;
+    } catch { /* retained below */ }
+    await withQueueLock(async () => {
+      const queue = await readSeenMutationQueue(storage);
+      const attemptedByChannel = new Map(candidates.map((entry) => [entry.channelId, entry]));
+      for (const current of [...queue.intents]) {
+        const candidate = attemptedByChannel.get(current.channelId);
+        if (!candidate) continue;
+        if (ok) {
+          const confirmedIds = new Set(candidate.contentIds);
+          current.contentIds = current.contentIds.filter((id) => !confirmedIds.has(id));
+          if (!current.contentIds.length) queue.intents = queue.intents.filter((intent) => intent !== current);
+          else {
+            current.attempts = 0;
+            current.nextAttemptAt = Number(now());
+          }
+        } else {
+          current.attempts++;
+          current.updatedAt = Number(now());
+          current.nextAttemptAt = current.updatedAt + retryDelay(current.attempts - 1);
+        }
+      }
+      await writeQueue(storage, queue);
+    });
+    return {
+      attempted: candidates.length,
+      confirmed: ok ? candidates.length : 0,
+      remaining: (await readSeenMutationQueue(storage)).intents.length,
+    };
+  }
   let attempted = 0;
   let confirmed = 0;
   while (attempted < maxIntents) {

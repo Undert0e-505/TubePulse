@@ -146,7 +146,7 @@ After each aligned discovery pass, Home performs the standard subscriber fan-out
 | `POST` | `/register` | Bearer | `handleRegister` — create/update device profile (FCM token optional). New clients advertise `notificationCapability: "local-v1"`; missing/unknown values preserve legacy FCM rendering. Two-phase deviceId migration handles cross-version upgrades (see §11.1). |
 | `POST` | `/subscribe-channel` | Bearer | `handleSubscribeChannel` — add a channel, fetch cached metadata if needed, and bootstrap recent uploads through `channels.list` → uploads playlist → `playlistItems.list` |
 | `POST` | `/unsubscribe` | Bearer | `handleUnsubscribe` — remove a channel and subscriber state; the final subscriber removes it from `channels:active`, stops polling, cleans display caches, and retains the known-video watermark for safe resubscribe |
-| `POST` | `/seen` | Bearer | `handleSeen` — mark videos / posts as watched. `ids: [videoId, "post:activityId", ...]` for individual marks; `clearAll: true` for channel-tap (clears all videos and posts for that channel) |
+| `POST` | `/seen` | Bearer | `handleSeen` — mark videos/posts seen by exact ID; current clients can batch channel snapshots, while released clients retain single-channel `videoIds`/`clearAll` compatibility |
 | `GET`  | `/feed` | Bearer | `handleFeed` — return recent videos + community posts for all subscribed channels, with per-device `unwatched` flags merged in |
 | `GET`  | `/resolve` | Bearer | `handleResolve` — `@handle` → channelId (Data API, cached 7 days in `handle:*`) |
 | `POST` | `/bootstrap` | Bearer | `handleBootstrap` — on-demand channel metadata + recent uploads refresh through the Data API structural path |
@@ -233,7 +233,7 @@ All intervals are five-minute raster multiples with no former rotating-scan jitt
 
 Every future single or batch video notification for one channel uses `tubepulse-channel-{channelId}`. It therefore replaces that channel's previous surface without colliding with another channel. Swiping does not acknowledge and the notification may return at the next due interval. Single taps acknowledge the exact item; bundle taps open the channel and acknowledge their exact `contentIds`. Server DND defers unseen state until the first eligible aligned tick, while local mute keeps the push visible but silent. New livestream notifications retain their DND bypass contract.
 
-Flag-off preserves the old bounded rotating aux implementation for rollback. It retains the old after-twelve backoff semantics; that behavior is not active production policy. The state and v4.0.0/v4.1.0 `type: nag` and `type: batch` payload schemas require no client migration.
+Flag-off preserves the old bounded rotating aux implementation for rollback. It retains the old after-twelve backoff semantics; that behavior is not active production policy. Released clients through v4.2.0 retain their existing `type: nag` and `type: batch` payload and single-channel `/seen` contracts; the new fields and batch request are additive.
 
 ### 5.2 `/seen` contract
 
@@ -250,6 +250,19 @@ Flag-off preserves the old bounded rotating aux implementation for rollback. It 
 ```
 
 Either `videoIds` (array of seen IDs) or `clearAll: true` is required.
+
+Current clients may instead send one snapshot-safe batched request:
+```json
+{
+  "channels": [
+    { "channelId": "UCxxxxx", "contentIds": ["videoId1", "post:activityId1"] },
+    { "channelId": "UCyyyyy", "contentIds": ["videoId2"] }
+  ]
+}
+```
+The batch is installation-scoped, idempotent, updates `nag:active` once, and returns per-channel
+remaining counts. Exact IDs ensure a retry never marks a later arrival seen. The single-channel
+shape and `clearAll` remain for released clients.
 
 **Seen ID format:**
 - Videos: plain `videoId` string (e.g. `dQw4w9WgXcQ`)
@@ -477,7 +490,7 @@ The active Home authority uses FCM v1 for notification fan-out through the share
 
 **The FCM token can be null on `/register`.** The server accepts null tokens because the user might have denied notification permission. The device profile is still created so `/feed` and `/subscribe-channel` work. Push delivery is just disabled until a real token arrives via `onTokenRefresh`.
 
-**Background push handler** (Android side, in `App.js`): capable data-only pushes are displayed immediately from their payload through the locally selected audible/silent channel, then the handler re-fetches `/feed`, updates local cache and requests a widget render best-effort. Legacy clients retain Android auto-display. The three mute actions alter only device-local sound state; they do not call this API, write D1, change unseen state or replace host-side DND.
+**Background push handler** (Android side, in `App.js`): capable data-only pushes are displayed immediately from their payload through the locally selected audible/silent channel, then the handler re-fetches `/feed`, updates local cache and requests a widget render best-effort. Legacy clients retain Android auto-display. Mute and unmute actions alter only device-local sound state; they do not call this API, write D1, change unseen state or replace host-side DND. `Mark seen` is a separate exact-ID action that uses the installation-scoped `/seen` path.
 
 **Capability activation is an API + active-host cutover.** The deployed `/register` handler must
 persist `local-v1`, and the running Home authority image must pass that profile field through its

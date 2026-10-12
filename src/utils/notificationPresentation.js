@@ -3,7 +3,10 @@ import {
   LOCAL_NOTIFICATION_CHANNEL_MUTED_CATEGORY,
   LOCAL_NOTIFICATION_CATEGORY,
   LOCAL_NOTIFICATION_GLOBAL_MUTED_CATEGORY,
+  LOCAL_NOTIFICATION_GROUP_CATEGORY,
+  LOCAL_NOTIFICATION_PREWARN_CATEGORY,
   NOTIFICATION_ACTIONS,
+  notificationCategoryForData,
 } from './localNotificationSilence.mjs';
 import { getLocalNotificationPresentation } from './localNotificationSilenceStorage';
 import { createRetryableAsyncSetup } from './retryableAsyncSetup.mjs';
@@ -18,12 +21,24 @@ const ensureNotificationCategory = createRetryableAsyncSetup(async () => {
     Notifications.setNotificationCategoryAsync(LOCAL_NOTIFICATION_CATEGORY, [
       {
         identifier: NOTIFICATION_ACTIONS.MUTE_CHANNEL_1H,
-        buttonTitle: 'Mute channel 1hr',
+        buttonTitle: 'Mute 1h',
         options: { opensAppToForeground: false },
       },
       {
         identifier: NOTIFICATION_ACTIONS.MUTE_CHANNEL_8H,
-        buttonTitle: 'Mute channel 8hr',
+        buttonTitle: 'Mute 8h',
+        options: { opensAppToForeground: false },
+      },
+      {
+        identifier: NOTIFICATION_ACTIONS.MARK_SEEN,
+        buttonTitle: 'Mark seen',
+        options: { opensAppToForeground: false },
+      },
+    ]),
+    Notifications.setNotificationCategoryAsync(LOCAL_NOTIFICATION_GROUP_CATEGORY, [
+      {
+        identifier: NOTIFICATION_ACTIONS.MUTE_CHANNEL_1H,
+        buttonTitle: 'Mute 1h',
         options: { opensAppToForeground: false },
       },
       {
@@ -31,11 +46,33 @@ const ensureNotificationCategory = createRetryableAsyncSetup(async () => {
         buttonTitle: 'Mute all',
         options: { opensAppToForeground: false },
       },
+      {
+        identifier: NOTIFICATION_ACTIONS.MARK_SEEN,
+        buttonTitle: 'Mark seen',
+        options: { opensAppToForeground: false },
+      },
+    ]),
+    Notifications.setNotificationCategoryAsync(LOCAL_NOTIFICATION_PREWARN_CATEGORY, [
+      {
+        identifier: NOTIFICATION_ACTIONS.MUTE_CHANNEL_1H,
+        buttonTitle: 'Mute 1h',
+        options: { opensAppToForeground: false },
+      },
+      {
+        identifier: NOTIFICATION_ACTIONS.MUTE_CHANNEL_8H,
+        buttonTitle: 'Mute 8h',
+        options: { opensAppToForeground: false },
+      },
     ]),
     Notifications.setNotificationCategoryAsync(LOCAL_NOTIFICATION_CHANNEL_MUTED_CATEGORY, [
       {
         identifier: NOTIFICATION_ACTIONS.UNMUTE_CHANNEL,
         buttonTitle: 'Unmute channel',
+        options: { opensAppToForeground: false },
+      },
+      {
+        identifier: NOTIFICATION_ACTIONS.MARK_SEEN,
+        buttonTitle: 'Mark seen',
         options: { opensAppToForeground: false },
       },
     ]),
@@ -48,6 +85,11 @@ const ensureNotificationCategory = createRetryableAsyncSetup(async () => {
       {
         identifier: NOTIFICATION_ACTIONS.UNMUTE_ALL,
         buttonTitle: 'Unmute all',
+        options: { opensAppToForeground: false },
+      },
+      {
+        identifier: NOTIFICATION_ACTIONS.MARK_SEEN,
+        buttonTitle: 'Mark seen',
         options: { opensAppToForeground: false },
       },
     ]),
@@ -103,7 +145,7 @@ export async function presentRemoteMessageLocally(remoteMessage) {
       title,
       body,
       data: { ...data, localSilent: silent ? '1' : '0' },
-      categoryIdentifier: localPresentation.categoryIdentifier,
+      categoryIdentifier: notificationCategoryForData(localPresentation, data),
       sound: silent ? null : 'default',
       color: COLORS.accent,
     },
