@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -7,6 +8,15 @@ import { fileURLToPath } from 'node:url';
 const selfHostDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const windowsDir = path.join(selfHostDir, 'windows');
 const powershell = process.platform === 'win32' ? 'powershell.exe' : 'pwsh';
+
+test('authority Compose uses the private awaited shutdown signal and a full-cycle grace window', () => {
+  const compose = readFileSync(path.join(selfHostDir, 'compose.authority.yaml'), 'utf8');
+  const cli = readFileSync(path.join(selfHostDir, 'src', 'home-authority-cli.mjs'), 'utf8');
+  assert.match(compose, /stop_signal:\s*SIGUSR2/);
+  assert.match(compose, /stop_grace_period:\s*4m/);
+  assert.match(cli, /process\.once\('SIGUSR2',[\s\S]*shutdown\('SIGUSR2'\)/);
+  assert.match(cli, /unified Home authority stopped/);
+});
 
 function runPowerShell(args) {
   return execFileSync(powershell, ['-NoProfile', '-NonInteractive', ...args], {

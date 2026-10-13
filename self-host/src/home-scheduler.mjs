@@ -140,6 +140,7 @@ export function nextFiveMinuteBoundary(now = Date.now()) {
 export class FileLease {
   constructor({ dataDir, ttlMs = 180_000, now = Date.now, owner = crypto.randomUUID() }) {
     this.path = path.join(dataDir, 'home-scheduler.lock');
+    this.backupPath = `${this.path}.bak`;
     this.ttlMs = ttlMs;
     this.now = now;
     this.owner = owner;
@@ -156,8 +157,44 @@ export class FileLease {
     const handle = await fs.open(this.path, 'wx', 0o600);
     try {
       await handle.writeFile(`${JSON.stringify(record)}\n`, 'utf8');
+      await handle.sync();
     } finally {
       await handle.close();
+    }
+    try {
+      await this.writeLeaseFile(this.backupPath, record);
+    } catch (error) {
+      // Acquisition has not been published to the caller yet, so rollback
+      // the exclusive pathname rather than strand an ownerless lock.
+      await fs.rm(this.path, { force: true }).catch(() => {});
+      throw error;
+    }
+  }
+
+  async writeLeaseFile(filePath, record) {
+    const handle = await fs.open(filePath, 'w', 0o600);
+    try {
+      await handle.writeFile(`${JSON.stringify(record)}\n`, 'utf8');
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+  }
+
+  async readLeaseRecord() {
+    try {
+      return JSON.parse(await fs.readFile(this.path, 'utf8'));
+    } catch (primaryError) {
+      try {
+        const backup = JSON.parse(await fs.readFile(this.backupPath, 'utf8'));
+        // The lock pathname remains the exclusion primitive. Repair only its
+        // contents; never remove it while another owner may still be active.
+        await this.writeLeaseFile(this.path, backup);
+        return backup;
+      } catch (backupError) {
+        if (primaryError?.code === 'ENOENT' && backupError?.code === 'ENOENT') throw primaryError;
+        throw new Error(`Home scheduler lease exists but cannot be validated: ${primaryError.message}`);
+      }
     }
   }
 
@@ -170,7 +207,7 @@ export class FileLease {
       if (error?.code !== 'EEXIST') throw error;
       let existing;
       try {
-        existing = JSON.parse(await fs.readFile(this.path, 'utf8'));
+        existing = await this.readLeaseRecord();
       } catch {
         throw new Error('Home scheduler lease exists but cannot be validated');
       }
@@ -179,6 +216,9 @@ export class FileLease {
       }
       const stalePath = `${this.path}.stale-${new Date(this.now()).toISOString().replace(/[:.]/g, '-')}`;
       await fs.rename(this.path, stalePath);
+      await fs.rename(this.backupPath, `${stalePath}.bak`).catch((backupError) => {
+        if (backupError?.code !== 'ENOENT') throw backupError;
+      });
       await this.writeExclusive(this.record());
     }
     this.acquired = true;
@@ -192,17 +232,18 @@ export class FileLease {
     if (!this.acquired) return;
     let existing;
     try {
-      existing = JSON.parse(await fs.readFile(this.path, 'utf8'));
+      existing = await this.readLeaseRecord();
     } catch {
       throw new Error('Home scheduler lease disappeared during execution');
     }
     if (existing.owner !== this.owner) throw new Error('Home scheduler lease ownership changed');
     const now = this.now();
     const next = { ...existing, heartbeatAt: iso(now), expiresAt: iso(now + this.ttlMs) };
-    // The exclusive file itself is the ownership primitive. Rewriting it in
-    // place avoids Windows' non-replacing rename semantics and, importantly,
-    // never creates a gap in which a second process could acquire the path.
-    await fs.writeFile(this.path, `${JSON.stringify(next)}\n`, { encoding: 'utf8', mode: 0o600 });
+    // The exclusive file itself is the ownership primitive. Flush it in
+    // place so there is no acquisition gap, then flush a recovery generation.
+    // The next external action cannot begin until both writes complete.
+    await this.writeLeaseFile(this.path, next);
+    await this.writeLeaseFile(this.backupPath, next);
   }
 
   async release() {
@@ -210,8 +251,11 @@ export class FileLease {
     this.heartbeatTimer = null;
     if (!this.acquired) return;
     try {
-      const existing = JSON.parse(await fs.readFile(this.path, 'utf8'));
-      if (existing.owner === this.owner) await fs.unlink(this.path);
+      const existing = await this.readLeaseRecord();
+      if (existing.owner === this.owner) {
+        await fs.unlink(this.path);
+        await fs.rm(this.backupPath, { force: true });
+      }
     } catch (error) {
       if (error?.code !== 'ENOENT') throw error;
     } finally {
@@ -1972,9 +2016,9 @@ export class HomeSchedulerRunner {
     if (this.config.mode === 'standby') return { outcome: 'standby' };
     if (this.running) {
       this.overlapSkips++;
-      const state = await this.stateFile.read();
-      state.overlapSkips = Math.max(Number(state.overlapSkips || 0) + 1, this.overlapSkips);
-      await this.stateFile.write(state);
+      // The active run persists the in-memory counter with its terminal state.
+      // Writing a second read/modify/write snapshot here can overwrite newer
+      // currentSweep progress from the active run.
       return { outcome: 'overlap-skipped' };
     }
     this.running = true;

@@ -939,6 +939,39 @@ test('file lease acquisition is idempotent for the owning runner', async (t) => 
   await first.release();
 });
 
+test('graceful lease release allows an immediate replacement without waiting for expiry', async (t) => {
+  const dataDir = await temporaryDirectory(t);
+  let now = Date.UTC(2026, 9, 4, 12, 0);
+  const first = new FileLease({ dataDir, ttlMs: 180_000, now: () => now, owner: 'first' });
+  const replacement = new FileLease({ dataDir, ttlMs: 180_000, now: () => now, owner: 'replacement' });
+  await first.acquire();
+  await first.release();
+
+  const acquired = await replacement.acquire();
+  assert.equal(acquired.owner, 'replacement');
+  await replacement.release();
+  await assert.rejects(() => fs.access(path.join(dataDir, 'home-scheduler.lock')), { code: 'ENOENT' });
+  await assert.rejects(() => fs.access(path.join(dataDir, 'home-scheduler.lock.bak')), { code: 'ENOENT' });
+});
+
+test('file lease heartbeat recovers a zero-filled lock from its flushed generation', async (t) => {
+  const dataDir = await temporaryDirectory(t);
+  let now = Date.UTC(2026, 9, 4, 12, 0);
+  const lease = new FileLease({ dataDir, ttlMs: 10_000, now: () => now, owner: 'first' });
+  await lease.acquire();
+  const lockPath = path.join(dataDir, 'home-scheduler.lock');
+  await fs.writeFile(lockPath, '\0'.repeat(128), 'utf8');
+
+  now += 1_000;
+  await lease.heartbeat();
+  const recovered = JSON.parse(await fs.readFile(lockPath, 'utf8'));
+  const backup = JSON.parse(await fs.readFile(`${lockPath}.bak`, 'utf8'));
+  assert.equal(recovered.owner, 'first');
+  assert.equal(recovered.heartbeatAt, new Date(now).toISOString());
+  assert.deepEqual(backup, recovered);
+  await lease.release();
+});
+
 test('scheduled tick failure is recorded, recovered, and contained by the timer', async (t) => {
   const dataDir = await temporaryDirectory(t);
   const scheduledNow = Date.UTC(2026, 9, 4, 12, 0, 59, 995);
@@ -968,7 +1001,11 @@ test('scheduled tick failure is recorded, recovered, and contained by the timer'
     recoveryFinished,
     new Promise((_, reject) => setTimeout(() => reject(new Error('scheduled recovery timed out')), 500)),
   ]);
-  await new Promise((resolve) => setTimeout(resolve, 10));
+  // The recovery callback resolves before the scheduler persists the final
+  // reconciled marker. Wait for the complete scheduled task instead of using
+  // a timing-sensitive delay that can observe the intentional pending state
+  // under a busy parallel test run.
+  await runner.activeTick;
   const failed = await runner.stateFile.read();
   assert.equal(recovered, 1);
   assert.equal(failed.currentSweep.status, 'failed');

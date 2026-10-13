@@ -15,6 +15,43 @@ import { LocalKvAdapter } from './kv-adapters.mjs';
 import { TubePulseRuntime } from './runtime.mjs';
 import { createUnifiedHomeAuthorityService } from './home-authority-service.mjs';
 
+let liveService = null;
+let serviceStartup = null;
+let shutdownPromise = null;
+
+function installServiceShutdownHandlers() {
+  const shutdown = (signal) => {
+    if (shutdownPromise) return;
+    console.log(JSON.stringify({ message: 'TubePulse unified Home authority stopping', signal }));
+    // A Promise alone does not keep Node's event loop alive. Closing the HTTP
+    // server and scheduler timers can otherwise let PID 1 exit while the
+    // remaining async state flush and lease unlink are still pending.
+    const keepAlive = setInterval(() => {}, 1_000);
+    shutdownPromise = (async () => {
+      // The handler is installed before startup begins. If shutdown arrives
+      // during startup, wait for startup's own rollback (or the resulting
+      // service) so the scheduler lease cannot be orphaned.
+      const service = liveService || await serviceStartup?.catch(() => null);
+      if (service) await service.close();
+    })();
+    void shutdownPromise.then(
+      () => {
+        clearInterval(keepAlive);
+        console.log(JSON.stringify({ message: 'TubePulse unified Home authority stopped', signal }));
+        process.exit(0);
+      },
+      (error) => {
+        clearInterval(keepAlive);
+        console.error(`TubePulse Home authority shutdown error: ${error?.message || error}`);
+        process.exit(1);
+      },
+    );
+  };
+  process.once('SIGINT', () => shutdown('SIGINT'));
+  process.once('SIGTERM', () => shutdown('SIGTERM'));
+  process.once('SIGUSR2', () => shutdown('SIGUSR2'));
+}
+
 const explicitEnvFile = process.env.TUBEPULSE_HOME_SCHEDULER_ENV_FILE;
 loadDotEnv(explicitEnvFile ? path.resolve(explicitEnvFile) : path.resolve('.env.authority'));
 
@@ -152,15 +189,9 @@ async function main() {
   if (command === 'reconcile') return await reconcile(config);
   if (command === 'migrate-d1') return await migrateD1(config);
   if (command !== 'run') throw new Error('Usage: node src/home-authority-cli.mjs run|status|drain-pending|reconcile|migrate-d1');
-  const service = await createUnifiedHomeAuthorityService(config);
-  let closing = false;
-  const close = async () => {
-    if (closing) return;
-    closing = true;
-    await service.close();
-  };
-  process.once('SIGINT', () => close().finally(() => process.exit(0)));
-  process.once('SIGTERM', () => close().finally(() => process.exit(0)));
+  installServiceShutdownHandlers();
+  serviceStartup = createUnifiedHomeAuthorityService(config);
+  liveService = await serviceStartup;
   console.log(JSON.stringify({
     message: 'TubePulse unified Home authority started',
     mode: config.mode,

@@ -7,7 +7,15 @@ services:
       dockerfile: self-host/Dockerfile
     command: ["node", "src/home-authority-cli.mjs", "run"]
     restart: unless-stopped
-    stop_grace_period: 45s
+    # Miniflare installs a SIGTERM hook that exits PID 1 immediately. Use a
+    # private Compose stop signal so our authority can flush state and release
+    # the scheduler lease before the container exits.
+    stop_signal: SIGUSR2
+    # A full channel reconciliation can legitimately run for longer than the
+    # old 45-second window. Let the signal handler finish that in-flight tick
+    # and release the scheduler lease instead of SIGKILLing the owner and
+    # forcing the replacement to wait out a stale three-minute lease.
+    stop_grace_period: 4m
     env_file:
       - path: ${TUBEPULSE_HOME_AUTHORITY_ENV_FILE:-.env.authority}
         required: true

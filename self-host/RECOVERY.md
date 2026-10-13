@@ -89,6 +89,12 @@ The Scheduled Task installer remains an optional administrator-controlled altern
 | Authority stale, pending, or transaction fault | No destructive restart/clear/activation. The supervisor exits unsuccessfully after bounded observation so the fault remains actionable. | Manual integrity recovery |
 | Scheduler lease/progress stuck while HTTP remains healthy | Classified separately and surfaced; not treated as an upstream outage or automatic data reset. | Manual diagnosis after bounded alert |
 
+### Local JSON generations after an abrupt stop
+
+Every host JSON state write is serialized, written to a same-directory temporary file, flushed, atomically renamed without a delete-first gap, and followed by a directory flush where the platform supports it. The write does not complete until a matching flushed `.bak` last-known-good generation is also present. At startup, a missing, empty, NUL-filled, or truncated primary is quarantined as `.corrupt-<timestamp>-<id>` and restored from the validated backup. An invalid state root and corruption of both generations fail closed; neither is silently replaced with initial state.
+
+If startup still reports `StateFileCorruptionError`, stop only `home-authority`, preserve the primary, `.bak`, `.tmp`, `.swap`, and `.corrupt-*` files, then follow the signed coordinator-status and D1 reconciliation sequence below. Never delete the scheduler or notification state merely to make the container start. D1 can reconstruct canonical keys, but not local YouTube quota reservations or an ambiguous claimed notification. After any recovery, require one completed aligned cycle, zero pending/overdue notification intents, and a Home-backed feed before declaring service restored. Durable known-content watermarks suppress historical uploads; never compensate by replaying a guessed backlog.
+
 The current host has the per-user Startup shortcut installed. A real power-loss recovery proved Docker, authority, monitoring, and the tunnel process restarted, but also exposed that daemon-level concurrent container restart could leave public VPC reads on D1 fallback despite registered tunnel connections. Restarting only the tunnel after authority readiness restored host routing without replacing the authority container or touching state. The checked-in once-per-boot sequencing fix has passed a safe same-boot idempotence test; the next controlled reboot/power recovery must confirm it end to end.
 
 ## Total-loss recovery: what survives remotely
@@ -201,6 +207,16 @@ The status must show standby and a stale/unreconciled local authority. Fresh emp
 ```powershell
 docker compose --env-file .env.authority -f compose.authority.yaml stop home-authority
 ```
+
+The authority container has a four-minute graceful-stop window. Do not shorten
+it below the longest observed full polling cycle: the process must finish any
+in-flight cycle and remove both scheduler lease generations before Compose
+starts its replacement. An abrupt host loss still relies on the lease TTL; do
+not delete a live-looking lease manually to make a replacement start sooner.
+Compose deliberately stops this container with `SIGUSR2`: Miniflare owns
+`SIGTERM` and exits before application cleanup completes, while the private
+signal reaches TubePulse's awaited shutdown handler and permits an immediate,
+split-brain-safe replacement.
 
 Expected: configuration/image work, but no polling/publication/notification occurs.
 
@@ -325,7 +341,7 @@ Only after application recovery succeeds, dry-run and install the per-user Start
 
 ## Remaining hardening
 
-The repository now contains bounded host startup supervision, signed status, a hash-guarded pending-drain command, and exact D1-to-local reconstruction. It still cannot recover lost notification-intent history or YouTube request counters. Future work should add always-verify startup manifests and checksummed/fsynced local state generations. These limitations must fail closed rather than being hidden by retries.
+The repository now contains bounded host startup supervision, signed status, a hash-guarded pending-drain command, exact D1-to-local reconstruction, and flushed atomic primary/last-known-good JSON generations with corruption quarantine. It still cannot reconstruct both lost local generations, historical notification-intent decisions, or YouTube request counters. A future change may add checksums and always-verify startup manifests; until then, loss of both validated generations must fail closed rather than being hidden by retries.
 
 ## Restore aggregate monitoring after recovery
 
