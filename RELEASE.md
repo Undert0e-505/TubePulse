@@ -39,7 +39,11 @@ work: it keeps the production package, endpoint, push, signing, and visible chec
 signing/config/identity changes and APK inputs; never runs Git or GitHub actions; and writes a timestamped
 `dist/TubePulse-vX.Y.Z-feature-preview-*.apk`. To permit an in-place install over the current release,
 FeaturePreview alone injects checked-in Android `versionCode + 1` at build time without editing version
-files. That internal code is consumed: the next official APK must use a still-higher code. Signing material
+files. That internal code is consumed: the next official APK must use a still-higher code. Official
+releases normally use the semantic version with dots removed as their baseline code, but may check in a
+higher monotonic integer when necessary to remain installable over a distributed preview or other signed
+build. The guarded runner accepts that explicit code when it is at least the semantic-version baseline.
+TubePulse v4.3.1 therefore uses Android `versionCode 434`. Signing material
 stays at its existing path and is neither copied nor printed. Remove all four task registrations with:
 
 ```powershell
@@ -90,7 +94,9 @@ Current full-release behavior, in order:
    - `app.json` `expo.version`
    - `android/app/build.gradle` `versionName`
    - `android/app/build.gradle` `versionCode`
-5. Derives `versionCode` by stripping dots from the requested version, for example `3.2.4` becomes `324`.
+5. In the legacy full-release path, derives `versionCode` by stripping dots from the requested version,
+   for example `3.2.4` becomes `324`. Releases that require a higher explicit monotonic code use the
+   prepared checked-in metadata with the guarded Official build-only path instead.
 6. Runs `npm install --no-audit --no-fund`.
 7. Runs `android\gradlew.bat assembleRelease --no-daemon`.
 8. Signs `android/app/build/outputs/apk/release/app-release.apk` with `android/app/debug.keystore`.
@@ -152,7 +158,9 @@ The current release process works, but it has too much authority in one command:
 - Release commits now stage only `app.json` and `android/app/build.gradle`, and the script blocks unrelated tracked changes before committing.
 - Commit and push failures are fatal before GitHub release creation or APK upload.
 - Release signing currently uses `android/app/debug.keystore`; this is current behavior, not a reviewed long-term signing policy.
-- `versionCode` is derived by stripping dots. This can create future ordering problems, for example when version segments become more than one digit.
+- The legacy full-release path derives `versionCode` by stripping dots. Prepared releases may instead
+  check in a higher explicit monotonic code; the guarded Official runner accepts it when it is at least
+  the semantic-version baseline. This keeps updates installable over already distributed signed builds.
 - `package.json` has its own `version`, but that is tooling metadata and should not be treated as the app release version.
 - Google Services ownership is confusing: `app.json` points at the ignored root `google-services.json`, while `android/app/google-services.json` is tracked and used by the Android project.
 - Validate-only mode exists for release preflight checks.
@@ -237,6 +245,7 @@ Completed in the current script:
 - fatal commit/push handling before release upload;
 - build-only and validate-only modes.
 
-Remaining review items are release signing, Google Services ownership, and a future-proof `versionCode` policy.
+Remaining review items are release signing, Google Services ownership, and teaching the legacy full-release
+command to consume an explicitly prepared monotonic `versionCode` instead of deriving one automatically.
 
 Historical local APKs can be deleted locally after confirming they are ignored and no longer needed for manual rollback. Do not commit those artifacts.

@@ -1,8 +1,8 @@
 const listeners = new Set();
 
-export function notifyLocalSeenChanged() {
+export function notifyLocalSeenChanged(change = null) {
   for (const listener of listeners) {
-    try { listener(); } catch { /* one screen listener must not block others */ }
+    try { listener(change); } catch { /* one screen listener must not block others */ }
   }
 }
 

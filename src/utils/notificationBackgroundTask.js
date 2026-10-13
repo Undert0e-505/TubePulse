@@ -1,27 +1,24 @@
 import * as Notifications from 'expo-notifications';
 import * as TaskManager from 'expo-task-manager';
-import { isNotificationAction } from './localNotificationSilence.mjs';
 import {
   processLocalNotificationActionResponse,
   processNotificationSeenResponse,
 } from './notificationActionRuntime';
-import { NOTIFICATION_ACTIONS } from './localNotificationSilence.mjs';
 import { createRetryableAsyncSetup } from './retryableAsyncSetup.mjs';
+import { processBackgroundNotificationActionPayload } from './notificationBackgroundAction.mjs';
 
 export const LOCAL_NOTIFICATION_RESPONSE_TASK = 'TUBEPULSE_LOCAL_NOTIFICATION_RESPONSE';
 
 // Expo also invokes this task for remote receipt. RNFirebase owns receipt and
 // local display, so only action responses are handled here.
 if (!TaskManager.isTaskDefined(LOCAL_NOTIFICATION_RESPONSE_TASK)) {
-  TaskManager.defineTask(LOCAL_NOTIFICATION_RESPONSE_TASK, async ({ data, error }) => {
-    if (error || !data || typeof data !== 'object' || !('actionIdentifier' in data)) return;
-    if (!isNotificationAction(data.actionIdentifier)) return;
-    if (data.actionIdentifier === NOTIFICATION_ACTIONS.MARK_SEEN) {
-      await processNotificationSeenResponse(data);
-    } else {
-      await processLocalNotificationActionResponse(data);
-    }
-  });
+  TaskManager.defineTask(LOCAL_NOTIFICATION_RESPONSE_TASK, async (task) => (
+    await processBackgroundNotificationActionPayload(task, {
+      processSeen: processNotificationSeenResponse,
+      processSilence: processLocalNotificationActionResponse,
+      warn: (message) => console.warn(message),
+    })
+  ));
 }
 
 const registerNotificationResponseTask = createRetryableAsyncSetup(async () => {

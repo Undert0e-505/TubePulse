@@ -52,6 +52,10 @@ the backend's detection or notification behavior.
 - Use the right-aligned **Mark seen** control on a channel heading to clear that channel without
   opening YouTube. **Mark all seen** appears above the list only while unseen content exists.
 
+Blue dots and both Mark seen controls use the same represented content currently shown in the feed.
+An older unseen item outside that visible slice does not leave a stray control behind; if it is later
+promoted into view, its dot and applicable control appear together.
+
 TubePulse updates seen state locally first. If the service or network is unavailable, exact content
 IDs remain in a durable local queue and retry later on normal app lifecycle and refresh
 opportunities. The app does not restore a blue dot merely because a remote save failed.
@@ -121,6 +125,9 @@ Expand a normal single-item TubePulse notification to use **Mute 1h**, **Mute 8h
 in that order. **Mark seen** clears exactly the item represented by that notification without
 opening YouTube. A channel bundle clears exactly its bundled snapshot. Newer content that arrives
 after the notification was created remains unseen.
+The action works while TubePulse is open, in the background or swiped away. After the exact content
+IDs are saved to the local retry queue, Android dismisses the notification used for the action; a
+newer replacement from the same channel is protected and remains visible.
 The mute controls are device-local and affect sound only: later notifications still arrive, remain in
 the Android notification shade, update the feed/widget, and keep their ordinary unseen/reminder
 state. Pressing a mute action does not open YouTube or mark anything seen.

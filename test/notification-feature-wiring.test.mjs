@@ -46,7 +46,9 @@ test('background action task loads before App and action taps exit before defaul
   assert.ok(index.indexOf("./src/utils/notificationBackgroundTask") < index.indexOf("./App"));
   assert.ok(app.indexOf("if (route === 'silence')") < app.indexOf('const data = messageOrResponse?.data'));
   assert.match(backgroundTask, /ensureNotificationResponseTaskRegistered/);
-  assert.match(backgroundTask, /processLocalNotificationActionResponse\(data\)/);
+  assert.match(backgroundTask, /await processBackgroundNotificationActionPayload\(task/);
+  assert.match(backgroundTask, /processSilence:\s*processLocalNotificationActionResponse/);
+  assert.match(backgroundTask, /processSeen:\s*processNotificationSeenResponse/);
   assert.ok(app.indexOf('ensureNotificationResponseTaskRegistered()') < app.indexOf('await registerDevice('));
 });
 
@@ -67,7 +69,11 @@ test('Home owns local sound recovery while Settings retains update accessibility
   assert.ok(home.indexOf('style={styles.channelNameBtn}') < home.indexOf('style={styles.markSeenLozenge}'));
   assert.match(home, /accessibilityLabel="Mark all content seen"/);
   assert.match(home, /subscribeLocalSeenChanges/);
-  assert.match(actionRuntime, /notifyLocalSeenChanged\(\)/);
+  assert.match(actionRuntime, /notifyLocalSeenChanged\(details\)/);
+  assert.match(home, /pendingSeenRef\.current = collectPendingSeenIds\(queued\)/);
+  assert.match(home, /selectEffectiveChannelUnseen/);
+  assert.match(home, /setSeenOverlayRevision\(\(revision\) => revision \+ 1\)/);
+  assert.match(home, /extraData=\{seenOverlayRevision\}/);
   assert.match(home, /unmuteLozenge:\s*\{[\s\S]*?flexShrink: 0,/);
   assert.match(home, /nextNotificationSilenceExpiry/);
   assert.match(home, /AppState\.addEventListener/);

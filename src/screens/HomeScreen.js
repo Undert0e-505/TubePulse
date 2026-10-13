@@ -58,7 +58,12 @@ import {
 import { NOTIFICATION_ACTIONS } from '../utils/localNotificationSilence.mjs';
 import { dismissCoveredNotifications } from '../utils/notificationActionRuntime';
 import { subscribeLocalSeenChanges } from '../utils/localSeenEvents';
-import { collectChannelUnseenSnapshots, collectUnseenContentSnapshot } from '../utils/seenSnapshots.mjs';
+import { collectChannelUnseenSnapshots } from '../utils/seenSnapshots.mjs';
+import {
+  collectPendingSeenIds,
+  effectiveContentId,
+  selectEffectiveChannelUnseen,
+} from '../utils/effectiveUnseen.mjs';
 
 const THUMB_UP_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#666666" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
   <path d="M7 22V11" />
@@ -88,6 +93,7 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
   const [previewInitializationPending, setPreviewInitializationPending] = useState(IS_TUBEPULSE_PREVIEW);
   const [nowMs, setNowMs] = useState(Date.now());
   const [silenceState, setSilenceState] = useState(() => emptySilenceState());
+  const [seenOverlayRevision, setSeenOverlayRevision] = useState(0);
   // Hold the latest cache in a ref so refresh() can be stable
   // (depending on `cache` directly caused an infinite re-render loop
   //  because setCache -> new refresh -> new useEffect -> new autoFetch -> new setCache)
@@ -97,17 +103,21 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
   // YouTube) doesn't overwrite the optimistic clear before markSeen
   // has been processed server-side.
   const recentlySeenRef = useRef(new Set());
+  const pendingSeenRef = useRef(new Set());
   const firstFocusRef = useRef(true);
   const previewInitializationPendingRef = useRef(IS_TUBEPULSE_PREVIEW);
 
   const loadData = useCallback(async () => {
-    const [ch, s, ls, ca, cds] = await Promise.all([
+    const [ch, s, ls, ca, cds, queued] = await Promise.all([
       getChannels(),
       getSettings(),
       getLastSeen(),
       getChannelCache(),
       getChannelDisplaySettings(),
+      readSeenMutationQueue(AsyncStorage),
     ]);
+    pendingSeenRef.current = collectPendingSeenIds(queued);
+    for (const id of pendingSeenRef.current) recentlySeenRef.current.add(id);
     cacheRef.current = ca || {};
     setChannels(ch);
     setSettings(s);
@@ -141,11 +151,13 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
     // restart while offline cannot bring blue dots back before retry succeeds.
     try {
       const queued = await readSeenMutationQueue(AsyncStorage);
-      for (const intent of queued.intents) {
-        for (const id of intent.contentIds) recentlySeenRef.current.add(id);
-      }
+      pendingSeenRef.current = collectPendingSeenIds(queued);
+      for (const id of pendingSeenRef.current) recentlySeenRef.current.add(id);
     } catch { /* local cache below remains the fallback */ }
-    const seenSnapshot = new Set(recentlySeenRef.current);
+    const seenSnapshot = new Set([
+      ...recentlySeenRef.current,
+      ...pendingSeenRef.current,
+    ]);
     try {
       const deviceId = await getDeviceId();
       if (deviceId) {
@@ -276,6 +288,7 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
             for (const v of (serverChannel.videos || [])) {
               if (!v.unwatched && seenSnapshot.has(v.videoId)) {
                 recentlySeenRef.current.delete(v.videoId);
+                pendingSeenRef.current.delete(v.videoId);
                 prunedCount++;
               }
             }
@@ -283,6 +296,7 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
               const pid = getPostSeenId(p);
               if (!p.unwatched && pid && seenSnapshot.has(pid)) {
                 recentlySeenRef.current.delete(pid);
+                pendingSeenRef.current.delete(pid);
                 prunedCount++;
               }
             }
@@ -335,13 +349,16 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
       if (IS_TUBEPULSE_PREVIEW) previewInitializationPendingRef.current = false;
 
       // Init has written cache data — re-read everything before refreshing
-      const [freshChannels, freshCache, freshLastSeen, freshSettings, freshDisplaySettings] = await Promise.all([
+      const [freshChannels, freshCache, freshLastSeen, freshSettings, freshDisplaySettings, queued] = await Promise.all([
         getChannels(),
         getChannelCache(),
         getLastSeen(),
         getSettings(),
         getChannelDisplaySettings(),
+        readSeenMutationQueue(AsyncStorage),
       ]);
+      pendingSeenRef.current = collectPendingSeenIds(queued);
+      for (const id of pendingSeenRef.current) recentlySeenRef.current.add(id);
       cacheRef.current = freshCache || {};
       setChannels(freshChannels);
       setCache(freshCache);
@@ -400,7 +417,9 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
 
   useEffect(() => subscribeLocalNotificationSilence(setSilenceState), []);
 
-  useEffect(() => subscribeLocalSeenChanges(() => {
+  useEffect(() => subscribeLocalSeenChanges((change) => {
+    for (const id of (change?.contentIds || [])) recentlySeenRef.current.add(id);
+    setSeenOverlayRevision((revision) => revision + 1);
     loadData().catch(() => {});
   }), [loadData]);
 
@@ -433,8 +452,6 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
     return sortPostsNewestFirst(cached.posts);
   };
 
-  const isPostUnwatched = (post) => post?.unwatched === true;
-
   const selectPersistentLatestContent = (handle) => {
     return chooseLatestChannelContent(getVideos(handle)[0] || null, getPosts(handle)[0] || null);
   };
@@ -445,37 +462,32 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
     return settings.latestVideosPerChannel || 1;
   };
 
+  const getRepresentedVideos = (handle) => (
+    getVideos(handle).slice(0, getEffectiveVideoCount(handle))
+  );
+
+  const getEffectiveUnseenState = (handle) => {
+    const allVideos = getVideos(handle);
+    const latestVideo = allVideos[0] || null;
+    return selectEffectiveChannelUnseen({
+      videos: allVideos,
+      posts: getPosts(handle),
+      maxVideos: getEffectiveVideoCount(handle),
+      locallySeenIds: recentlySeenRef.current,
+      pendingSeenIds: pendingSeenRef.current,
+      isPostRepresented: (post) => chooseLatestChannelContent(latestVideo, post)?.type === 'post',
+    });
+  };
+
   const getVisiblePosts = (handle) => {
-    const posts = getPosts(handle);
-    const latestVideo = getVideos(handle)[0] || null;
-    const visibleUnseen = posts.filter((post) => (
-      isPostUnwatched(post)
-      && chooseLatestChannelContent(latestVideo, post)?.type === 'post'
-    ));
+    const visibleUnseen = getEffectiveUnseenState(handle).posts;
     if (visibleUnseen.length > 0) return visibleUnseen;
     const persistent = selectPersistentLatestContent(handle);
     if (persistent?.type === 'post') return [persistent.item];
     return [];
   };
 
-  const getUnseenVideos = (handle) => {
-    // Source of truth: the server's `unwatched` flag on each video in
-    // the cache (populated from the /feed response). The local
-    // `seenIds` is a UI cache used elsewhere (e.g. to display the
-    // "seen" dot), but it is NOT a reliable filter for unseen videos:
-    //   - The loadData sync only ADDS to seenIds (for videos the
-    //     server marks as seen), never REMOVES (when the server
-    //     later un-sees one, e.g. a missed-tap re-add or a cron
-    //     re-classification).
-    //   - A previous markSeen for a videoId that's since been
-    //     re-classified as unseen server-side would still be in the
-    //     local seenIds and would hide the video.
-    // Result: filtering by !seenIds.includes() silently drops videos
-    // the user genuinely hasn't watched yet, making the home screen
-    // fall back to [latestVideo] when seenIds happens to cover
-    // everything.
-    return getVideos(handle).filter(v => v.unwatched === true);
-  };
+  const getUnseenVideos = (handle) => getEffectiveUnseenState(handle).videos;
 
   const unseenCount = (handle) => getUnseenVideos(handle).length;
 
@@ -550,7 +562,7 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
     // a delayed retry from consuming a newer arrival.
     const allChannelVideos = getVideos(handle);
     const allChannelPosts = getPosts(handle);
-    const allIds = contentIds || collectUnseenContentSnapshot(allChannelVideos, allChannelPosts);
+    const allIds = contentIds || getEffectiveUnseenState(handle).contentIds;
     const idSet = new Set(allIds);
     const allVideos = allChannelVideos.filter((video) => idSet.has(video.videoId));
     const allPosts = allChannelPosts.filter((post) => idSet.has(getPostSeenId(post)));
@@ -588,7 +600,7 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
         };
         changed = true;
       }
-      if (cached.posts?.some((post) => isPostUnwatched(post) && idSet.has(getPostSeenId(post)))) {
+      if (cached.posts?.some((post) => post?.unwatched === true && idSet.has(getPostSeenId(post)))) {
         updatedCache[handle] = {
           ...updatedCache[handle],
           posts: cached.posts.map((post) => idSet.has(getPostSeenId(post))
@@ -623,7 +635,11 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
     // Freeze every channel's exact snapshot before the first await. An FCM
     // arrival after this tap must remain unseen even if local processing takes
     // long enough for the new item to reach the cache.
-    const snapshots = collectChannelUnseenSnapshots(channels, getVideos, getPosts);
+    const snapshots = collectChannelUnseenSnapshots(
+      channels,
+      (handle) => getEffectiveUnseenState(handle).videos,
+      (handle) => getEffectiveUnseenState(handle).posts,
+    );
     const snapshotIds = [];
     for (const snapshot of snapshots) {
       const ids = await markAllSeen({
@@ -714,11 +730,7 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
   };
 
   const getUnseenPosts = (handle) => {
-    const latestVideo = getVideos(handle)[0] || null;
-    return getPosts(handle).filter((post) => (
-      isPostUnwatched(post)
-      && chooseLatestChannelContent(latestVideo, post)?.type === 'post'
-    ));
+    return getEffectiveUnseenState(handle).posts;
   };
 
   const isNew = (handle) => unseenCount(handle) > 0 || getUnseenPosts(handle).length > 0;
@@ -752,7 +764,7 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
     const hasNew = isNew(item.handle);
     const displayName = cached?.name || item.name || item.handle;
     const effectiveCount = getEffectiveVideoCount(item.handle);
-    const allVideos = getVideos(item.handle);
+    const allVideos = getRepresentedVideos(item.handle);
     const persistent = selectPersistentLatestContent(item.handle);
     const silenceUntil = channelSilenceUntil(silenceState, item.channelId);
     const localPresentation = notificationSilencePresentation(silenceState, item.channelId);
@@ -834,9 +846,10 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
         )}
 
         {posts.map((post) => {
-          // Server-driven: post.unwatched reflects the device's
-          // per-channel state. No local seenIds lookup.
-          const isSeen = !post.unwatched;
+          // Use the same effective represented-content model as the channel
+          // and global controls, including pending exact-ID acknowledgements.
+          const isSeen = !getUnseenPosts(item.handle)
+            .some((candidate) => effectiveContentId(candidate, 'post') === effectiveContentId(post, 'post'));
           const likeLabel = post.likeCount != null ? formatCount(post.likeCount) : null;
           const viewLabel = post.viewCount != null ? formatViews(post.viewCount) : (post.viewText || null);
           return (
@@ -990,6 +1003,7 @@ export default function HomeScreen({ navigation, previewInitializationMarker = n
     <View style={styles.container}>
       <FlatList
         data={displayedChannels}
+        extraData={seenOverlayRevision}
         keyExtractor={(item) => item.handle}
         renderItem={renderChannel}
         refreshControl={

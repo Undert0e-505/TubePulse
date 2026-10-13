@@ -55,6 +55,8 @@ test('FeaturePreview alone uses the fixed scoped init hook and all builds verify
   assert.equal(/InitScript/i.test(parameterBlock), false);
   assert.match(buildSource, /\$apkVc -ne \$expectedApkVersionCode/);
   assert.match(runnerSource, /if \(\$Mode -eq 'FeaturePreview'\) \{\s*\$expectedApkVersionCode = \[string\]\(\(\[int\]\$versionCode\) \+ 1\)\s*\}/);
+  assert.match(runnerSource, /\$minimumVersionCode = \[int\]\(\$version -replace '\\\.', ''\)/);
+  assert.match(runnerSource, /\[int\]\$versionCode -lt \$minimumVersionCode/);
   assert.match(runnerSource, /if \(\$Mode -eq 'FeaturePreview'\) \{\s*\$arguments \+= @\('-BuildOnlyVersionCodeOverride', \$expectedApkVersionCode\)\s*\}/);
   assert.match(runnerSource, /Assert-ReleaseApk -ApkPath \$outputPath -ExpectedVersion \$version -ExpectedVersionCode \$expectedApkVersionCode/);
   assert.equal((runnerSource.match(/'-BuildOnlyVersionCodeOverride'/g) || []).length, 1);

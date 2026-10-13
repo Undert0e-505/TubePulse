@@ -513,7 +513,8 @@ Writes `device:{deviceId}:override:{channelId}` (or deletes it if the override i
   normalize to no exceptions; enabling global mute again clears prior exceptions, while clearing
   global mute removes them as meaningless.
 - Registers the Expo response task before advertising `local-v1`; foreground and headless action
-  handling share one persist-before-dismiss path. A normal notification exposes `Mute 1h`, `Mute
+  handling normalize Expo's mapped `content.data` and raw headless `content.dataString` forms into
+  one fail-closed response before entering the shared persist-before-dismiss path. A normal notification exposes `Mute 1h`, `Mute
   8h`, then `Mark seen`; channel bundles move `Mute all` into their available action set. Muted
   notifications retain their applicable unmute actions and add `Mark seen` last. Prewarnings omit
   seen actions because they do not enter unseen state. Locally rendered notifications select from the same
@@ -521,8 +522,11 @@ Writes `device:{deviceId}:override:{channelId}` (or deletes it if the override i
   that chooses their audible/silent Android channel. Home exposes `Silent until HH:MM` with `Unmute`
   per timed channel and `Silent` with `Unmute all` for the global state. Right-justified channel
   **Mark seen** and conditional global **Mark all seen** controls have separate non-navigation hit
-  areas and update blue dots, widget and notification tray immediately, refreshing on action,
-  focus/resume and the nearest saved expiry without backend traffic.
+  areas. Blue dots and both controls use the same effective represented-content state: the current
+  visible slice with exact local and queued seen IDs overlaid. Hidden older content does not leave a
+  control without a matching dot, but becomes actionable if later promoted. Actions update that
+  state, the widget and notification tray immediately, refreshing on action, focus/resume and the
+  nearest saved expiry without backend traffic.
 
 ### 9.2 What the app does NOT do
 
@@ -550,10 +554,14 @@ FCM presentation is capability-gated for release compatibility:
    before any feed request, through the audible or silent channel.
 3. Foreground and background receipt reuse one presentation function. The existing tag is dismissed
    before replacement, and the notification retains the same tap/seen semantics.
-4. Mute action responses update only local sound state. `Mark seen` queues exact represented IDs,
-   updates local cache/widget/tray, and uses the same path in foreground, background or terminated
-   state. Body taps retain navigation plus seen handling. A headless Expo task handles actions and
-   ignores receipt events because RNFirebase owns message receipt.
+4. Mute action responses update only local sound state. `Mark seen` durably queues exact represented
+   IDs, dismisses the exact acted-on presentation, then updates local cache/widget/tray and retries
+   server delivery. Per-presentation request IDs prevent an older action from dismissing a newer
+   same-channel notification; compatibility notifications are dismissed only after current-payload
+   coverage is verified. The same path runs in foreground, background or terminated state. The
+   headless Expo task parses the native `content.dataString` object form, preserves the request
+   identifier and fails closed on malformed or unexpected payloads. Body taps retain navigation plus
+   seen handling; receipt events remain with RNFirebase.
 5. Feed/cache/widget refresh remains best effort after presentation.
 
 The capability cutover requires both sides. The API registration path must persist `local-v1` and

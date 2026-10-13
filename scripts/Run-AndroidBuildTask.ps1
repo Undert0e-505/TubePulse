@@ -207,7 +207,8 @@ try {
     $versionName = $Matches[1]
     if ($buildGradle -notmatch 'versionCode (\d+)') { throw 'Could not read Gradle versionCode.' }
     $versionCode = $Matches[1]
-    if ($versionName -ne $version -or $versionCode -ne ($version -replace '\.', '')) {
+    $minimumVersionCode = [int]($version -replace '\.', '')
+    if ($versionName -ne $version -or [int]$versionCode -lt $minimumVersionCode) {
         throw "Version metadata is inconsistent ($version / $versionName / $versionCode)."
     }
     $expectedApkVersionCode = $versionCode

@@ -10,6 +10,10 @@ import {
 } from './localNotificationSilence.mjs';
 import { getLocalNotificationPresentation } from './localNotificationSilenceStorage';
 import { createRetryableAsyncSetup } from './retryableAsyncSetup.mjs';
+import {
+  notificationPresentationIdentifier,
+  notificationTag,
+} from './notificationIdentity.mjs';
 
 export function isLocallyRenderedRemoteMessage(remoteMessage) {
   return remoteMessage?.data?.localRender === '1';
@@ -100,13 +104,6 @@ export async function setupLocalNotificationPresentation() {
   await ensureNotificationCategory();
 }
 
-function notificationTag(data) {
-  return data.notificationTag
-    || (data.videoId ? `video-${data.videoId}` : null)
-    || (data.activityId ? `post-${data.activityId}` : null)
-    || null;
-}
-
 export async function presentRemoteMessageLocally(remoteMessage) {
   if (!isLocallyRenderedRemoteMessage(remoteMessage)) return false;
   const Notifications = require('expo-notifications');
@@ -127,7 +124,10 @@ export async function presentRemoteMessageLocally(remoteMessage) {
   const localPresentation = await getLocalNotificationPresentation(data.channelId || null);
   const silent = localPresentation.silent;
   const channelId = silent ? 'new-videos-silent' : 'new-videos';
-  const identifier = tag ? `local-${tag}` : `local-${remoteMessage?.messageId || Date.now()}`;
+  // The tag remains stable for replacement, while the Android request ID is
+  // unique to this FCM/snapshot. An action from an older notification can then
+  // acknowledge only that old request and can never cancel a newer replacement.
+  const identifier = notificationPresentationIdentifier(data, remoteMessage?.messageId);
 
   try {
     const presented = await Notifications.getPresentedNotificationsAsync();

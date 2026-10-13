@@ -18,6 +18,21 @@ function response(actionIdentifier = NOTIFICATION_ACTIONS.MUTE_CHANNEL_1H) {
   };
 }
 
+function rawHeadlessResponse(actionIdentifier) {
+  const mapped = response(actionIdentifier);
+  return {
+    ...mapped,
+    notification: {
+      request: {
+        ...mapped.notification.request,
+        content: {
+          dataString: JSON.stringify(mapped.notification.request.content.data),
+        },
+      },
+    },
+  };
+}
+
 test('action response exposes the exact notification and channel identifiers', () => {
   assert.deepEqual(notificationActionDetails(response()), {
     actionIdentifier: NOTIFICATION_ACTIONS.MUTE_CHANNEL_1H,
@@ -34,7 +49,8 @@ test('foreground/background/headless action path persists before exact dismissal
     ['headless', NOTIFICATION_ACTIONS.UNMUTE_ALL],
   ]) {
     const events = [];
-    const result = await handleLocalNotificationActionResponse(response(action), {
+    const event = mode === 'headless' ? rawHeadlessResponse(action) : response(action);
+    const result = await handleLocalNotificationActionResponse(event, {
       persistAction: async (action, channelId) => {
         events.push(`${mode}:persist:${action}:${channelId}`);
         return { globalMuted: false, channels: { 'UC-one': 123 } };

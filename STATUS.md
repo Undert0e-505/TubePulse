@@ -1,9 +1,9 @@
 # TubePulse - Project Status
 
-**Last updated:** 2026-10-12
+**Last updated:** 2026-10-13
 **Current repo branch:** `master`
-**Current app version in repo:** `4.3.0`
-**Android versionCode/versionName in repo:** `430` / `4.3.0`
+**Current app version in repo:** `4.3.1`
+**Android versionCode/versionName in repo:** `434` / `4.3.1`
 **Repo:** [Undert0e-505/TubePulse](https://github.com/Undert0e-505/TubePulse)
 **Platform:** Android only (React Native + Expo)
 
@@ -17,8 +17,8 @@ Repo evidence as of this document update:
 
 | Area | Current evidence |
 |---|---|
-| App version | `app.json` has `expo.version = 4.3.0` |
-| Android version | `android/app/build.gradle` has `versionCode 430`, `versionName "4.3.0"` |
+| App version | `app.json` has `expo.version = 4.3.1` |
+| Android version | `android/app/build.gradle` has `versionCode 434`, `versionName "4.3.1"` |
 | API base URL | `src/utils/api.js` uses `EXPO_PUBLIC_TUBEPULSE_API_URL` when built with one and otherwise preserves `https://tubepulse-api.jimothyoakley55.workers.dev`; optional fallback is disabled unless separately configured |
 | Release script | `build-and-release.ps1` is the current local release path |
 | Feature preview build | The limited, current-user `FeaturePreview` scheduled task signs a production-package APK from reviewed uncommitted feature work while rejecting secrets and app identity/signing/endpoint-policy changes; it keeps the checked-in visible versionName, injects checked-in versionCode + 1 without editing version files, and runs no Git/GitHub actions. The next official code must exceed the latest preview code. |
@@ -36,7 +36,7 @@ The stack was activated locally on 2026-10-06. Live validation proved a successf
 
 Same-LAN anonymous Viewer access is enabled for Grafana on the production host through ignored host configuration plus a Windows Firewall rule restricted to the active physical interface, the Private profile, `LocalSubnet`, and TCP port 3000. Prometheus, the collector, and authority status remain loopback-only. The tracked default for a fresh clone is still loopback-only; [`monitoring/README.md`](monitoring/README.md) documents inspection, DHCP/address caveats, and removal.
 
-Release v4.3.0 adds exact-snapshot **Mark seen** actions to notifications and channel rows, a conditional batched **Mark all seen** control, immediate local feed/widget/tray updates, and bounded durable retry. The batch `/seen` request is additive: released clients retain their existing single-channel request and payload contracts. Monitoring now derives notification delivery from persisted monotonic Firebase outcome counters, collects on aligned `HH:mm:30` slots with bounded scheduler-completion awareness, and exposes privacy-safe permanent-invalid-token lifecycle counts. The expired one-time pre-counter reconstruction used during the monitoring cutover has been retired; supported charts now rely only on the durable live counter pipeline.
+Release v4.3.1 hardens v4.3.0's exact-snapshot **Mark seen** flow: raw Expo headless action payloads are normalized before routing, acknowledgement dismisses the exact acted-on notification after durable queueing, and blue dots plus channel/global seen controls now share one represented-content state with pending local IDs overlaid. A newer same-channel presentation remains protected, and hidden older content becomes actionable only if it is promoted into the visible slice. The batch `/seen` request remains additive and older clients retain their existing contracts. Monitoring continues to use persisted monotonic Firebase outcome counters, aligned `HH:mm:30` collection with bounded scheduler-completion awareness, and privacy-safe permanent-invalid-token lifecycle counts.
 
 ---
 
@@ -55,7 +55,7 @@ The scheduled Worker deployments below are retained rollback/history assets. The
 | `tubepulse-api` | Version `7d418086-f904-494e-ae23-0498a9233ac8`; serves the unchanged app URL and the privacy-safe service-status route. Every authenticated feed uses the unified Home store over VPC while current, with D1 fallback; authenticated mutations are Home-first with deferred atomic D1 backup. See the production D1 cutover section for the currently verified deployment. |
 | `worker/archive/tubepulse-resolver` | Not deployed; archive remains reference-only. |
 
-The checked-in app version is `4.3.0` with Android `versionCode 430`. Worker deployment is separate from app APK release; this release does not imply a Worker deployment.
+The checked-in app version is `4.3.1` with Android `versionCode 434`. Worker deployment is separate from app APK release; this patch requires no Worker or host deployment.
 
 Community-post worker/app support is enabled only when `TUBEPULSE_ENABLE_COMMUNITY_POSTS` is set to `1`, `true`, or `yes`. When enabled, cron polls active subscribed channels from `channels:active`. `TUBEPULSE_COMMUNITY_POST_CHANNEL_ALLOWLIST` is optional and narrows polling only when non-empty; missing or blank means all active channels are eligible. First-poll seeding remains silent to avoid old-post spam for newly added channels.
 
@@ -93,7 +93,7 @@ Safe read-only checks showed:
 
 Keep these version labels distinct:
 
-- App/release version evidence in this repo is `4.3.0` with Android `versionCode 430`.
+- App/release version evidence in this repo is `4.3.1` with Android `versionCode 434`.
 - API worker health response reports Worker contract `version: "3.0.0"`; it is intentionally independent of the Android app release version.
 
 `worker/tubepulse-api/wrangler.toml` intentionally commits no custom route. The live `workers.dev` endpoint remains enabled and unchanged; route ownership is separate from the app release version.
