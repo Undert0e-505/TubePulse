@@ -52,6 +52,7 @@ test('stale Home authority is replaced from the exact canonical snapshot and rea
     local, client, gate, syncStateFile, now: () => Date.UTC(2026, 9, 4, 20, 30),
   });
   assert.equal(result.reconciled, true);
+  assert.deepEqual(result.result.affectedChannelIds, []);
   assert.equal(local.values.has('old'), false);
   assert.equal(local.values.get('alpha'), 'one');
   assert.equal(local.values.get('beta'), 'two');
@@ -61,6 +62,39 @@ test('stale Home authority is replaced from the exact canonical snapshot and rea
   const sync = await syncStateFile.read();
   assert.equal(sync.lastPull.canonicalReset, true);
   assert.equal(Object.keys(sync.baseline).length, 2);
+});
+
+test('canonical recovery identifies only changed video feed channels for revalidation', async (t) => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tubepulse-reconcile-channels-'));
+  t.after(() => fs.rm(dataDir, { recursive: true, force: true }));
+  const channelId = 'UC0000000000000000000000';
+  const recentKey = `channel:${channelId}:recent`;
+  const knownKey = `channel:${channelId}:known:videos`;
+  const local = new MemoryAdapter({
+    [recentKey]: '[{"videoId":"new"}]',
+    [knownKey]: '{"ids":["new"]}',
+    [`channel:${channelId}:meta`]: '{"title":"same"}',
+  });
+  const canonical = snapshot({
+    [recentKey]: '[{"videoId":"old"}]',
+    [knownKey]: '{"ids":["old"]}',
+    [`channel:${channelId}:meta`]: '{"title":"same"}',
+  });
+  const client = {
+    async status() { return { replication: { status: 'stale' } }; },
+    async snapshotCanonical() { return canonical; },
+    async activateCanonical() {}, async releaseReconciliation() {}, async markStale() {},
+  };
+  const result = await ensureHomeAuthorityCurrent({
+    local, client,
+    gate: {
+      async status() { return { replication: { status: 'stale' } }; },
+      async reconcile() {},
+    },
+    syncStateFile: new JsonStateFile(path.join(dataDir, 'sync.json'), {}),
+  });
+  assert.deepEqual(result.result.affectedChannelIds, [channelId]);
+  assert.equal(JSON.stringify(result.result).includes(channelId), false);
 });
 
 test('current local and remote authorities do not perform an expensive snapshot pull', async () => {

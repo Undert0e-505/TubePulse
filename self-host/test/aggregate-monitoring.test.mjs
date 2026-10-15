@@ -42,6 +42,10 @@ test('aggregate monitoring counts profiles and subscriptions without exposing re
       status: 'ready', mode: 'active', authority: { replication: { status: 'current' } },
       scheduler: {
         mode: 'active', lease: { state: 'held' }, lastMinuteJobs: { scheduledAt: now - 10_000 },
+        lastNotificationDelivery: {
+          barrier: 'failed', reason: 'feed-not-visible', visibilityBlocked: 1,
+          visibilityDevices: 1, visibilityChannels: 1,
+        },
         notificationIntents: {
           pending: 2, overduePending: 1, oldestPendingAgeSeconds: 75,
           fcmAcceptedTotal: 123, fcmFailedTotal: 4,
@@ -88,6 +92,8 @@ test('aggregate monitoring counts profiles and subscriptions without exposing re
   assert.equal(payload.notifications.pending, 2);
   assert.equal(payload.notifications.durableBacklog, 1);
   assert.equal(payload.notifications.oldestPendingAgeSeconds, 75);
+  assert.equal(payload.notifications.barrierHealthy, true);
+  assert.equal(payload.notifications.barrierDegraded, true);
   assert.equal(payload.notifications.fcmAcceptedTotal, 123);
   assert.equal(payload.notifications.fcmFailedTotal, 4);
   assert.equal(payload.notifications.permanentInvalidTokenResponsesTotal, 3);
@@ -165,6 +171,39 @@ test('aggregate monitoring distinguishes a current YouTube error from cumulative
   assert.equal(payload.youtube.lastErrorPresent, true);
   assert.equal(payload.youtube.general.failures, 7);
   assert.equal(payload.youtube.statistics.failures, 2);
+});
+
+test('aggregate monitoring clears a retained scheduler incident after newer terminal progress', async () => {
+  const now = Date.parse('2026-10-15T17:43:00.000Z');
+  const payload = await collectAggregateMonitoring({
+    adapter: new MemoryAdapter({ 'channels:active': '[]' }),
+    nowMs: now,
+    localStatus: {
+      scheduler: {
+        startedAt: '2026-10-15T16:00:00.000Z',
+        lastError: { at: '2026-10-15T17:41:00.250Z', recovery: 'reconciled' },
+        youtubeDataApi: { lastGoodAt: '2026-10-15T17:40:43.000Z' },
+        lastSweep: { outcome: 'not-due', scheduledAt: '2026-10-15T17:42:00.000Z' },
+        lastMinuteJobs: { scheduledAt: '2026-10-15T17:42:00.000Z' },
+        lastNotificationDelivery: { barrier: 'not-needed', observedAt: '2026-10-15T17:42:08.000Z' },
+      },
+    },
+  });
+  assert.equal(payload.host.lastErrorPresent, false);
+  assert.equal(payload.host.schedulerProgressAgeSeconds, 52);
+
+  const unresolved = await collectAggregateMonitoring({
+    adapter: new MemoryAdapter({ 'channels:active': '[]' }),
+    nowMs: now,
+    localStatus: {
+      scheduler: {
+        lastError: { at: '2026-10-15T17:42:30.000Z', recovery: 'pending' },
+        lastMinuteJobs: { scheduledAt: '2026-10-15T17:42:00.000Z' },
+        lastNotificationDelivery: { barrier: 'not-needed', observedAt: '2026-10-15T17:42:08.000Z' },
+      },
+    },
+  });
+  assert.equal(unresolved.host.lastErrorPresent, true);
 });
 
 test('aggregate monitoring preserves explicit zero and tolerates invalid rows', async () => {

@@ -29,6 +29,7 @@ test('Prometheus exposition contains aggregate labels and excludes identifiers',
         liveWatch: { enabled: true, units: 30, requests: 30, dailyCap: 2000, remaining: 1970, ratio: 0.015, active: 2, inWindow: 1, degraded: false },
         notifications: {
           pending: 2, oldestPendingAgeSeconds: 75, durableBacklog: 1,
+          barrierHealthy: true, barrierDegraded: true,
           fcmAcceptedTotal: 123, fcmFailedTotal: 4,
           fcmAcceptedInterval: 3, fcmFailedInterval: 1,
           permanentInvalidTokenResponsesTotal: 3,
@@ -64,6 +65,8 @@ test('Prometheus exposition contains aggregate labels and excludes identifiers',
   assert.match(metrics, /tubepulse_notifications_pending 2/);
   assert.match(metrics, /tubepulse_notifications_oldest_pending_age_seconds 75/);
   assert.match(metrics, /tubepulse_notifications_durable_backlog 1/);
+  assert.match(metrics, /tubepulse_notifications_barrier_healthy 1/);
+  assert.match(metrics, /tubepulse_notifications_barrier_degraded 1/);
   assert.match(metrics, /# HELP tubepulse_notifications_fcm_accepted_total FCM send requests accepted successfully by Firebase; this does not confirm handset delivery\./);
   assert.match(metrics, /# TYPE tubepulse_notifications_fcm_accepted_total counter/);
   assert.match(metrics, /tubepulse_notifications_fcm_accepted_total 123/);

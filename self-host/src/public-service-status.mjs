@@ -1,6 +1,8 @@
 const HEALTHY_PROGRESS_AGE_MS = 11 * 60 * 1000;
 const OUTAGE_PROGRESS_AGE_MS = 16 * 60 * 1000;
 const HEALTHY_BARRIERS = new Set(['passed', 'not-required', 'not-needed']);
+const ISOLATED_FEED_BLOCKED_LIMIT = 2;
+const ISOLATED_FEED_AGE_LIMIT_SECONDS = 15 * 60;
 
 function timestamp(value) {
   const parsed = Date.parse(String(value || ''));
@@ -22,12 +24,19 @@ function response(status, observedAt, since = null) {
   return { status, message: messages[status], observedAt, since };
 }
 
-function progressTimestamp(scheduler) {
-  return timestamp(scheduler?.youtubeDataApi?.lastGoodAt)
-    ?? timestamp(scheduler?.youtubeDataApi?.lastCycle?.finishedAt)
-    ?? timestamp(scheduler?.lastSweep?.finishedAt)
-    ?? timestamp(scheduler?.lastMinuteJobs?.scheduledAt)
-    ?? timestamp(scheduler?.startedAt);
+export function latestSchedulerProgressTimestamp(scheduler) {
+  const candidates = [
+    scheduler?.youtubeDataApi?.lastGoodAt,
+    scheduler?.youtubeDataApi?.lastCycle?.finishedAt,
+    scheduler?.lastSweep?.finishedAt,
+    scheduler?.lastSweep?.scheduledAt,
+    scheduler?.lastMinuteJobs?.scheduledAt,
+    scheduler?.lastNotificationDelivery?.barrier
+      ? scheduler?.lastNotificationDelivery?.observedAt
+      : null,
+    scheduler?.startedAt,
+  ].map(timestamp).filter((value) => value !== null);
+  return candidates.length > 0 ? Math.max(...candidates) : null;
 }
 
 function unsupersededSchedulerError(scheduler, progressAt) {
@@ -36,9 +45,23 @@ function unsupersededSchedulerError(scheduler, progressAt) {
     && (errorAt === null || progressAt === null || errorAt >= progressAt);
 }
 
-function notificationBarrierFault(scheduler) {
+export function classifyNotificationBarrier(scheduler) {
   const delivery = scheduler?.lastNotificationDelivery;
-  return Boolean(delivery?.barrier && !HEALTHY_BARRIERS.has(delivery.barrier));
+  if (!delivery?.barrier || HEALTHY_BARRIERS.has(delivery.barrier)) return 'healthy';
+  if (delivery.reason !== 'feed-not-visible') return 'outage';
+
+  const intents = scheduler?.notificationIntents || {};
+  const blocked = Number(delivery.visibilityBlocked);
+  const devices = Number(delivery.visibilityDevices);
+  const channels = Number(delivery.visibilityChannels);
+  const overdue = Number(intents.overduePending || 0);
+  const oldestAge = Number(intents.oldestPendingAgeSeconds || 0);
+  const bounded = Number.isFinite(blocked) && blocked > 0 && blocked <= ISOLATED_FEED_BLOCKED_LIMIT
+    && Number.isFinite(devices) && devices > 0 && devices <= 1
+    && Number.isFinite(channels) && channels > 0 && channels <= 1
+    && overdue <= ISOLATED_FEED_BLOCKED_LIMIT
+    && oldestAge <= ISOLATED_FEED_AGE_LIMIT_SECONDS;
+  return bounded ? 'degraded' : 'outage';
 }
 
 function notificationAttention(scheduler) {
@@ -57,7 +80,7 @@ export function classifyPublicServiceStatus(localStatus, { nowMs = Date.now() } 
   const scheduler = localStatus?.scheduler || {};
   const authority = localStatus?.authority || {};
   const configuration = localStatus?.configuration || {};
-  const progressAt = progressTimestamp(scheduler);
+  const progressAt = latestSchedulerProgressTimestamp(scheduler);
 
   const capabilityUnavailable = localStatus?.status !== 'ready'
     || localStatus?.mode !== 'active'
@@ -73,9 +96,19 @@ export function classifyPublicServiceStatus(localStatus, { nowMs = Date.now() } 
     return response('outage', observedAt, new Date(Math.min(nowMs, sinceAt)).toISOString());
   }
 
-  if (unsupersededSchedulerError(scheduler, progressAt) || notificationBarrierFault(scheduler)) {
+  if (unsupersededSchedulerError(scheduler, progressAt)) {
     const sinceAt = timestamp(scheduler?.lastError?.at) ?? progressAt ?? nowMs;
     return response('outage', observedAt, new Date(Math.min(nowMs, sinceAt)).toISOString());
+  }
+
+  const barrierStatus = classifyNotificationBarrier(scheduler);
+  if (barrierStatus === 'outage') {
+    const sinceAt = timestamp(scheduler?.lastNotificationDelivery?.observedAt) ?? progressAt ?? nowMs;
+    return response('outage', observedAt, new Date(Math.min(nowMs, sinceAt)).toISOString());
+  }
+  if (barrierStatus === 'degraded') {
+    const sinceAt = timestamp(scheduler?.lastNotificationDelivery?.observedAt);
+    return response('degraded', observedAt, sinceAt === null ? null : new Date(sinceAt).toISOString());
   }
 
   if (scheduler?.youtubeDataApi?.lastError
@@ -103,4 +136,6 @@ export function classifyPublicServiceStatus(localStatus, { nowMs = Date.now() } 
 export const publicServiceStatusTestHelpers = {
   HEALTHY_PROGRESS_AGE_MS,
   OUTAGE_PROGRESS_AGE_MS,
+  ISOLATED_FEED_BLOCKED_LIMIT,
+  ISOLATED_FEED_AGE_LIMIT_SECONDS,
 };

@@ -200,6 +200,42 @@ test('missing production feed visibility suppresses FCM after bounded retries', 
   assert.equal(callbacks, 0);
   assert.equal(result.suppressed, 1);
   assert.equal(result.reason, 'feed-not-visible');
+  assert.equal(result.visibilityBlocked, 1);
+  assert.equal(result.visibilityDevices, 1);
+  assert.equal(result.visibilityChannels, 1);
+});
+
+test('a durable intent remains pending until visible, then sends and resolves exactly once', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'tubepulse-visibility-repair-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const store = new DurableNotificationIntentStore(directory);
+  let visible = false;
+  let sends = 0;
+  const coordinator = new ProductionNotificationCoordinator({
+    ...barrierConfig, gatewayConvergenceRequired: false,
+  }, {
+    intentStore: store,
+    fetchImpl: async () => jsonResponse({ channels: [{
+      channelId: 'UC-synthetic',
+      videos: visible ? [{ videoId: 'video-new', unwatched: true }] : [],
+      posts: [],
+    }] }),
+    tokenProvider: async () => 'token',
+    sender: async () => { sends++; return { sent: true, deadToken: false }; },
+    sleep: async () => {},
+  });
+
+  const first = await coordinator.flush([intent()], {});
+  assert.equal(first.reason, 'feed-not-visible');
+  assert.equal((await store.summary()).pending, 1);
+  assert.deepEqual(await coordinator.pendingChannelIds(), ['UC-synthetic']);
+  visible = true;
+  const repaired = await coordinator.flush([], {});
+  assert.equal(repaired.sent, 1);
+  assert.equal(sends, 1);
+  assert.equal((await store.summary()).sent, 1);
+  await coordinator.flush([], {});
+  assert.equal(sends, 1);
 });
 
 test('an invisible stale nag cannot block a separately visible new-video notification', async () => {

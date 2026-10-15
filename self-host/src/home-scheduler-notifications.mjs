@@ -445,6 +445,12 @@ export class ProductionNotificationCoordinator {
 
   async stage(intents) { return await this.intentStore.stage(intents); }
 
+  async pendingChannelIds() {
+    return [...new Set((await this.intentStore.pending())
+      .map(({ intent }) => intent?.channelId)
+      .filter(Boolean))].sort();
+  }
+
   async applyRecoveredResult(intent, delivery, workerEnv) {
     const kv = workerEnv?.TUBEPULSE_KV;
     if (!kv || (!delivery?.sent && !delivery?.deadToken)) return;
@@ -591,6 +597,8 @@ export class ProductionNotificationCoordinator {
       ok: false,
       attempts: this.config.retryCount + 1,
       deviceCount: new Set(intents.map((intent) => intent.deviceId)).size,
+      invisibleDeviceCount: new Set([...unresolved.values()].map((intent) => intent.deviceId)).size,
+      invisibleChannelCount: new Set([...unresolved.values()].map((intent) => intent.channelId)).size,
       visibleIntentIds: [...visibleIntentIds],
       invisibleCount: unresolved.size,
       reason: 'feed-not-visible',
@@ -675,7 +683,9 @@ export class ProductionNotificationCoordinator {
       return {
         queued: queued.length, deduplicated, recovered, sent: 0, failed: 0, suppressed: pending.length,
         transientExpired, barrier: 'failed', reason: visibility.reason, convergenceAttempts: convergence.attempts,
-        visibilityAttempts: visibility.attempts,
+        visibilityAttempts: visibility.attempts, visibilityBlocked: visibility.invisibleCount,
+        visibilityDevices: visibility.invisibleDeviceCount,
+        visibilityChannels: visibility.invisibleChannelCount,
       };
     }
 
@@ -731,6 +741,10 @@ export class ProductionNotificationCoordinator {
       suppressed: recovered + blockedCount,
       barrier: blockedCount > 0 ? 'partial' : 'passed',
       ...(blockedCount > 0 ? { reason: visibility.reason, visibilityBlocked: blockedCount } : {}),
+      ...(blockedCount > 0 ? {
+        visibilityDevices: visibility.invisibleDeviceCount,
+        visibilityChannels: visibility.invisibleChannelCount,
+      } : {}),
       callbackFailures, convergenceAttempts: convergence.attempts, visibilityAttempts: visibility.attempts,
     };
   }

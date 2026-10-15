@@ -135,6 +135,7 @@ export function prometheusText({ snapshot, collector, nowMs = Date.now() }) {
     metric(`tubepulse_notifications_${field.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`)}`, host.notifications?.[field]);
   }
   metric('tubepulse_notifications_barrier_healthy', bool(host.notifications?.barrierHealthy));
+  metric('tubepulse_notifications_barrier_degraded', bool(host.notifications?.barrierDegraded));
   metric('tubepulse_authority_remote_available', bool(host.authority?.remoteAvailable));
   metric('tubepulse_authority_current', bool(host.authority?.current));
   metric('tubepulse_authority_pending_backup_keys', host.authority?.pendingBackupKeys);

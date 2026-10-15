@@ -1051,6 +1051,43 @@ test('active startup does not resume a sweep whose local state was replaced by r
   assert.equal(started.currentSweep.failureReason, 'authority-reconciled-after-sweep-start');
 });
 
+test('active startup prioritizes channels implicated by durable pending intents for revalidation', async (t) => {
+  const dataDir = await temporaryDirectory(t);
+  const { channels, entries } = canonicalChannels(1);
+  const stateFile = createHomeSchedulerStateFile(dataDir, 'active');
+  const state = await stateFile.read();
+  state.youtubeDataApi = {
+    channels: {
+      [channels[0]]: {
+        videoCount: 10,
+        uploadsPlaylistId: `UU${channels[0].slice(2)}`,
+        lastReconciledAt: '2026-10-15T14:55:00.000Z',
+      },
+    },
+  };
+  await stateFile.write(state);
+  const runner = new HomeSchedulerRunner({
+    config: config(dataDir, {
+      mode: 'active', remoteWriteEnabled: true, notificationsEnabled: true,
+      schedulesDisabled: true, notificationBarrier: { configured: true },
+    }),
+    runtime: new FakeRuntime(new MemoryNamespace(entries)),
+    stateFile,
+    authorityGate: new FakeAuthorityGate(),
+    authorityClient: new FakeAuthorityClient(new MemoryAdapter(entries)),
+    notificationCoordinator: {
+      async pendingChannelIds() { return [channels[0]]; },
+      async stage() {}, async flush() {}, async suppress() {},
+    },
+    rssPoller: async () => {}, postPoller: async () => {}, auxRunner: async () => {},
+  });
+  await runner.start();
+  t.after(() => runner.close());
+  const started = await stateFile.read();
+  assert.ok(started.youtubeDataApi.channels[channels[0]].recoveryRevalidationAt);
+  assert.equal(started.youtubeDataApi.channels[channels[0]].lastReconciledAt, '2026-10-15T14:55:00.000Z');
+});
+
 test('standby performs no polling, mutation, notification, or remote write', async (t) => {
   const dataDir = await temporaryDirectory(t);
   const remote = new MemoryAdapter(canonicalChannels(2).entries);
@@ -1517,6 +1554,109 @@ test('simultaneous API mutation and scheduler publication use global-then-local 
     'scheduler-global-acquire', 'scheduler-local-acquire', 'scheduler-global-commit',
     'scheduler-local-verify', 'scheduler-local-release',
   ]);
+});
+
+test('active scheduler waits for a short API lease and completes without recovery or stale authority', async (t) => {
+  const dataDir = await temporaryDirectory(t);
+  const { entries } = canonicalChannels(1);
+  const remote = new MemoryAdapter(entries);
+  let clock = Date.UTC(2026, 9, 15, 12, 0, 0);
+  let recoveryCalls = 0;
+  const gate = new FakeAuthorityGate();
+  gate.lease = 'api-mutation-lease';
+  gate.acquire = async function acquire({ leaseId }) {
+    if (this.lease) throw new Error('Home authority lease busy');
+    this.lease = leaseId;
+  };
+  const runner = new HomeSchedulerRunner({
+    config: config(dataDir, {
+      mode: 'active', remoteWriteEnabled: true, notificationsEnabled: true,
+      schedulesDisabled: true, notificationBarrier: { configured: true },
+    }),
+    runtime: new FakeRuntime(new MemoryNamespace(entries)), remote,
+    authorityGate: gate, authorityClient: new FakeAuthorityClient(remote),
+    notificationCoordinator: {
+      async stage() {},
+      async flush() { return { queued: 0, sent: 0, failed: 0, suppressed: 0, barrier: 'not-needed' }; },
+    },
+    recoverAuthority: async () => { recoveryCalls++; return { reconciled: true }; },
+    now: () => clock,
+    sleep: async (ms) => {
+      clock += ms;
+      if (clock >= Date.UTC(2026, 9, 15, 12, 0, 0, 500)) gate.lease = null;
+    },
+    localLeaseRetryMs: 1_000,
+    localLeaseRetryIntervalMs: 250,
+    rssPoller: async () => {}, postPoller: async () => {}, auxRunner: async () => {},
+  });
+  await runner.start();
+  t.after(() => runner.close());
+  const result = await runner.runTick(Date.UTC(2026, 9, 15, 12, 0), { forceSweep: true });
+  assert.equal(result.outcome, 'ok');
+  assert.equal(recoveryCalls, 0);
+  assert.equal(gate.stale, false);
+  assert.equal((await runner.status()).lastError, null);
+});
+
+test('long API lease contention defers an aligned sweep without recovery and the next minute executes it', async (t) => {
+  const dataDir = await temporaryDirectory(t);
+  const { channels, entries } = canonicalChannels(2);
+  const remote = new MemoryAdapter(entries);
+  let clock = Date.UTC(2026, 9, 15, 12, 0, 0);
+  let recoveryCalls = 0;
+  const visited = [];
+  const gate = new FakeAuthorityGate();
+  gate.lease = 'api-mutation-lease';
+  gate.acquire = async function acquire({ leaseId }) {
+    if (this.lease) throw new Error('Home authority lease busy');
+    this.lease = leaseId;
+  };
+  const runner = new HomeSchedulerRunner({
+    config: config(dataDir, {
+      mode: 'active', remoteWriteEnabled: true, notificationsEnabled: true,
+      schedulesDisabled: true, notificationBarrier: { configured: true },
+    }),
+    runtime: new FakeRuntime(new MemoryNamespace(entries)), remote,
+    authorityGate: gate, authorityClient: new FakeAuthorityClient(remote),
+    notificationCoordinator: {
+      async stage() {},
+      async flush() { return { queued: 0, sent: 0, failed: 0, suppressed: 0, barrier: 'not-needed' }; },
+    },
+    recoverAuthority: async () => { recoveryCalls++; return { reconciled: true }; },
+    now: () => clock,
+    sleep: async (ms) => { clock += ms; },
+    localLeaseRetryMs: 500,
+    localLeaseRetryIntervalMs: 250,
+    rssPoller: async (_env, _ctx, channelId) => { visited.push(channelId); },
+    postPoller: async () => {}, auxRunner: async () => {},
+  });
+  await runner.start();
+  t.after(() => runner.close());
+  const scheduled = Date.UTC(2026, 9, 15, 12, 0);
+  let contention;
+  try {
+    await runner.runTick(scheduled);
+    assert.fail('expected bounded local lease contention');
+  } catch (error) {
+    contention = error;
+  }
+  await runner.handleScheduledTickError(contention, scheduled);
+  let state = await runner.status();
+  assert.equal(state.lastError, null);
+  assert.equal(state.deferredVideoSweep.due, true);
+  assert.equal(state.lastContention.outcome, 'lease-contention-skipped');
+  assert.equal(recoveryCalls, 0);
+  assert.equal(gate.stale, false);
+
+  gate.lease = null;
+  clock = Date.UTC(2026, 9, 15, 12, 1, 0);
+  const result = await runner.runTick(clock);
+  assert.equal(result.outcome, 'ok');
+  assert.deepEqual(new Set(visited), new Set(channels), 'the deferred full sweep runs off-boundary');
+  state = await runner.status();
+  assert.equal(state.deferredVideoSweep, null);
+  assert.equal(recoveryCalls, 0);
+  assert.equal(gate.stale, false);
 });
 
 test('publication cap coalesces a durable backup queue and flushes it after quota recovery while Home stays readable', async (t) => {

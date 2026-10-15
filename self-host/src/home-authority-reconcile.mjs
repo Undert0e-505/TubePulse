@@ -11,6 +11,19 @@ function canonicalBaseline(records) {
   }]));
 }
 
+function affectedVideoChannels(pull) {
+  const channelIds = new Set();
+  for (const key of [
+    ...(pull.importedKeys || []),
+    ...(pull.updatedKeys || []),
+    ...(pull.deletedKeys || []),
+  ]) {
+    const match = /^channel:([^:]+):(?:recent|known:videos)$/.exec(key);
+    if (match) channelIds.add(match[1]);
+  }
+  return [...channelIds].sort();
+}
+
 export async function reconcileHomeAuthority({ local, client, gate, syncStateFile, now = Date.now }) {
   let canonical;
   try {
@@ -47,7 +60,7 @@ export async function reconcileHomeAuthority({ local, client, gate, syncStateFil
       throw error;
     }
 
-    return {
+    const result = {
       ok: true,
       recordCount: manifest.recordCount,
       canonicalReset: true,
@@ -56,6 +69,12 @@ export async function reconcileHomeAuthority({ local, client, gate, syncStateFil
       deleted: pull.deleted,
       unchanged: pull.unchanged,
     };
+    // Recovery routing needs exact internal channel identities, but the
+    // operator CLI JSON must remain aggregate-only.
+    Object.defineProperty(result, 'affectedChannelIds', {
+      value: affectedVideoChannels(pull), enumerable: false,
+    });
+    return result;
   } catch (error) {
     if (canonical?.leaseId) await client.releaseReconciliation(canonical.leaseId).catch(() => {});
     throw error;

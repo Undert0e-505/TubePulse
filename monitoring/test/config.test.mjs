@@ -432,6 +432,11 @@ test('wallboard coalesces only an absent Worker-error window without masking cor
       `${metric} must not be defaulted healthy when its telemetry is absent`,
     );
   }
+  assert.match(statusExpr, /tubepulse_notifications_barrier_degraded == bool 0/);
+  assert.ok(
+    attentionTargets.some(({ expr }) => expr.includes('tubepulse_notifications_barrier_degraded')),
+    'an isolated visibility mismatch must be attention without becoming a core fault',
+  );
 });
 
 test('channels and subscriptions stat remains readable at mobile widths', () => {

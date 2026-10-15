@@ -249,6 +249,7 @@ test('exact canonical snapshot install validates every hash and preserves exclud
   });
   assert.deepEqual(result, {
     imported: 1, updated: 1, deleted: 1, unchanged: 0,
+    importedKeys: ['bravo'], updatedKeys: ['alpha'], deletedKeys: ['old'],
     hash: manifestHash, recordCount: 2,
   });
   assert.deepEqual(Object.fromEntries(adapter.values), {

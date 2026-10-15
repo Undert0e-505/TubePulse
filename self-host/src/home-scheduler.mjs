@@ -60,6 +60,8 @@ import {
 
 const FIVE_MINUTES_MS = 5 * 60 * 1000;
 const MINUTE_MS = 60 * 1000;
+const LOCAL_AUTHORITY_LEASE_RETRY_MS = 20_000;
+const LOCAL_AUTHORITY_LEASE_RETRY_INTERVAL_MS = 250;
 
 function iso(now = Date.now()) {
   return new Date(now).toISOString();
@@ -67,6 +69,18 @@ function iso(now = Date.now()) {
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export class HomeAuthorityLeaseContentionError extends Error {
+  constructor(message = 'Home authority lease remained busy after bounded retry') {
+    super(message);
+    this.name = 'HomeAuthorityLeaseContentionError';
+    this.code = 'HOME_AUTHORITY_LEASE_CONTENTION';
+  }
+}
+
+function isHomeAuthorityLeaseBusy(error) {
+  return String(error?.message || error) === 'Home authority lease busy';
 }
 
 function freshSchedulerState(mode = 'shadow') {
@@ -80,6 +94,8 @@ function freshSchedulerState(mode = 'shadow') {
     lastSweep: null,
     lastMinuteJobs: null,
     lastNotificationDelivery: null,
+    lastContention: null,
+    deferredVideoSweep: null,
     lastError: null,
     nextSweepAt: null,
     overlapSkips: 0,
@@ -625,11 +641,24 @@ function isAuthorityLocalOnlyKey(name) {
 }
 
 export class ActivePublicationStrategy {
-  constructor({ local, gate, client, leaseTtlMs = 180_000 }) {
+  constructor({
+    local,
+    gate,
+    client,
+    leaseTtlMs = 180_000,
+    now = Date.now,
+    sleep = delay,
+    localLeaseRetryMs = LOCAL_AUTHORITY_LEASE_RETRY_MS,
+    localLeaseRetryIntervalMs = LOCAL_AUTHORITY_LEASE_RETRY_INTERVAL_MS,
+  }) {
     this.local = local;
     this.gate = gate;
     this.client = client;
     this.leaseTtlMs = leaseTtlMs;
+    this.now = now;
+    this.sleep = sleep;
+    this.localLeaseRetryMs = localLeaseRetryMs;
+    this.localLeaseRetryIntervalMs = localLeaseRetryIntervalMs;
     this.workerKv = new WorkerKvFacade(local);
     this.leaseId = null;
     this.heartbeat = null;
@@ -638,8 +667,21 @@ export class ActivePublicationStrategy {
   }
   async prepare() {
     if (this.leaseId) throw new Error('Local authority publication is already prepared');
-    this.leaseId = `scheduler-${crypto.randomUUID()}`;
-    await this.gate.acquire({ leaseId: this.leaseId, kind: 'scheduler' });
+    const leaseId = `scheduler-${crypto.randomUUID()}`;
+    const deadline = this.now() + this.localLeaseRetryMs;
+    while (true) {
+      try {
+        await this.gate.acquire({ leaseId, kind: 'scheduler' });
+        break;
+      } catch (error) {
+        if (!isHomeAuthorityLeaseBusy(error)) throw error;
+        if (this.now() >= deadline) throw new HomeAuthorityLeaseContentionError();
+        await this.sleep(Math.min(this.localLeaseRetryIntervalMs, Math.max(1, deadline - this.now())));
+      }
+    }
+    // Assign ownership only after acquisition. A failed acquisition must
+    // never be aborted as though the scheduler owned the API mutation lease.
+    this.leaseId = leaseId;
     this.heartbeat = setInterval(() => {
       this.gate.renew(this.leaseId).catch(() => {});
     }, Math.max(1000, Math.floor(this.leaseTtlMs / 3)));
@@ -777,6 +819,8 @@ export class HomeSchedulerRunner {
     authorityGate = null,
     authorityClient = null,
     recoverAuthority = null,
+    localLeaseRetryMs = LOCAL_AUTHORITY_LEASE_RETRY_MS,
+    localLeaseRetryIntervalMs = LOCAL_AUTHORITY_LEASE_RETRY_INTERVAL_MS,
   }) {
     this.config = config;
     this.runtime = runtime || new TubePulseRuntime({
@@ -800,6 +844,8 @@ export class HomeSchedulerRunner {
     this.authorityGate = authorityGate;
     this.authorityClient = authorityClient;
     this.recoverAuthority = recoverAuthority;
+    this.localLeaseRetryMs = localLeaseRetryMs;
+    this.localLeaseRetryIntervalMs = localLeaseRetryIntervalMs;
     this.publication = null;
     this.running = false;
     this.timer = null;
@@ -848,6 +894,10 @@ export class HomeSchedulerRunner {
           gate: this.authorityGate,
           client: this.authorityClient,
           leaseTtlMs: this.config.leaseTtlMs,
+          now: this.now,
+          sleep: this.sleep,
+          localLeaseRetryMs: this.localLeaseRetryMs,
+          localLeaseRetryIntervalMs: this.localLeaseRetryIntervalMs,
         });
         this.notificationCoordinator ||= new ProductionNotificationCoordinator(this.config.notificationBarrier, {
           intentStore: new DurableNotificationIntentStore(this.config.dataDir, { now: this.now }),
@@ -863,6 +913,16 @@ export class HomeSchedulerRunner {
       const state = await this.stateFile.read();
       state.rssHealth = normalizeRssHealthState(state.rssHealth, this.now());
       state.youtubeDataApi = normalizeYoutubeDataApiState(state.youtubeDataApi, this.now());
+      if (this.config.mode === 'active'
+        && typeof this.notificationCoordinator?.pendingChannelIds === 'function') {
+        const markedAt = iso(this.now());
+        for (const channelId of await this.notificationCoordinator.pendingChannelIds()) {
+          state.youtubeDataApi.channels[channelId] = {
+            ...(state.youtubeDataApi.channels[channelId] || {}),
+            recoveryRevalidationAt: markedAt,
+          };
+        }
+      }
       state.preciseLiveWatch = normalizePreciseLiveWatchState(state.preciseLiveWatch, this.now());
       if (this.config.preciseLiveWatchEnabled && !state.preciseLiveWatch.enabledAt) {
         state.preciseLiveWatch.enabledAt = iso(this.now());
@@ -933,6 +993,29 @@ export class HomeSchedulerRunner {
       },
       TUBEPULSE_KV_MUTATION_LOCK: (name, operation) => this.kvMutationMutex.run(name, operation),
     };
+  }
+
+  async scheduleCanonicalRecoveryRevalidation(recovery) {
+    if (!recovery?.reconciled) return [];
+    const affected = recovery?.result?.affectedChannelIds || [];
+    const pending = typeof this.notificationCoordinator?.pendingChannelIds === 'function'
+      ? await this.notificationCoordinator.pendingChannelIds()
+      : [];
+    const channelIds = [...new Set([...affected, ...pending])].filter(Boolean).sort();
+    if (channelIds.length === 0) return [];
+
+    const state = await this.stateFile.read();
+    const health = normalizeYoutubeDataApiState(state.youtubeDataApi, this.now());
+    const markedAt = iso(this.now());
+    for (const channelId of channelIds) {
+      health.channels[channelId] = {
+        ...(health.channels[channelId] || {}),
+        recoveryRevalidationAt: markedAt,
+      };
+    }
+    state.youtubeDataApi = health;
+    await this.stateFile.write(state);
+    return channelIds;
   }
 
   postQuota(channelCount) {
@@ -1306,6 +1389,7 @@ export class HomeSchedulerRunner {
       const confirmedEmpty = Number.isFinite(videoCount) && videoCount === 0;
       const lastReconciled = Date.parse(previous.lastReconciledAt || '');
       const safetyDue = !Number.isFinite(lastReconciled) || this.now() - lastReconciled >= safetyMs;
+      const recoveryDue = Boolean(previous.recoveryRevalidationAt);
       health.channels[channelId] = {
         ...previous,
         uploadsPlaylistId,
@@ -1322,17 +1406,21 @@ export class HomeSchedulerRunner {
           paginationBoundReached: false,
         } : {}),
       };
+      if (confirmedEmpty) delete health.channels[channelId].recoveryRevalidationAt;
       // A valid zero-video channel has no uploads to enumerate. Some such
       // channels return 404 for their otherwise valid uploads playlist, so
       // record an empty successful baseline without spending another quota
       // unit. A later 0 -> 1 detector change still enters reconciliation and
       // discovers the first upload normally.
-      if (!confirmedEmpty && uploadsPlaylistId && (baselineMissing || changed || safetyDue)) {
-        candidates.push({ channelId, baselineMissing, changed, safetyDue, uploadsPlaylistId, lastReconciled });
+      if (!confirmedEmpty && uploadsPlaylistId && (recoveryDue || baselineMissing || changed || safetyDue)) {
+        candidates.push({
+          channelId, recoveryDue, baselineMissing, changed, safetyDue, uploadsPlaylistId, lastReconciled,
+        });
       }
     }
     candidates.sort((left, right) => (
-      Number(right.changed) - Number(left.changed)
+      Number(right.recoveryDue) - Number(left.recoveryDue)
+      || Number(right.changed) - Number(left.changed)
       || Number(right.baselineMissing) - Number(left.baselineMissing)
       || (Number.isFinite(left.lastReconciled) ? left.lastReconciled : 0)
         - (Number.isFinite(right.lastReconciled) ? right.lastReconciled : 0)
@@ -1374,6 +1462,7 @@ export class HomeSchedulerRunner {
           lastPageCount: result.pageCount,
           paginationBoundReached: result.truncatedWithoutOverlap,
         };
+        delete health.channels[candidate.channelId].recoveryRevalidationAt;
         state.youtubeDataApi = health;
         await this.stateFile.write(state);
         reconcileResults.push({ channelId: candidate.channelId, outcome: 'ok', pageCount: result.pageCount, processed: processed?.outcome });
@@ -2028,6 +2117,10 @@ export class HomeSchedulerRunner {
     const pendingNotifications = new Set();
     const alignedVideoDirty = new Set();
     try {
+      const initialState = await this.stateFile.read();
+      const deferredSweepDue = !preciseLiveOnly && Boolean(initialState.deferredVideoSweep?.due);
+      const effectiveForceSweep = forceSweep || deferredSweepDue;
+      const effectiveForcePosts = forcePosts || deferredSweepDue;
       // Minute ticks keep posts/aux work aligned. Video detection itself is
       // batched and runs only on aligned five-minute boundaries.
       const shouldPrepare = true;
@@ -2047,8 +2140,8 @@ export class HomeSchedulerRunner {
         target, notifications, notificationQueue, pendingNotifications, alignedVideoDirty,
       );
       const sweep = preciseLiveOnly ? null : this.config.videoSourceMode === 'youtube-api'
-        ? await this.runYoutubeDataApiCycle(env, target, scheduledTime, { force: forceSweep })
-        : forceSweep
+        ? await this.runYoutubeDataApiCycle(env, target, scheduledTime, { force: effectiveForceSweep })
+        : effectiveForceSweep
           ? await this.runRssSweep(env, target, scheduledTime)
           : await this.runRssCohort(env, target, scheduledTime);
       let preciseLiveWatch = { outcome: 'disabled', livePairs: new Set() };
@@ -2062,7 +2155,8 @@ export class HomeSchedulerRunner {
       let alignedNotifications = { outcome: 'disabled' };
       if (this.config.alignedVideoNotificationsEnabled
         && (preciseLiveWatch.livePairs?.size > 0
-          || (!preciseLiveOnly && Math.floor(scheduledTime / MINUTE_MS) % 5 === 0))
+          || (!preciseLiveOnly && (effectiveForceSweep
+            || Math.floor(scheduledTime / MINUTE_MS) % 5 === 0)))
         && (preciseLiveWatch.livePairs?.size > 0 || sweep?.outcome !== 'error')) {
         const alignedContext = new WaitUntilContext();
         alignedNotifications = await runAlignedVideoNotifications(env, alignedContext, scheduledTime, {
@@ -2074,7 +2168,7 @@ export class HomeSchedulerRunner {
       }
       const minuteJobs = preciseLiveOnly
         ? null
-        : await this.runMinuteJobs(env, target, scheduledTime, { forcePosts });
+        : await this.runMinuteJobs(env, target, scheduledTime, { forcePosts: effectiveForcePosts });
       if (minuteJobs) minuteJobs.alignedVideoNotifications = alignedNotifications;
       let publication;
       let notificationPublication = null;
@@ -2116,6 +2210,7 @@ export class HomeSchedulerRunner {
         };
       }
       if (minuteJobs) state.lastMinuteJobs = minuteJobs;
+      if (deferredSweepDue && sweep?.outcome !== 'error') state.deferredVideoSweep = null;
       state.lastPreciseLiveWatch = {
         ...preciseLiveWatch,
         livePairs: undefined,
@@ -2125,7 +2220,7 @@ export class HomeSchedulerRunner {
         notificationPublication,
         scheduledAt: iso(scheduledTime),
       };
-      state.lastNotificationDelivery = notificationDelivery;
+      state.lastNotificationDelivery = { ...notificationDelivery, observedAt: iso(this.now()) };
       state.nextSweepAt = iso(nextFiveMinuteBoundary(this.now()));
       await this.stateFile.write(state);
       return {
@@ -2144,6 +2239,26 @@ export class HomeSchedulerRunner {
     const state = await this.stateFile.read();
     const failedAt = iso(this.now());
     const message = String(error?.message || error || 'Unknown scheduler tick error').slice(0, 300);
+    if (error instanceof HomeAuthorityLeaseContentionError
+      || error?.code === 'HOME_AUTHORITY_LEASE_CONTENTION') {
+      const fiveMinuteTick = Math.floor(scheduledTime / MINUTE_MS) % 5 === 0;
+      state.lastContention = {
+        at: failedAt,
+        scheduledAt: iso(scheduledTime),
+        outcome: 'lease-contention-skipped',
+        retryWindowMs: LOCAL_AUTHORITY_LEASE_RETRY_MS,
+        deferredVideoSweep: fiveMinuteTick,
+      };
+      if (fiveMinuteTick) {
+        state.deferredVideoSweep = { due: true, scheduledAt: iso(scheduledTime), deferredAt: failedAt };
+      }
+      state.nextSweepAt = fiveMinuteTick
+        ? iso(Math.min(nextFiveMinuteBoundary(this.now()), this.now() + MINUTE_MS))
+        : iso(nextFiveMinuteBoundary(this.now()));
+      await this.stateFile.write(state);
+      console.warn('TubePulse Home scheduled tick deferred for local authority lease contention');
+      return;
+    }
     if (state.currentSweep?.status === 'running') {
       state.currentSweep = { ...state.currentSweep, status: 'failed', failedAt };
     }
@@ -2154,11 +2269,13 @@ export class HomeSchedulerRunner {
     if (!this.recoverAuthority) return;
     try {
       const recovery = await this.recoverAuthority(error);
+      const recoveryRevalidationChannels = await this.scheduleCanonicalRecoveryRevalidation(recovery);
       const recoveredState = await this.stateFile.read();
       recoveredState.lastError = {
         ...recoveredState.lastError,
         recovery: recovery?.reconciled ? 'reconciled' : 'already-current',
         recoveredAt: iso(this.now()),
+        recoveryRevalidationChannels: recoveryRevalidationChannels.length,
       };
       await this.stateFile.write(recoveredState);
     } catch (recoveryError) {

@@ -97,6 +97,7 @@ export class UnifiedHomeAuthorityService {
 
   async start() {
     let runnerStarted = false;
+    let startupRecovery = null;
     try {
       // The unified service owns the process lease before starting workerd or
       // reconciling. HomeSchedulerRunner reuses this same lease instance.
@@ -126,7 +127,7 @@ export class UnifiedHomeAuthorityService {
         gate: this.gate,
         syncStateFile,
       });
-      if (this.config.mode === 'active' && !this.runner) await ensureCurrent();
+      if (this.config.mode === 'active' && !this.runner) startupRecovery = await ensureCurrent();
       this.ingress = new HomeAuthorityIngress({
         secret: this.config.authority.secret,
         gate: this.gate,
@@ -174,6 +175,9 @@ export class UnifiedHomeAuthorityService {
       });
       await this.runner.start();
       runnerStarted = true;
+      if (startupRecovery?.reconciled) {
+        await this.runner.scheduleCanonicalRecoveryRevalidation(startupRecovery);
+      }
       if (this.config.mode === 'active') await this.runner.run();
 
       this.server = http.createServer((request, response) => {

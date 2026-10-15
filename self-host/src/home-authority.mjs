@@ -530,11 +530,15 @@ export async function installAuthoritySnapshot(adapter, snapshot) {
   const localKeys = (await adapter.listKeys())
     .map(({ name }) => name)
     .filter(isAuthorityCanonicalKey);
-  const summary = { imported: 0, updated: 0, deleted: 0, unchanged: 0 };
+  const summary = {
+    imported: 0, updated: 0, deleted: 0, unchanged: 0,
+    importedKeys: [], updatedKeys: [], deletedKeys: [],
+  };
   for (const key of localKeys) {
     if (!expected.has(key)) {
       await adapter.delete(key);
       summary.deleted++;
+      summary.deletedKeys.push(key);
     }
   }
   for (const record of [...expected.values()].sort((left, right) => left.key.localeCompare(right.key))) {
@@ -548,6 +552,8 @@ export async function installAuthoritySnapshot(adapter, snapshot) {
     });
     if (current === null || current === undefined) summary.imported++;
     else summary.updated++;
+    if (current === null || current === undefined) summary.importedKeys.push(record.key);
+    else summary.updatedKeys.push(record.key);
   }
   return { ...summary, ...manifest };
 }

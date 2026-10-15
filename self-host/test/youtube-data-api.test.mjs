@@ -466,3 +466,92 @@ test('an unchanged detector baseline cannot suppress an established channel migr
   assert.equal(playlistCalls, 1);
   assert.equal((await kv.get(`channel:${channelId}:recent`, 'json'))[0].videoId, 'missedvideo1');
 });
+
+test('canonical recovery revalidates a changed recent feed despite an unchanged detector count', async (t) => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tubepulse-data-api-recovery-'));
+  t.after(() => fs.rm(dataDir, { recursive: true, force: true }));
+  const now = Date.parse('2026-10-15T15:05:00Z');
+  const channelId = 'UC0000000000000000000000';
+  const stateFile = createHomeSchedulerStateFile(dataDir, 'active');
+  const state = await stateFile.read();
+  state.youtubeDataApi = normalizeYoutubeDataApiState(null, now);
+  state.youtubeDataApi.channels[channelId] = {
+    uploadsPlaylistId: 'UU0000000000000000000000', videoCount: 11,
+    lastReconciledAt: new Date(now - 10 * 60_000).toISOString(),
+  };
+  await stateFile.write(state);
+
+  // Canonical recovery has restored the older feed generation while the
+  // detector state still remembers the successful new-content cycle.
+  const kv = new MemoryKv({
+    'channels:active': [channelId],
+    [`channel:${channelId}:known:videos`]: {
+      ids: ['oldvideo0001'], highWatermarkAt: '2026-10-15T13:00:00Z',
+      highWatermarkIds: ['oldvideo0001'],
+    },
+    [`channel:${channelId}:recent`]: [{
+      videoId: 'oldvideo0001', title: 'Old', publishedAt: '2026-10-15T13:00:00Z',
+    }],
+  });
+  let playlistCalls = 0;
+  const api = {
+    async listChannels() {
+      return { items: [{
+        id: channelId, statistics: { videoCount: '11' },
+        contentDetails: { relatedPlaylists: { uploads: 'UU0000000000000000000000' } },
+      }] };
+    },
+    async listPlaylistItems() {
+      playlistCalls++;
+      return { items: [
+        {
+          snippet: { title: 'Recovered', publishedAt: '2026-10-15T14:55:00Z' },
+          contentDetails: { videoId: 'newvideo0001', videoPublishedAt: '2026-10-15T14:55:00Z' },
+          status: { privacyStatus: 'public' },
+        },
+        {
+          snippet: { title: 'Old', publishedAt: '2026-10-15T13:00:00Z' },
+          contentDetails: { videoId: 'oldvideo0001', videoPublishedAt: '2026-10-15T13:00:00Z' },
+          status: { privacyStatus: 'public' },
+        },
+      ] };
+    },
+    async listVideoDetails(ids) {
+      return { items: ids.map((id) => ({
+        id, snippet: {
+          title: id === 'newvideo0001' ? 'Recovered' : 'Old',
+          publishedAt: id === 'newvideo0001' ? '2026-10-15T14:55:00Z' : '2026-10-15T13:00:00Z',
+          channelTitle: 'Channel', thumbnails: {},
+        },
+        status: { privacyStatus: 'public' },
+      })) };
+    },
+    async batchGetStats() { return { items: [] }; },
+  };
+  const runner = new HomeSchedulerRunner({
+    config: {
+      mode: 'active', videoSourceMode: 'youtube-api', dataDir,
+      sync: { configured: false, concurrency: 1 },
+      workerBindings: { YOUTUBE_API_KEY: 'test', TUBEPULSE_NOTIFICATION_MODE: 'shadow' },
+      youtubeSafetyReconcileHours: 6, youtubeMaxReconciliationsPerCycle: 5,
+      youtubeMaxMigrationReconciliationsPerCycle: 100, youtubeMaxPlaylistPages: 3,
+      youtubeDailyQuotaUnits: 10_000, youtubeQuotaReserveUnits: 1_000,
+      youtubeStatisticsDailyQuotaUnits: 10_000, youtubeStatisticsReserveUnits: 1_000,
+      channelTimeoutMs: 1000,
+    },
+    stateFile, youtubeDataApiClient: api, now: () => now,
+    notificationCoordinator: { async pendingChannelIds() { return [channelId]; } },
+  });
+  const marked = await runner.scheduleCanonicalRecoveryRevalidation({
+    reconciled: true, result: { affectedChannelIds: [channelId] },
+  });
+  assert.deepEqual(marked, [channelId]);
+
+  const result = await runner.runYoutubeDataApiCycle({ TUBEPULSE_KV: kv }, kv, now);
+  assert.equal(result.changedCount, 0, 'the detector count intentionally remains unchanged');
+  assert.equal(result.reconciledCount, 1);
+  assert.equal(playlistCalls, 1);
+  assert.equal((await kv.get(`channel:${channelId}:recent`, 'json'))[0].videoId, 'newvideo0001');
+  const repaired = await stateFile.read();
+  assert.equal(repaired.youtubeDataApi.channels[channelId].recoveryRevalidationAt, undefined);
+});

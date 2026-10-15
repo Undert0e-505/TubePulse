@@ -1,3 +1,8 @@
+import {
+  classifyNotificationBarrier,
+  latestSchedulerProgressTimestamp,
+} from './public-service-status.mjs';
+
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 function finite(value, fallback = 0) {
@@ -219,6 +224,7 @@ export async function collectAggregateMonitoring({
     config.preciseLiveWatchDailyCap ?? localStatus?.configuration?.preciseLiveWatchDailyCap,
   ));
   const lastDelivery = scheduler.lastNotificationDelivery || {};
+  const barrierStatus = classifyNotificationBarrier(scheduler);
   const notificationIntents = scheduler.notificationIntents || {};
   const overduePending = Number.isFinite(Number(notificationIntents.overduePending))
     ? finite(notificationIntents.overduePending)
@@ -227,7 +233,8 @@ export async function collectAggregateMonitoring({
   const lastSweep = scheduler.lastSweep || {};
   const remoteQuota = remoteStatus?.quota || {};
   const remoteLimits = remoteQuota.limits || {};
-  const progressAt = youtube.lastGoodAt || lastCycle.finishedAt || scheduler.lastMinuteJobs?.scheduledAt || scheduler.startedAt;
+  const progressAtMs = latestSchedulerProgressTimestamp(scheduler);
+  const progressAt = progressAtMs === null ? null : new Date(progressAtMs).toISOString();
   const schedulerErrorAt = timestamp(scheduler.lastError?.at);
   const schedulerProgressAt = timestamp(progressAt);
 
@@ -325,7 +332,8 @@ export async function collectAggregateMonitoring({
       suppressed: finite(lastDelivery.suppressed),
       recovered: finite(lastDelivery.recovered),
       deduplicated: finite(lastDelivery.deduplicated),
-      barrierHealthy: ['passed', 'not-required', 'not-needed'].includes(lastDelivery.barrier),
+      barrierHealthy: barrierStatus !== 'outage',
+      barrierDegraded: barrierStatus === 'degraded',
       pending: finite(notificationIntents.pending),
       oldestPendingAgeSeconds: finite(notificationIntents.oldestPendingAgeSeconds),
       durableBacklog: overduePending,

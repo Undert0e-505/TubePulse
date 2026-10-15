@@ -61,10 +61,46 @@ test('missing notification capability, current authority, active scheduler or he
   }
 });
 
-test('a notification barrier fault is outage while actionable retained work is degraded', () => {
+test('an isolated feed visibility mismatch is degraded while broad or old barrier faults are outages', () => {
+  const observedAt = new Date(NOW - 2 * 60_000).toISOString();
+  const isolated = classifyPublicServiceStatus(localStatus({ scheduler: {
+    lastError: { at: new Date(NOW - 30 * 60_000).toISOString() },
+    lastNotificationDelivery: {
+      barrier: 'failed', reason: 'feed-not-visible', visibilityBlocked: 1,
+      visibilityDevices: 1, visibilityChannels: 1, observedAt,
+    },
+    notificationIntents: { overduePending: 1, oldestPendingAgeSeconds: 120 },
+  } }), { nowMs: NOW });
+  assert.equal(isolated.status, 'degraded');
+  assert.equal(isolated.since, observedAt, 'a retained unrelated scheduler error cannot date this mismatch');
+
   assert.equal(classifyPublicServiceStatus(localStatus({ scheduler: {
     lastNotificationDelivery: { barrier: 'failed' },
   } }), { nowMs: NOW }).status, 'outage');
+  for (const scheduler of [
+    {
+      lastNotificationDelivery: {
+        barrier: 'failed', reason: 'feed-not-visible', visibilityBlocked: 3,
+        visibilityDevices: 1, visibilityChannels: 1,
+      },
+      notificationIntents: { overduePending: 3, oldestPendingAgeSeconds: 120 },
+    },
+    {
+      lastNotificationDelivery: {
+        barrier: 'failed', reason: 'feed-not-visible', visibilityBlocked: 2,
+        visibilityDevices: 2, visibilityChannels: 2,
+      },
+      notificationIntents: { overduePending: 2, oldestPendingAgeSeconds: 120 },
+    },
+    {
+      lastNotificationDelivery: {
+        barrier: 'failed', reason: 'feed-not-visible', visibilityBlocked: 1,
+        visibilityDevices: 1, visibilityChannels: 1,
+      },
+      notificationIntents: { overduePending: 1, oldestPendingAgeSeconds: 901 },
+    },
+  ]) assert.equal(classifyPublicServiceStatus(localStatus({ scheduler }), { nowMs: NOW }).status, 'outage');
+
   for (const scheduler of [
     { notificationIntents: { overduePending: 1 } },
     { notificationIntents: { sending: 1 } },
@@ -85,6 +121,28 @@ test('a scheduler error is ignored only after newer successful progress supersed
     lastError: { at: new Date(NOW - 30_000).toISOString() },
     youtubeDataApi: { lastGoodAt: new Date(NOW - 60_000).toISOString() },
   } }), { nowMs: NOW }).status, 'outage');
+});
+
+test('a completed minute tick supersedes an older retained recovered lease error', () => {
+  const errorAt = '2026-10-10T11:41:00.250Z';
+  const completedAt = '2026-10-10T11:42:08.000Z';
+  const status = classifyPublicServiceStatus(localStatus({ scheduler: {
+    lastError: { at: errorAt, recovery: 'reconciled', recoveredAt: '2026-10-10T11:41:16.000Z' },
+    youtubeDataApi: { lastGoodAt: '2026-10-10T11:40:43.000Z', lastError: null },
+    lastSweep: { outcome: 'not-due', scheduledAt: '2026-10-10T11:42:00.000Z' },
+    lastMinuteJobs: { scheduledAt: '2026-10-10T11:42:00.000Z', posts: { outcome: 'ok' } },
+    lastNotificationDelivery: { barrier: 'not-needed', observedAt: completedAt },
+  } }), { nowMs: Date.parse('2026-10-10T11:43:00.000Z') });
+  assert.equal(status.status, 'healthy');
+
+  const unresolved = classifyPublicServiceStatus(localStatus({ scheduler: {
+    lastError: { at: '2026-10-10T11:42:30.000Z', recovery: 'pending' },
+    youtubeDataApi: { lastGoodAt: '2026-10-10T11:40:43.000Z', lastError: null },
+    lastSweep: { outcome: 'not-due', scheduledAt: '2026-10-10T11:42:00.000Z' },
+    lastMinuteJobs: { scheduledAt: '2026-10-10T11:42:00.000Z' },
+    lastNotificationDelivery: { barrier: 'not-needed', observedAt: completedAt },
+  } }), { nowMs: Date.parse('2026-10-10T11:43:00.000Z') });
+  assert.equal(unresolved.status, 'outage');
 });
 
 test('precise live degradation degrades the public service without exposing its reason', () => {
