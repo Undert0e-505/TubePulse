@@ -14,6 +14,12 @@ sync: each installation manages its own channels and settings.
 A newer signed release can be installed over the existing app. The local channel list, settings,
 unseen state and pending seen updates should remain in place.
 
+On a genuine fresh install, a nine-step guided tour points to the actual controls used to add a
+channel and configure notification destination, reminder mode, quiet time, livestream warning and
+Home display. **Done**, **Skip** and Android Back return to the Home feed. Existing users can start
+the same tour at any time with **Show app tour** in Settings; replaying it does not change channels
+or settings.
+
 When a newer stable GitHub release is available, Settings shows **Update available**. TubePulse
 checks the public GitHub releases API at most once every 12 hours per installation, uses a cached
 validated result while offline, and hides that exact release after the button is tapped. The button

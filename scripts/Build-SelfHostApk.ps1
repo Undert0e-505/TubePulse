@@ -10,6 +10,10 @@ param(
     [string]$JavaHome,
 
     [Parameter()]
+    [ValidateSet('armeabi-v7a', 'arm64-v8a', 'x86', 'x86_64')]
+    [string]$ReactNativeArchitecture,
+
+    [Parameter()]
     [switch]$UseTcpJavaPipeFallback
 )
 
@@ -122,7 +126,11 @@ try {
 
     Push-Location (Join-Path $repoRoot 'android')
     try {
-        & .\gradlew.bat --no-daemon :app:assembleSelfhost
+        $gradleArguments = @('--no-daemon', ':app:assembleSelfhost')
+        if (-not [string]::IsNullOrWhiteSpace($ReactNativeArchitecture)) {
+            $gradleArguments += "-PreactNativeArchitectures=$ReactNativeArchitecture"
+        }
+        & .\gradlew.bat @gradleArguments
         if ($LASTEXITCODE -ne 0) {
             throw "Gradle failed with exit code $LASTEXITCODE."
         }

@@ -38,11 +38,15 @@ class FakeRuntime {
 }
 
 class FakeRunner {
-  constructor() { this.started = false; }
+  constructor() { this.started = false; this.operatorCleanupCalls = []; }
   async start() { this.started = true; }
   async run() { throw new Error('standby must not arm scheduler'); }
   async status() { return { mode: 'standby', lease: { state: 'held' } }; }
   async close() { this.started = false; }
+  async operatorCleanupDevices(devices, options) {
+    this.operatorCleanupCalls.push({ devices, options });
+    return { applied: options.apply, deviceCount: devices.length };
+  }
 }
 
 class FailingRunner extends FakeRunner {
@@ -111,6 +115,21 @@ test('unified service exposes only status and signed authority ingress over the 
   assert.equal(response.status, 405);
   response = await fetch(`${base}/feed`);
   assert.equal(response.status, 404);
+
+  response = await fetch(`${base}/_tubepulse/admin/purge-devices`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ devices: [] }),
+  });
+  assert.equal(response.status, 401);
+  response = await fetch(`${base}/_tubepulse/admin/purge-devices`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${SECRET}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ devices: [{ deviceId: 'synthetic-test-device' }], apply: false }),
+  });
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).result.deviceCount, 1);
+  assert.deepEqual(runner.operatorCleanupCalls, [{
+    devices: [{ deviceId: 'synthetic-test-device' }], options: { apply: false },
+  }]);
 
   const manifest = { hash: contentHash('synthetic'), recordCount: 1 };
   await service.gate.reconcile({ manifestHash: manifest.hash, recordCount: manifest.recordCount });

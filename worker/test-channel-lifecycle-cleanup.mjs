@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { cleanupDeadChannel } from './tubepulse-cron/shared.mjs';
+import { cleanupDeadChannel, cleanupDeadDevice } from './tubepulse-cron/shared.mjs';
 import { processChannelUploads } from './tubepulse-rss-0/index.js';
 import { appWorker } from './tubepulse-api/index.js';
 
@@ -22,7 +22,13 @@ class MemoryKV {
 
   async put(key, value) { this.entries.set(key, String(value)); }
   async delete(key) { this.entries.delete(key); }
-  async list() { return { keys: [], list_complete: true }; }
+  async list(options = {}) {
+    const prefix = String(options.prefix || '');
+    return {
+      keys: [...this.entries.keys()].filter((name) => name.startsWith(prefix)).sort().map((name) => ({ name })),
+      list_complete: true,
+    };
+  }
 }
 
 function key(suffix) { return `channel:${CHANNEL}:${suffix}`; }
@@ -116,4 +122,25 @@ test('a fully cleaned and re-added channel silently seeds current uploads', asyn
   assert.equal(result.outcome, 'seeded');
   assert.deepEqual((await kv.get(key('known:videos'), 'json')).ids, ['newest-video', 'older-video']);
   assert.equal(await kv.get(`device:${DEVICE}:state:${CHANNEL}`, 'json'), null);
+});
+
+test('dead-device cleanup removes every device-scoped notification index without touching another device', async () => {
+  const token = 'synthetic-token';
+  const kv = new MemoryKV({
+    ...channelEntries([DEVICE, OTHER_DEVICE]),
+    [`device:${DEVICE}:profile`]: { platform: 'android', fcmToken: token },
+    [`fcm:lookup:${token}`]: DEVICE,
+    'nag:active': [`${DEVICE}|${CHANNEL}`, `${DEVICE}|other-channel`, `${OTHER_DEVICE}|${CHANNEL}`],
+    [`upcoming:prewarn:video-a:${DEVICE}`]: 60,
+    [`upcoming:prewarn:video-b:${OTHER_DEVICE}`]: 60,
+  });
+
+  await cleanupDeadDevice(DEVICE, { TUBEPULSE_KV: kv }, 'test-fixture');
+
+  assert.equal(await kv.get(`device:${DEVICE}:profile`, 'json'), null);
+  assert.equal(await kv.get(`fcm:lookup:${token}`, 'json'), null);
+  assert.deepEqual(await kv.get('nag:active', 'json'), [`${OTHER_DEVICE}|${CHANNEL}`]);
+  assert.equal(await kv.get(`upcoming:prewarn:video-a:${DEVICE}`, 'json'), null);
+  assert.equal(await kv.get(`upcoming:prewarn:video-b:${OTHER_DEVICE}`, 'json'), 60);
+  assert.deepEqual(await kv.get(key('subscribers'), 'json'), [OTHER_DEVICE]);
 });

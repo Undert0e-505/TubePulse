@@ -197,7 +197,7 @@ Continuous Home scheduling sorts and de-duplicates `channels:active`. On every a
 
 Canonical snapshot recovery is also an explicit reconciliation trigger. Changed channel recent/known keys and channels implicated by durable pending intents receive a persisted recovery marker, are prioritized within the normal bounded playlist budget, and clear that marker only after success. Active startup repeats the pending-intent check. This prevents a restored older feed from being hidden by an unchanged retained `videoCount` while preserving quota bounds and the notification visibility barrier.
 
-Playlist results flow through the existing durable known/high-watermark, recent-cache, scheduled/live, notification, canonical backup, and visibility-barrier code. A genuinely new channel seeds silently. An established channel keeps its watermark, including across this migration, so an upload missed during the RSS outage can be classified normally. Private/deleted/unavailable items never notify. New item metadata is fetched through `videos.list` in batches of 50 only where playlist data is insufficient; `search.list` is never used.
+Playlist results flow through the existing durable known/high-watermark, recent-cache, scheduled/live, notification, canonical backup, and visibility-barrier code. A genuinely new channel seeds silently. An established channel keeps its watermark, including across this migration, so an upload missed during the RSS outage can be classified normally. Private/deleted/unavailable items never notify. New item metadata is fetched through `videos.list` in batches of 50 only where playlist data is insufficient; `search.list` is never used. Active aligned cycles also batch the source IDs of pending durable video intents through `videos.list`. One missing response never bypasses the fail-closed barrier; the same missing set must be confirmed on two observations at least four minutes apart before that obsolete intent is resolved as `source-content-unavailable`. A later visible response resets the observation.
 
 One-off community-post and prewarn pushes use the durable local notification-intent store and its at-most-once recovery boundary. Production sets the host-only `TUBEPULSE_HOME_ALIGNED_VIDEO_NOTIFICATIONS_ENABLED=true` in ignored `.env.authority`; tracked examples deliberately default it to `false` as deployment insurance. When enabled, discovery first updates canonical content/unseen state, then one decision per active device/channel emits either a single current unseen video or one exact top-three bundle. New content is immediate on that detection tick and resets the channel's reminder clock; otherwise the configured 5/15/30/60/120-minute or four-hour interval is measured in exact raster ticks with no hidden backoff or rotating-scan jitter. The legacy rotating minute nag owner is disabled by the same switch, so both owners cannot run together. Successful delivery alone advances the existing `lastNagAt`/`nagCount` state, pure reminders stay transient, and upload intents retain durable at-most-once recovery. Stable channel-scoped Android tags replace a prior single with a later bundle without allowing channels to replace each other. Flag-off preserves the rollback path and established state/payload schema.
 
@@ -535,6 +535,29 @@ Do not use a public unauthenticated Quick Tunnel for sustained operation. Curren
 If you intentionally bind to `0.0.0.0`, use host firewall rules and never expose plain HTTP directly to the internet.
 
 ## Backup and restore
+
+### Conclusively identified test-device cleanup
+
+Production test pollution is removed through the authenticated, preconditioned authority path rather
+than by editing Miniflare files or D1 manually. Create an ignored JSON plan containing `deviceId`,
+`expectedCreatedAt`, `expectedAppVersion`, and the exact `expectedChannels` for every proven test
+identity. Take a byte-for-byte backup of `data-authority` first. Then dry-run and apply from the running
+authority container:
+
+```powershell
+docker exec -e TUBEPULSE_HOME_AUTHORITY_STATUS_PORT=8788 tubepulse-home-authority-home-authority-1 `
+  node src/home-authority-cli.mjs purge-devices /data/incident-backups/<incident>/cleanup-plan.json
+docker exec -e TUBEPULSE_HOME_AUTHORITY_STATUS_PORT=8788 tubepulse-home-authority-home-authority-1 `
+  node src/home-authority-cli.mjs purge-devices /data/incident-backups/<incident>/cleanup-plan.json --apply
+```
+
+The endpoint is loopback/private-network only, requires the authority secret, rejects changed profile
+or membership fingerprints, removes profile/settings/channel/state/override records, reverse subscriber
+memberships, FCM lookup, nag/prewarn state and durable notification intents, then publishes one canonical
+batch. Re-running a consumed plan fails closed because its profile no longer exists. Verify current Home,
+zero pending backup/transaction state, subscription-index integrity, notification backlog, and aggregate
+deltas after applying. Historical Prometheus/JSONL samples are incident evidence and are not rewritten;
+the short-lived registration spike remains visible in historical graphs.
 
 The following generic procedure applies to the standalone/legacy mirror tooling. It is not sufficient by itself for the unified production authority:
 

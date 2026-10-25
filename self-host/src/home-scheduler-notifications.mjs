@@ -69,6 +69,13 @@ function isTransientIntent(intent) {
 // after an intent has remained pending long enough to miss the normal send
 // window. The raw pending count remains available for activity charts.
 const DURABLE_BACKLOG_GRACE_MS = 60_000;
+// A playlist item can briefly precede videos.list propagation.  Never retire
+// a durable video intent from a single missing lookup; require the same source
+// ID to be absent on two aligned observations separated by most of a five-
+// minute cycle.  A genuinely deleted/replaced upload then stops blocking the
+// fail-closed feed barrier, while transient YouTube propagation still has time
+// to converge normally.
+const VIDEO_UNAVAILABLE_CONFIRMATION_MS = 4 * 60 * 1000;
 const INVALID_TOKEN_BUCKET_MS = 5 * 60 * 1000;
 const INVALID_TOKEN_HISTORY_RETENTION_MS = 48 * 60 * 60 * 1000;
 const INVALID_TOKEN_LIFECYCLE_RETENTION_MS = 365 * 24 * 60 * 60 * 1000;
@@ -261,6 +268,97 @@ export class DurableNotificationIntentStore {
       .map((record) => ({ id: record.id, intent: structuredClone(record.intent) }));
   }
 
+  async inspectDevices(deviceIds) {
+    const selected = new Set((deviceIds || []).map(String));
+    const state = await this.stateFile.read();
+    const records = Object.values(state.records || {}).filter((record) => (
+      selected.has(String(record.intent?.deviceId || ''))
+    ));
+    return {
+      records: records.length,
+      pending: records.filter((record) => record.status === 'pending').length,
+      callbackPending: records.filter((record) => !record.callbackApplied
+        && (['sending', 'sent'].includes(record.status) || record.delivery === 'dead-token')).length,
+    };
+  }
+
+  async purgeDevices(deviceIds) {
+    const selected = new Set((deviceIds || []).map(String));
+    const state = await this.stateFile.read();
+    state.records ||= {};
+    let removed = 0;
+    for (const [id, record] of Object.entries(state.records)) {
+      if (!selected.has(String(record.intent?.deviceId || ''))) continue;
+      delete state.records[id];
+      removed++;
+    }
+    if (removed > 0) await this.stateFile.write(state);
+    return { removed };
+  }
+
+  async pendingVideoIds() {
+    return [...new Set((await this.pending())
+      .filter(({ intent }) => intent?.kind === 'video')
+      .flatMap(({ intent }) => intent.contentIds || [])
+      .map(String)
+      .filter(Boolean))].sort();
+  }
+
+  async observeVideoAvailability(checkedVideoIds, availableVideoIds) {
+    const checked = new Set((checkedVideoIds || []).map(String).filter(Boolean));
+    const available = new Set((availableVideoIds || []).map(String).filter(Boolean));
+    if (checked.size === 0) return { observed: 0, resolved: 0 };
+
+    const state = await this.stateFile.read();
+    const now = this.now();
+    let observed = 0;
+    let resolved = 0;
+    let changed = false;
+    for (const record of Object.values(state.records || {})) {
+      if (record.status !== 'pending' || record.intent?.kind !== 'video') continue;
+      const contentIds = (record.intent.contentIds || []).map(String).filter(Boolean);
+      if (contentIds.length === 0 || !contentIds.every((videoId) => checked.has(videoId))) continue;
+      observed++;
+      const missingIds = contentIds.filter((videoId) => !available.has(videoId)).sort();
+      if (missingIds.length === 0) {
+        if (record.sourceAvailability) {
+          delete record.sourceAvailability;
+          record.updatedAt = now;
+          changed = true;
+        }
+        continue;
+      }
+
+      const previous = record.sourceAvailability;
+      const sameMissing = Array.isArray(previous?.missingIds)
+        && previous.missingIds.length === missingIds.length
+        && previous.missingIds.every((videoId, index) => videoId === missingIds[index]);
+      const firstObservedAt = sameMissing && Number.isFinite(Number(previous.firstObservedAt))
+        ? Number(previous.firstObservedAt)
+        : now;
+      const observations = sameMissing ? Number(previous.observations || 0) + 1 : 1;
+      record.sourceAvailability = {
+        missingIds,
+        observations,
+        firstObservedAt,
+        lastObservedAt: now,
+      };
+      record.updatedAt = now;
+      changed = true;
+      if (observations < 2 || now - firstObservedAt < VIDEO_UNAVAILABLE_CONFIRMATION_MS) continue;
+
+      record.status = 'resolved';
+      record.delivery = 'suppressed';
+      record.suppressionReason = 'source-content-unavailable';
+      record.completedAt = now;
+      record.callbackApplied = true;
+      delete record.sourceAvailability;
+      resolved++;
+    }
+    if (changed) await this.stateFile.write(state);
+    return { observed, resolved };
+  }
+
   async summary() {
     const state = await this.stateFile.read();
     const now = this.now();
@@ -444,6 +542,18 @@ export class ProductionNotificationCoordinator {
   }
 
   async stage(intents) { return await this.intentStore.stage(intents); }
+
+  async pendingVideoIds() {
+    return typeof this.intentStore.pendingVideoIds === 'function'
+      ? await this.intentStore.pendingVideoIds()
+      : [];
+  }
+
+  async observeVideoAvailability(checkedVideoIds, availableVideoIds) {
+    return typeof this.intentStore.observeVideoAvailability === 'function'
+      ? await this.intentStore.observeVideoAvailability(checkedVideoIds, availableVideoIds)
+      : { observed: 0, resolved: 0 };
+  }
 
   async pendingChannelIds() {
     return [...new Set((await this.intentStore.pending())

@@ -704,6 +704,16 @@ export async function cleanupDeadDevice(deviceId, env, reason = 'fcm_unregistere
   }
   // Remove from nag:active
   await removeFromNagActive(env, deviceId);
+  if (typeof kv.list === 'function') {
+    let cursor;
+    do {
+      const page = await kv.list({ prefix: 'upcoming:prewarn:', limit: 1000, ...(cursor ? { cursor } : {}) });
+      for (const entry of page.keys || []) {
+        if (String(entry.name).endsWith(`:${deviceId}`)) await kv.delete(entry.name);
+      }
+      cursor = page.list_complete ? undefined : page.cursor;
+    } while (cursor);
+  }
   console.log(`[Cleanup] device ${deviceId}: reason=${reason} channelsAffected=${channels.length} channelsCleaned=${channelsCleaned} devicesDeleted=${devicesDeleted}`);
 }
 
@@ -725,7 +735,9 @@ export async function removeFromNagActive(env, deviceId, channelId) {
     const kv = env.TUBEPULSE_KV;
     const entry = `${deviceId}|${channelId}`;
     const active = await getKV(kv, key.nagActive()) || [];
-    const filtered = active.filter((e) => e !== entry);
+    const filtered = channelId === undefined
+      ? active.filter((e) => !String(e).startsWith(`${deviceId}|`))
+      : active.filter((e) => e !== entry);
     if (filtered.length !== active.length) {
       await putKV(kv, key.nagActive(), filtered);
     }

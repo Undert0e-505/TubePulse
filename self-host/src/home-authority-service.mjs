@@ -1,4 +1,5 @@
 import http from 'node:http';
+import crypto from 'node:crypto';
 import { appWorker, touchExistingDeviceActivity } from '../../worker/tubepulse-api/index.js';
 import { BufferedKvNamespace } from '../../worker/tubepulse-api/authority.mjs';
 import { AuthorityClient } from './authority-client.mjs';
@@ -24,6 +25,17 @@ const HOP_BY_HOP_HEADERS = new Set([
   'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
   'te', 'trailer', 'transfer-encoding', 'upgrade', 'content-length',
 ]);
+
+function bearerToken(request) {
+  const header = String(request.headers.authorization || '');
+  return header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+}
+
+function tokenMatches(expected, supplied) {
+  const left = Buffer.from(String(expected || ''));
+  const right = Buffer.from(String(supplied || ''));
+  return left.length === right.length && left.length > 0 && crypto.timingSafeEqual(left, right);
+}
 
 class CapturingExecutionContext {
   constructor() { this.promises = []; }
@@ -210,6 +222,24 @@ export class UnifiedHomeAuthorityService {
 
   async handle(request, response) {
     const parsed = new URL(request.url, 'http://authority.local');
+    if (parsed.pathname === '/_tubepulse/admin/purge-devices') {
+      if (request.method !== 'POST') return await sendResponse(response, Response.json({ error: 'Method not allowed' }, { status: 405 }));
+      if (!tokenMatches(this.config.authority.secret, bearerToken(request))) {
+        return await sendResponse(response, Response.json({ error: 'Unauthorized' }, { status: 401 }));
+      }
+      const operatorRequest = await nodeRequestToRequest(request, 'http://authority.local');
+      const payload = await operatorRequest.json().catch(() => null);
+      if (!payload || !Array.isArray(payload.devices)) {
+        return await sendResponse(response, Response.json({ error: 'Invalid cleanup plan' }, { status: 400 }));
+      }
+      try {
+        const result = await this.runner.operatorCleanupDevices(payload.devices, { apply: payload.apply === true });
+        return await sendResponse(response, Response.json({ ok: true, result }));
+      } catch (error) {
+        const status = Number(error?.status) || (/precondition|cleanup plan/i.test(String(error?.message)) ? 409 : 500);
+        return await sendResponse(response, Response.json({ error: String(error?.message || 'Cleanup failed') }, { status }));
+      }
+    }
     if (parsed.pathname === '/service-status') {
       if (request.method !== 'GET') return await sendResponse(response, Response.json({ error: 'Method not allowed' }, { status: 405 }));
       const [authority, scheduler] = await Promise.all([this.gate.status(), this.runner.status()]);

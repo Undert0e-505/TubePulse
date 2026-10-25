@@ -8,6 +8,12 @@ const settingsWarmCache = createSettingsWarmCache({
   defaults: DEFAULT_SETTINGS,
 });
 
+// Capture install freshness as soon as the storage module is loaded, before
+// any screen can call getChannels() and seed the two starter channels.  A
+// missing tour marker alone is not evidence of a fresh install because older
+// TubePulse versions pre-date the tour.
+const channelStoreAtLaunchPromise = AsyncStorage.getItem(STORAGE_KEYS.CHANNELS);
+
 // Begin the only settings disk read while the application modules are loading,
 // before a user can navigate to Settings. Consumers can synchronously peek the
 // actual snapshot once it resolves, or share this promise during an extreme
@@ -46,6 +52,10 @@ export async function getChannels() {
   // First run — seed defaults
   await saveChannels(DEFAULT_CHANNELS);
   return DEFAULT_CHANNELS;
+}
+
+export async function wasChannelStoreMissingAtLaunch() {
+  return (await channelStoreAtLaunchPromise) === null;
 }
 
 export async function saveChannels(channels) {

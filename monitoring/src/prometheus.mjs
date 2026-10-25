@@ -167,6 +167,7 @@ export function prometheusText({ snapshot, collector, nowMs = Date.now() }) {
   metric('tubepulse_cloudflare_do_storage_bytes', cloudflare?.durableObjectStorageBytes);
   metric('tubepulse_guardrail', collector.limits.d1RowsWritten, { resource: 'd1_rows_written_day' });
   metric('tubepulse_guardrail', collector.limits.d1RowsRead, { resource: 'd1_rows_read_day' });
+  metric('tubepulse_guardrail', collector.limits.durableObjectRowsWritten, { resource: 'do_rows_written_day' });
   metric('tubepulse_guardrail', collector.limits.workerRequests, { resource: 'worker_requests_day' });
   return `${lines.join('\n')}\n`;
 }

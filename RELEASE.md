@@ -43,12 +43,27 @@ files. That internal code is consumed: the next official APK must use a still-hi
 releases normally use the semantic version with dots removed as their baseline code, but may check in a
 higher monotonic integer when necessary to remain installable over a distributed preview or other signed
 build. The guarded runner accepts that explicit code when it is at least the semantic-version baseline.
-TubePulse v4.3.1 therefore uses Android `versionCode 434`. Signing material
+TubePulse v4.4.0 therefore uses Android `versionCode 441`, above the distributed onboarding preview
+code 440. Signing material
 stays at its existing path and is neither copied nor printed. Remove all four task registrations with:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Install-AndroidBuildRunner.ps1 -Remove
 ```
+
+## Emulator validation isolation
+
+Use `npm run android` for emulator/UI automation. It routes through
+`scripts/Run-AndroidEmulatorValidation.ps1`, which builds the separate
+`com.tubepulse.app.selfhost` package with preview mode enabled, push disabled, and the Android host
+alias `http://10.0.2.2:8788`. The command refuses any public endpoint by default. Do not use
+FeaturePreview or `expo run:android` for emulator testing: those preserve the production package,
+Worker endpoint, and push capability for physical-phone release validation.
+
+The exceptional production override is deliberately two-part: pass `-AllowProductionEndpoint` and
+set the process variable `TUBEPULSE_ALLOW_EMULATOR_PRODUCTION_REGISTRATION` to the literal
+`I_ACCEPT_TEST_DATA_POLLUTION`. It is an incident/debug escape hatch, not a normal test path. Without
+both inputs the guard fails before Gradle, ADB, Firebase, or the Worker can be contacted.
 
 If task registration is lost after machine recovery, restore the repository and signing/Google files
 as documented below, then rerun the installer. Registration is per-user and requires no password or

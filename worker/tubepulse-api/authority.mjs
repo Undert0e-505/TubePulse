@@ -10,6 +10,7 @@ const STATE_KEY = 'authority:state';
 const LEASE_KEY = 'authority:lease';
 const TX_KEY = 'authority:transaction';
 const BASELINE_PREFIX = 'authority:baseline:';
+const PACKED_BASELINE_KEY = 'authority:baseline-packed:v1';
 const TX_DELTA_PREFIX = 'authority:transaction:delta:';
 const PENDING_PREFIX = 'authority:pending:';
 const QUOTA_KEY = 'authority:quota';
@@ -18,6 +19,9 @@ const LEGACY_MIGRATION_KEY = 'authority:legacy-backend-migration';
 const MAX_DELTA_COUNT = 1000;
 const MAX_DELTA_BODY_BYTES = 2 * 1024 * 1024;
 const MAX_SNAPSHOT_EXPORT_BYTES = 10 * 1024 * 1024;
+// Durable Object SQLite key and value sizes share a 2 MiB ceiling. Leave
+// headroom for the key and storage encoding rather than approaching it.
+const MAX_PACKED_STORAGE_BYTES = 1_900_000;
 const RECONCILIATION_LEASE_TTL_MS = 5 * 60 * 1000;
 
 function isAuthorityCanonicalKey(key) {
@@ -185,6 +189,7 @@ export class TubePulseAuthorityCoordinator {
   constructor(state, env) {
     this.state = state;
     this.env = env;
+    this.packedBaseline = null;
   }
 
   async readJson(request) {
@@ -465,6 +470,9 @@ export class TubePulseAuthorityCoordinator {
   }
 
   async baselineHash(key) {
+    if (this.configuredBackend().backend === 'd1') {
+      return (await this.loadPackedBaseline()).get(key) ?? null;
+    }
     const keyHash = await authoritySha256(key);
     const entry = await this.state.storage.get(baselineStorageKey(keyHash));
     if (entry && entry.key !== key) throw new Error('baseline-key-collision');
@@ -472,10 +480,98 @@ export class TubePulseAuthorityCoordinator {
   }
 
   async storeBaseline(key, hash) {
+    if (this.configuredBackend().backend === 'd1') {
+      const baseline = new Map(await this.loadPackedBaseline());
+      if (hash === null) baseline.delete(key);
+      else baseline.set(key, hash);
+      await this.storePackedBaseline(baseline);
+      return;
+    }
     const keyHash = await authoritySha256(key);
     const storageKey = baselineStorageKey(keyHash);
     if (hash === null) await this.state.storage.delete(storageKey);
     else await this.state.storage.put(storageKey, { key, hash });
+  }
+
+  assertPackedStorageValue(value, label) {
+    if (bytes(JSON.stringify(value)).byteLength > MAX_PACKED_STORAGE_BYTES) {
+      throw new Error(`${label}-too-large`);
+    }
+    return value;
+  }
+
+  async loadPackedBaseline() {
+    if (this.packedBaseline) return this.packedBaseline;
+    const packed = await this.state.storage.get(PACKED_BASELINE_KEY);
+    if (packed !== undefined && packed !== null) {
+      if (packed.schemaVersion !== 1 || !Array.isArray(packed.entries)) {
+        throw new Error('packed-baseline-invalid');
+      }
+      const baseline = new Map();
+      for (const entry of packed.entries) {
+        if (!Array.isArray(entry) || entry.length !== 2
+          || !String(entry[0] || '') || !/^[a-f0-9]{64}$/.test(String(entry[1] || ''))
+          || baseline.has(String(entry[0]))) {
+          throw new Error('packed-baseline-invalid');
+        }
+        baseline.set(String(entry[0]), String(entry[1]));
+      }
+      this.packedBaseline = baseline;
+      return baseline;
+    }
+
+    // One-time, backwards-compatible migration. Deliberately retain the
+    // legacy per-key rows: deleting them would itself consume one billed DO
+    // row write per record and create another quota spike.
+    const legacy = await this.state.storage.list({ prefix: BASELINE_PREFIX });
+    const baseline = new Map();
+    for (const entry of legacy.values()) {
+      if (!entry || !String(entry.key || '') || !/^[a-f0-9]{64}$/.test(String(entry.hash || ''))
+        || baseline.has(String(entry.key))) {
+        throw new Error('legacy-baseline-invalid');
+      }
+      baseline.set(String(entry.key), String(entry.hash));
+    }
+    await this.storePackedBaseline(baseline);
+    return baseline;
+  }
+
+  async storePackedBaseline(baseline) {
+    const entries = [...baseline.entries()].sort(([left], [right]) => left.localeCompare(right));
+    const packed = this.assertPackedStorageValue({ schemaVersion: 1, entries }, 'packed-baseline');
+    await this.state.storage.put(PACKED_BASELINE_KEY, packed);
+    this.packedBaseline = new Map(entries);
+    return this.packedBaseline;
+  }
+
+  async packedBaselineAfter(deltas) {
+    const baseline = new Map(await this.loadPackedBaseline());
+    for (const delta of deltas) {
+      if (delta.nextHash === null) baseline.delete(delta.key);
+      else baseline.set(delta.key, delta.nextHash);
+    }
+    const entries = [...baseline.entries()].sort(([left], [right]) => left.localeCompare(right));
+    this.assertPackedStorageValue({ schemaVersion: 1, entries }, 'packed-baseline');
+    return baseline;
+  }
+
+  transactionForStorage(transaction, deltas) {
+    if (this.configuredBackend().backend !== 'd1') return transaction;
+    return this.assertPackedStorageValue({ ...transaction, deltas }, 'packed-transaction');
+  }
+
+  async transactionDeltas(transaction) {
+    if (Array.isArray(transaction.deltas)) {
+      if (transaction.deltas.length !== transaction.count) throw new Error('transaction-delta-count-mismatch');
+      return transaction.deltas.map(validateDelta);
+    }
+    const deltas = [];
+    for (let index = 0; index < transaction.count; index++) {
+      const delta = await this.state.storage.get(deltaStorageKey(index));
+      if (!delta) throw new Error('transaction-delta-missing');
+      deltas.push(delta);
+    }
+    return deltas;
   }
 
   async applyDelta(delta) {
@@ -486,8 +582,12 @@ export class TubePulseAuthorityCoordinator {
   }
 
   async clearTransaction(transaction) {
-    const keys = Array.from({ length: transaction.count }, (_, index) => deltaStorageKey(index));
-    if (keys.length) await this.state.storage.delete(keys);
+    // Embedded D1 transactions have no per-delta rows. Old deployed
+    // transactions remain recoverable and retain their legacy cleanup path.
+    if (!Array.isArray(transaction.deltas)) {
+      const keys = Array.from({ length: transaction.count }, (_, index) => deltaStorageKey(index));
+      if (keys.length) await this.state.storage.delete(keys);
+    }
     if (transaction.pendingStorageKeys?.length) {
       await this.state.storage.delete(transaction.pendingStorageKeys);
     }
@@ -533,8 +633,6 @@ export class TubePulseAuthorityCoordinator {
         return { ok: false, reason: 'baseline-diverged' };
       }
     }
-    const reserved = await this.reserveWrites(quotaKind, selected.length);
-    if (!reserved.ok) return { ok: false, reason: reserved.reason };
     const transaction = {
       id: `pending-${crypto.randomUUID()}`,
       kind: quotaKind,
@@ -542,18 +640,27 @@ export class TubePulseAuthorityCoordinator {
       nextIndex: 0,
       createdAt: Date.now(),
       retainLease: false,
-      quotaReserved: true,
-      quotaDay: reserved.quota.day,
+      quotaReserved: false,
       pendingStorageKeys: selected.map(({ storageKey }) => storageKey),
       backend: this.configuredBackend().backend,
       backendGeneration: this.configuredBackend().generation,
     };
-    await this.state.storage.put(TX_KEY, transaction);
-    for (let index = 0; index < selected.length; index++) {
-      await this.state.storage.put(deltaStorageKey(index), selected[index].delta);
+    const selectedDeltas = selected.map(({ delta }) => delta);
+    // Bound the recovery record before consuming canonical write budget.
+    this.transactionForStorage(transaction, selectedDeltas);
+    const reserved = await this.reserveWrites(quotaKind, selected.length);
+    if (!reserved.ok) return { ok: false, reason: reserved.reason };
+    transaction.quotaReserved = true;
+    transaction.quotaDay = reserved.quota.day;
+    const storedTransaction = this.transactionForStorage(transaction, selectedDeltas);
+    await this.state.storage.put(TX_KEY, storedTransaction);
+    if (!Array.isArray(storedTransaction.deltas)) {
+      for (let index = 0; index < selected.length; index++) {
+        await this.state.storage.put(deltaStorageKey(index), selected[index].delta);
+      }
     }
     try {
-      await this.applyStoredTransaction(transaction);
+      await this.applyStoredTransaction(storedTransaction);
       return { ok: true, applied: selected.length };
     } catch {
       await this.setReplicationState('stale', 'canonical-backup-recovery-failed');
@@ -575,16 +682,13 @@ export class TubePulseAuthorityCoordinator {
       await this.state.storage.put(TX_KEY, transaction);
     }
     if (identity.backend === 'd1') {
-      const deltas = [];
-      for (let index = 0; index < transaction.count; index++) {
-        const delta = await this.state.storage.get(deltaStorageKey(index));
-        if (!delta) throw new Error('transaction-delta-missing');
-        deltas.push(delta);
-      }
+      const deltas = await this.transactionDeltas(transaction);
+      // Validate the final packed baseline before touching canonical D1. If
+      // it cannot fit, the transaction remains recoverable and D1 unchanged.
+      const nextBaseline = await this.packedBaselineAfter(deltas);
       await this.canonical().applyConditionalBatch(deltas);
-      for (const delta of deltas) await this.storeBaseline(delta.key, delta.nextHash);
+      await this.storePackedBaseline(nextBaseline);
       transaction.nextIndex = transaction.count;
-      await this.state.storage.put(TX_KEY, transaction);
     }
     for (let index = identity.backend === 'd1' ? transaction.count : (transaction.nextIndex || 0);
       index < transaction.count; index++) {
@@ -705,7 +809,6 @@ export class TubePulseAuthorityCoordinator {
       }
       pendingStorageKeys = [...new Set([
         ...before.map(({ storageKey }) => storageKey),
-        ...[...pending.values()].map(({ storageKey }) => storageKey),
       ])];
     } else {
       for (const delta of deltas) {
@@ -734,12 +837,22 @@ export class TubePulseAuthorityCoordinator {
       backend: this.configuredBackend().backend,
       backendGeneration: this.configuredBackend().generation,
     };
-    await this.state.storage.put(TX_KEY, transaction);
-    for (let index = 0; index < appliedDeltas.length; index++) {
-      await this.state.storage.put(deltaStorageKey(index), appliedDeltas[index]);
+    let storedTransaction;
+    try {
+      storedTransaction = this.transactionForStorage(transaction, appliedDeltas);
+      if (this.configuredBackend().backend === 'd1') await this.packedBaselineAfter(appliedDeltas);
+    } catch (error) {
+      await this.state.storage.delete(LEASE_KEY);
+      return json({ error: 'Authority transaction exceeds safe storage limit' }, 413);
+    }
+    await this.state.storage.put(TX_KEY, storedTransaction);
+    if (!Array.isArray(storedTransaction.deltas)) {
+      for (let index = 0; index < appliedDeltas.length; index++) {
+        await this.state.storage.put(deltaStorageKey(index), appliedDeltas[index]);
+      }
     }
     try {
-      await this.applyStoredTransaction(transaction);
+      await this.applyStoredTransaction(storedTransaction);
       return json({
         ok: true,
         applied: appliedDeltas.length,
@@ -774,8 +887,6 @@ export class TubePulseAuthorityCoordinator {
       const replication = await this.replicationState();
       if (!this.backendMatches(replication)) throw new Error('canonical-backend-generation-mismatch');
       const canonical = this.canonical();
-      const old = await this.state.storage.list({ prefix: BASELINE_PREFIX });
-      if (old.size) await this.state.storage.delete([...old.keys()]);
       let records;
       let canonicalReadCount;
       let canonicalListCount;
@@ -822,7 +933,13 @@ export class TubePulseAuthorityCoordinator {
         0,
       );
       if (exportBytes > MAX_SNAPSHOT_EXPORT_BYTES) throw new Error('snapshot-export-too-large');
-      for (const record of records) await this.storeBaseline(record.key, record.hash);
+      if (this.configuredBackend().backend === 'd1') {
+        await this.storePackedBaseline(new Map(records.map(({ key, hash }) => [key, hash])));
+      } else {
+        const old = await this.state.storage.list({ prefix: BASELINE_PREFIX });
+        if (old.size) await this.state.storage.delete([...old.keys()]);
+        for (const record of records) await this.storeBaseline(record.key, record.hash);
+      }
       const manifestHash = await authoritySha256(records.map(({ key, hash }) => `${key}\0${hash || ''}\n`).join(''));
       await this.setReplicationState('stale', 'reconciliation-awaiting-home', {
         seeded: true,
@@ -966,10 +1083,15 @@ export class TubePulseAuthorityCoordinator {
     if (staged.recordCount !== migration.recordCount || staged.manifestHash !== migration.manifestHash) {
       return json({ error: 'D1 manifest does not match Home snapshot' }, 409);
     }
+    const stagedBaseline = new Map(staged.records.map(({ key, hash }) => [key, hash]));
+    // Validate the coordinator representation before making this generation
+    // canonical. A too-large manifest must leave the previous backend active.
+    this.assertPackedStorageValue({
+      schemaVersion: 1,
+      entries: [...stagedBaseline.entries()].sort(([left], [right]) => left.localeCompare(right)),
+    }, 'packed-baseline');
     await d1.activate(staged);
-    const oldBaseline = await this.state.storage.list({ prefix: BASELINE_PREFIX });
-    if (oldBaseline.size) await this.state.storage.delete([...oldBaseline.keys()]);
-    for (const record of staged.records) await this.storeBaseline(record.key, record.hash);
+    await this.storePackedBaseline(stagedBaseline);
     const pending = await this.state.storage.list({ prefix: PENDING_PREFIX });
     if (pending.size) await this.state.storage.delete([...pending.keys()]);
     await this.state.storage.put(LEGACY_MIGRATION_KEY, {
@@ -1057,7 +1179,6 @@ export class TubePulseAuthorityCoordinator {
 
   async fetch(request) {
     try {
-      await this.updateQuota({ doRequests: 1 });
       const url = new URL(request.url);
       if (request.method === 'GET' && url.pathname === '/status') return await this.status();
       if (request.method !== 'POST') return json({ error: 'Method not allowed' }, 405);

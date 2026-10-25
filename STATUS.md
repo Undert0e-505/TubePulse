@@ -1,9 +1,9 @@
 # TubePulse - Project Status
 
-**Last updated:** 2026-10-15
+**Last updated:** 2026-10-25
 **Current repo branch:** `master`
-**Current app version in repo:** `4.3.1`
-**Android versionCode/versionName in repo:** `434` / `4.3.1`
+**Current app version in repo:** `4.4.0`
+**Android versionCode/versionName in repo:** `441` / `4.4.0`
 **Repo:** [Undert0e-505/TubePulse](https://github.com/Undert0e-505/TubePulse)
 **Platform:** Android only (React Native + Expo)
 
@@ -17,8 +17,8 @@ Repo evidence as of this document update:
 
 | Area | Current evidence |
 |---|---|
-| App version | `app.json` has `expo.version = 4.3.1` |
-| Android version | `android/app/build.gradle` has `versionCode 434`, `versionName "4.3.1"` |
+| App version | `app.json` has `expo.version = 4.4.0` |
+| Android version | `android/app/build.gradle` has `versionCode 441`, `versionName "4.4.0"` |
 | API base URL | `src/utils/api.js` uses `EXPO_PUBLIC_TUBEPULSE_API_URL` when built with one and otherwise preserves `https://tubepulse-api.jimothyoakley55.workers.dev`; optional fallback is disabled unless separately configured |
 | Release script | `build-and-release.ps1` is the current local release path |
 | Feature preview build | The limited, current-user `FeaturePreview` scheduled task signs a production-package APK from reviewed uncommitted feature work while rejecting secrets and app identity/signing/endpoint-policy changes; it keeps the checked-in visible versionName, injects checked-in versionCode + 1 without editing version files, and runs no Git/GitHub actions. The next official code must exceed the latest preview code. |
@@ -36,9 +36,11 @@ The stack was activated locally on 2026-10-06. Live validation proved a successf
 
 Same-LAN anonymous Viewer access is enabled for Grafana on the production host through ignored host configuration plus a Windows Firewall rule restricted to the active physical interface, the Private profile, `LocalSubnet`, and TCP port 3000. Prometheus, the collector, and authority status remain loopback-only. The tracked default for a fresh clone is still loopback-only; [`monitoring/README.md`](monitoring/README.md) documents inspection, DHCP/address caveats, and removal.
 
-Release v4.3.1 hardens v4.3.0's exact-snapshot **Mark seen** flow: raw Expo headless action payloads are normalized before routing, acknowledgement dismisses the exact acted-on notification after durable queueing, and blue dots plus channel/global seen controls now share one represented-content state with pending local IDs overlaid. A newer same-channel presentation remains protected, and hidden older content becomes actionable only if it is promoted into the visible slice. The batch `/seen` request remains additive and older clients retain their existing contracts. Monitoring continues to use persisted monotonic Firebase outcome counters, aligned `HH:mm:30` collection with bounded scheduler-completion awareness, and privacy-safe permanent-invalid-token lifecycle counts.
+Release v4.4.0 adds a nine-step, route-local guided tour for adding channels and discovering the app's notification, DND, live-warning and display controls. It runs automatically only for genuine fresh installs, can be replayed from Settings, uses the actual highlighted controls on each screen, and returns cleanly to Home after Done, Skip or Android Back. The isolated emulator-validation route is push-disabled and uses a separate package and loopback Home endpoint so UI tests cannot register production devices.
 
 The 2026-10-15 host consistency repair closes a recovery race where an exact D1 snapshot could legitimately restore an older channel feed while the host-only YouTube detector retained its newer `videoCount` and reconciliation clock. Canonical recovery now reports changed video-feed keys, persists a bounded revalidation marker for those channels and any durable pending-intent channels, and clears each marker only after successful uploads-playlist reconciliation. Active startup also prioritizes channels implicated by pending durable intents. The public notification visibility barrier remains fail-closed and at-most-once delivery is unchanged. A bounded one-device/one-channel `feed-not-visible` mismatch is now an amber degraded condition for up to 15 minutes; broader, larger, or older mismatches remain a red outage. Monitoring carries the same distinction.
+
+On 2026-10-24 a failed authority commit was reconciled correctly, but a staged scheduled-live intent named a YouTube video ID that the publisher deleted and replaced minutes later. The repaired canonical feed contained the replacement, so the fail-closed visibility barrier correctly refused the obsolete link; because durable upload intents previously had no source-removal terminal path, that one intent remained pending and eventually raised a service outage. Production was recovered after byte-for-byte state backup and independent `videos.list` confirmation of the exact unavailable source ID, without sending or altering subscriptions/seen state. Aligned active cycles now check pending durable video IDs in batches and resolve `source-content-unavailable` only after two matching missing observations at least four minutes apart. One miss, a later visible result, or an API failure cannot discard an intent.
 
 ---
 
@@ -54,10 +56,10 @@ The scheduled Worker deployments below are retained rollback/history assets. The
 | `tubepulse-posts` | Version `ed33187c-9c79-4fa7-b215-72194117feb6`; deployment retained, Cron Triggers disabled at the Home cutover. Home checks posts hourly. |
 | `tubepulse-aux` | Version `ea9347cf-67db-4a49-a8d6-7bd671cedd08`; deployment retained, Cron Triggers disabled at the Home cutover. Home runs aux each minute. |
 | `tubepulse-cron` | Retired no-op retained under its historical name with `crons = []`. |
-| `tubepulse-api` | Version `7d418086-f904-494e-ae23-0498a9233ac8`; serves the unchanged app URL and the privacy-safe service-status route. Every authenticated feed uses the unified Home store over VPC while current, with D1 fallback; authenticated mutations are Home-first with deferred atomic D1 backup. See the production D1 cutover section for the currently verified deployment. |
+| `tubepulse-api` | Version `9eeb8a15-dc31-4e79-b310-279ecd10de54`; serves the unchanged app URL and the privacy-safe service-status route. Every authenticated feed uses the unified Home store over VPC while current, with D1 fallback; authenticated mutations are Home-first with deferred atomic D1 backup. See the production D1 cutover section for the currently verified deployment. |
 | `worker/archive/tubepulse-resolver` | Not deployed; archive remains reference-only. |
 
-The checked-in app version is `4.3.1` with Android `versionCode 434`. Worker deployment is separate from app APK release; the v4.3.1 Android patch itself required no Worker change. The separate 2026-10-13 host recovery hardening documented below is deployed on the production Home authority.
+The checked-in app version is `4.4.0` with Android `versionCode 441`. Worker deployment is separate from app APK release; the Android release uses the existing production Worker endpoint and notification service.
 
 Community-post worker/app support is enabled only when `TUBEPULSE_ENABLE_COMMUNITY_POSTS` is set to `1`, `true`, or `yes`. When enabled, cron polls active subscribed channels from `channels:active`. `TUBEPULSE_COMMUNITY_POST_CHANNEL_ALLOWLIST` is optional and narrows polling only when non-empty; missing or blank means all active channels are eligible. First-poll seeding remains silent to avoid old-post spam for newly added channels.
 
@@ -82,7 +84,7 @@ Community-post worker/app support is enabled only when `TUBEPULSE_ENABLE_COMMUNI
 
 ## Verified API Route State
 
-Last verified: 2026-10-05 after the D1 canonical cutover.
+Last verified: 2026-10-16 after the Durable Object write-amplification correction.
 
 The app-facing API route is currently reachable at:
 
@@ -91,11 +93,12 @@ The app-facing API route is currently reachable at:
 Safe read-only checks showed:
 
 - `GET /` returned `200 OK` from Cloudflare with JSON body `{"status":"ok","version":"3.0.0","worker":"tubepulse-api","architecture":"channel-first"}`.
+- An authenticated-format `GET /feed` for a deliberately nonexistent validation identity returned the expected `404 Device not registered` with `X-TubePulse-Authority-Route: home`, proving that the unchanged public route still reached the private Home authority without reading or changing a real installation.
 - `GET /__route_probe_readonly__` returned `404 Not Found` from Cloudflare, proving the hostname routes to a worker even for unknown paths.
 
 Keep these version labels distinct:
 
-- App/release version evidence in this repo is `4.3.1` with Android `versionCode 434`.
+- App/release version evidence in this repo is `4.4.0` with Android `versionCode 441`.
 - API worker health response reports Worker contract `version: "3.0.0"`; it is intentionally independent of the Android app release version.
 
 `worker/tubepulse-api/wrangler.toml` intentionally commits no custom route. The live `workers.dev` endpoint remains enabled and unchanged; route ownership is separate from the app release version.
@@ -180,6 +183,12 @@ On 2026-10-05 the active cloud canonical backup/fallback moved from Workers KV t
 The old KV namespace is now a frozen point-in-time snapshot: it is not read, written, or selected automatically. Retained scheduled Workers have no Cron Triggers and their scheduled handlers additionally require an explicit frozen-KV acknowledgement latch. Safe rollback after D1 advances requires a new quiesced exact reconciliation; enabling the latch alone is unsafe.
 
 The D1 coordinator uses one atomic four-query `batch()` for a complete logical transaction, with content-hash guard rows preventing partial or stale-baseline commits. It estimates three rows written per logical mutation and enforces 45,000 scheduler / 50,000 total estimated rows per UTC day, leaving 5,000 rows for app mutations. Seed/retry row work is included in the exposed daily counter. D1 batching reduces round trips but not billed rows, and read replication remains disabled.
+
+On 2026-10-16 Cloudflare warned that Durable Objects SQLite had reached 90% of its separate 100,000 rows-written UTC-day allowance while D1 remained far lower. Analytics attributed the account's current Durable Objects usage to the TubePulse authority. The coordinator had amplified writes by deleting/rewriting the full per-key baseline during reconciliation, storing/deleting a transaction row per delta, updating one baseline row per delta, attempting cleanup of pending rows that had never existed, and durably incrementing a request counter on every coordinator call. The corrected storage format uses one bounded packed baseline and one bounded embedded transaction, retains legacy rows without a migration delete burst, recovers both formats, performs no nonexistent pending cleanup for immediate publication, and no longer persists a per-request counter. Ordering, leases, D1 conditional atomicity, durable pending entries, stale fail-closed behavior, and old in-flight recovery remain intact.
+
+Monitoring now treats actual Durable Objects rows written as a first-class resource, separate from D1: default 100,000/day, UTC reset, current/EOD projection, 75% warning and 90% critical/overall-health protection. Cloudflare periodic/storage metrics are account-wide and delayed/approximate; current account inventory makes them TubePulse-representative, but post-deployment analytics are still required. The finalized 2026-10-15 Prometheus windows recorded about 31,791 coordinator requests (each previously rewrote the quota row), 97,826 Durable Objects rows written, 18,951 D1 rows written and 1,695 D1 write queries. Twelve reconciliation spikes contributed about 30,349 Durable Objects rows. Removing those three independent amplification sources, then allowing for one new packed-baseline row per D1 transaction and normal fixed lease/state/transaction rows, gives a structural expectation around 15,000–25,000 Durable Objects rows/day rather than roughly 98,000. Below 30% is the target, not a claim, until a clean full post-deployment UTC day is measured.
+
+Worker version `9eeb8a15-dc31-4e79-b310-279ecd10de54` deployed this correction on 2026-10-16 through the dedicated production deployment token. Two natural aligned scheduler cycles completed afterward with D1 current and seeded, no lease/transaction/pending residue, and normal notification visibility ordering. Repeated signed status reads left the legacy diagnostic `doRequests` counter unchanged, confirming that read-only coordinator traffic no longer rewrites it. The first observed cycle committed one canonical key; the second committed a 25-key batch plus one notification-state key and delivered one legitimate notification after the visibility barrier passed. The first fully post-deployment finalized Cloudflare interval (`03:40–03:45 UTC`) reported 70 Durable Objects rows written for 17 requests and 3 D1 rows written; that one-window pace extrapolates to about 20,160 Durable Objects rows/day, inside the expected structural range. Cloudflare analytics delay and short-window variance mean this is an encouraging spot check, not yet the daily billing reduction; retain the full-UTC-day measurement requirement above.
 
 Restart validation exposed and corrected a recovery-only query-shape defect: D1 canonical snapshots now read visible rows in one bounded set query instead of issuing one query per key, and SQL `NULL` expiration remains non-expiring rather than becoming zero. Home completed an exact automatic reconciliation after the fix; the coordinator returned to current with no transaction or pending backup.
 

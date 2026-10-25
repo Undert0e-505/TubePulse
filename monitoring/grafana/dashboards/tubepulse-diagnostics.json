@@ -30,7 +30,7 @@
       "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"], "values": false } }
     },
     {
-      "type": "gauge", "title": "D1 writes today", "description": "UTC-day D1 rows written from Cloudflare analytics versus the configurable free-plan guardrail.",
+      "type": "gauge", "title": "D1 writes today", "description": "UTC-day D1 rows written from Cloudflare analytics versus its configurable guardrail. D1 and Durable Objects are separate resources.",
       "gridPos": { "x": 12, "y": 0, "w": 6, "h": 4 },
       "targets": [{ "expr": "100 * tubepulse:d1_write_budget_ratio", "legendFormat": "used", "refId": "A" }],
       "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 65 }, { "color": "red", "value": 85 }] } }, "overrides": [] },
@@ -182,12 +182,16 @@
         { "expr": "tubepulse:worker_requests_day", "legendFormat": "Worker requests", "refId": "A" },
         { "expr": "100 * tubepulse:worker_request_budget_ratio", "legendFormat": "Worker request %", "refId": "B" },
         { "expr": "100 * tubepulse:d1_read_budget_ratio", "legendFormat": "D1 read %", "refId": "C" },
-        { "expr": "100 * tubepulse:d1_write_budget_ratio", "legendFormat": "D1 write %", "refId": "D" }
+        { "expr": "100 * tubepulse:d1_write_budget_ratio", "legendFormat": "D1 write %", "refId": "D" },
+        { "expr": "tubepulse:do_rows_written_day", "legendFormat": "DO rows written", "refId": "E" },
+        { "expr": "100 * tubepulse:do_write_budget_ratio", "legendFormat": "DO write %", "refId": "F" },
+        { "expr": "tubepulse:do_write_projected_end_of_day", "legendFormat": "DO projected EOD", "refId": "G" }
       ],
       "fieldConfig": { "defaults": { "unit": "short", "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 75 }, { "color": "red", "value": 90 }] } }, "overrides": [
         { "matcher": { "id": "byName", "options": "Worker request %" }, "properties": [{ "id": "unit", "value": "percent" }] },
         { "matcher": { "id": "byName", "options": "D1 read %" }, "properties": [{ "id": "unit", "value": "percent" }] },
-        { "matcher": { "id": "byName", "options": "D1 write %" }, "properties": [{ "id": "unit", "value": "percent" }] }
+        { "matcher": { "id": "byName", "options": "D1 write %" }, "properties": [{ "id": "unit", "value": "percent" }] },
+        { "matcher": { "id": "byName", "options": "DO write %" }, "properties": [{ "id": "unit", "value": "percent" }] }
       ] },
       "options": { "colorMode": "value", "graphMode": "area", "orientation": "horizontal", "reduceOptions": { "calcs": ["lastNotNull"], "values": false } }
     },

@@ -41,6 +41,7 @@ test('parser keeps TubePulse script aggregates and sums D1 and Durable Object us
   assert.equal(parsed.window.durableObjects.rowsWritten, 14);
   assert.equal(parsed.d1StorageBytes, 100);
   assert.equal(parsed.durableObjectStorageBytes, 200);
+  assert.match(parsed.analyticsNote, /Durable Object periodic\/storage usage is account-wide/);
   const serialized = JSON.stringify(parsed);
   assert.doesNotMatch(serialized, /unrelated-worker|11111111|aaaaaaaa/);
 });

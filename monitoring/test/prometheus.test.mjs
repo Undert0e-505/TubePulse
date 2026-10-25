@@ -7,7 +7,7 @@ test('Prometheus exposition contains aggregate labels and excludes identifiers',
     collector: {
       lastCollectionSuccess: true, errorsTotal: 0,
       lastAttemptAt: '2026-10-06T11:05:00Z', lastSuccessAt: '2026-10-06T11:05:00Z',
-      limits: { d1RowsWritten: 100000, d1RowsRead: 5000000, workerRequests: 100000 },
+      limits: { d1RowsWritten: 100000, d1RowsRead: 5000000, durableObjectRowsWritten: 100000, workerRequests: 100000 },
     },
     snapshot: {
       intervalStart: '2026-10-06T11:00:00Z', collection: { hostSuccess: true, cloudflareSuccess: true },
@@ -50,7 +50,7 @@ test('Prometheus exposition contains aggregate labels and excludes identifiers',
       },
       cloudflare: {
         window: { workers: [{ script: 'tubepulse-api', status: 'success', requests: 5 }], d1: {}, durableObjects: {} },
-        day: { workers: [], d1: {}, durableObjects: {} },
+        day: { workers: [], d1: {}, durableObjects: { rowsWritten: 97398 } },
       },
     },
   });
@@ -62,6 +62,8 @@ test('Prometheus exposition contains aggregate labels and excludes identifiers',
   assert.match(metrics, /tubepulse_subscription_membership_mismatches\{direction="missing_from_subscriber_index"\} 0/);
   assert.match(metrics, /tubepulse_subscription_integrity_issues\{kind="active_channel_without_subscriber_index"\} 0/);
   assert.match(metrics, /tubepulse_cloudflare_worker_requests\{period="window",script="tubepulse-api",status="success"\} 5/);
+  assert.match(metrics, /tubepulse_cloudflare_do_rows_written\{period="day"\} 97398/);
+  assert.match(metrics, /tubepulse_guardrail\{resource="do_rows_written_day"\} 100000/);
   assert.match(metrics, /tubepulse_notifications_pending 2/);
   assert.match(metrics, /tubepulse_notifications_oldest_pending_age_seconds 75/);
   assert.match(metrics, /tubepulse_notifications_durable_backlog 1/);

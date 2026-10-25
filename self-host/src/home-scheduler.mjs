@@ -7,7 +7,7 @@ import { pollSingleRssChannel, processChannelUploads } from '../../worker/tubepu
 import { runAuxTick } from '../../worker/tubepulse-aux/index.js';
 import { runAlignedVideoNotifications } from '../../worker/tubepulse-aux/aligned-video-notifications.mjs';
 import {
-  getKV, key, mergeRssUploadsIntoRecentVideos, putKV, putKVIfChanged,
+  cleanupDeadChannel, cleanupDeadDevice, getKV, key, mergeRssUploadsIntoRecentVideos, putKV, putKVIfChanged,
   removeFromNagActive, stableJson,
 } from '../../worker/tubepulse-cron/shared.mjs';
 import { isSyncExcluded } from './exclusions.mjs';
@@ -302,6 +302,21 @@ export class WorkerKvFacade {
   async delete(name) {
     await this.adapter.delete(name);
   }
+
+  async list({ prefix = '', limit = 1000, cursor } = {}) {
+    const offset = cursor ? Number.parseInt(String(cursor), 10) : 0;
+    const start = Number.isFinite(offset) && offset >= 0 ? offset : 0;
+    const matches = (await this.adapter.listKeys())
+      .filter(({ name }) => String(name).startsWith(String(prefix)))
+      .sort((left, right) => left.name.localeCompare(right.name));
+    const keys = matches.slice(start, start + limit);
+    const next = start + keys.length;
+    return {
+      keys,
+      list_complete: next >= matches.length,
+      ...(next < matches.length ? { cursor: String(next) } : {}),
+    };
+  }
 }
 
 function stripMetrics(value) {
@@ -487,6 +502,11 @@ export class RecordingKv {
     if (previousValue !== null && previousValue !== undefined) {
       this.journal.record({ key: name, operation: 'delete', previousValue, nextValue: null });
     }
+  }
+
+
+  async list(options) {
+    return await this.base.list(options);
   }
 }
 
@@ -865,6 +885,7 @@ export class HomeSchedulerRunner {
     try {
       await this.runtime.start();
       const local = new LocalKvAdapter(await this.runtime.getLocalNamespace());
+      this.localAdapter = local;
       if (this.config.mode === 'shadow') {
         this.publication = new ShadowPublicationStrategy({
           local,
@@ -993,6 +1014,120 @@ export class HomeSchedulerRunner {
       },
       TUBEPULSE_KV_MUTATION_LOCK: (name, operation) => this.kvMutationMutex.run(name, operation),
     };
+  }
+
+  async inspectOperatorDeviceCleanup(plans) {
+    if (!Array.isArray(plans) || plans.length === 0) throw new Error('At least one device cleanup plan is required');
+    const deviceIds = new Set();
+    const target = this.publication.target();
+    const listed = await this.localAdapter.listKeys();
+    const keyNames = listed.map(({ name }) => name);
+    const results = [];
+    for (const plan of plans) {
+      const deviceId = String(plan?.deviceId || '');
+      if (!deviceId || deviceIds.has(deviceId)) throw new Error('Device cleanup plans require unique device IDs');
+      deviceIds.add(deviceId);
+      const profile = await getKV(target, key.deviceProfile(deviceId));
+      const channels = await getKV(target, key.deviceChannels(deviceId)) || [];
+      if (!profile) throw new Error(`Device cleanup precondition failed for ${deviceId}: profile missing`);
+      if (Number(profile.createdAt) !== Number(plan.expectedCreatedAt)
+        || String(profile.appVersion || '') !== String(plan.expectedAppVersion || '')) {
+        throw new Error(`Device cleanup precondition failed for ${deviceId}: profile fingerprint changed`);
+      }
+      const expectedChannels = [...new Set((plan.expectedChannels || []).map(String))].sort();
+      const actualChannels = [...new Set(channels.map(String))].sort();
+      if (stableJson(actualChannels) !== stableJson(expectedChannels)) {
+        throw new Error(`Device cleanup precondition failed for ${deviceId}: memberships changed`);
+      }
+      const directKeys = keyNames.filter((name) => name.startsWith(`device:${deviceId}:`)
+        || name.endsWith(`:${deviceId}`));
+      const reverseSubscriberKeys = [];
+      const unexpectedValueReferences = [];
+      let fcmLookupKeys = 0;
+      for (const name of keyNames) {
+        if (name.startsWith('channel:') && name.endsWith(':subscribers')) {
+          const subscribers = await getKV(target, name) || [];
+          if (subscribers.includes(deviceId)) reverseSubscriberKeys.push(name);
+        } else if (name.startsWith('fcm:lookup:')) {
+          if (await getKV(target, name) === deviceId) fcmLookupKeys++;
+        }
+      }
+      results.push({
+        deviceId,
+        profile,
+        channels: actualChannels,
+        directKeys,
+        reverseSubscriberKeys,
+        fcmLookupKeys,
+      });
+    }
+    const nag = await getKV(target, key.nagActive()) || [];
+    const nagEntries = nag.filter((entry) => deviceIds.has(String(entry).split('|')[0])).length;
+    const intents = typeof this.notificationCoordinator?.intentStore?.inspectDevices === 'function'
+      ? await this.notificationCoordinator.intentStore.inspectDevices([...deviceIds])
+      : { records: 0, pending: 0, callbackPending: 0 };
+    return { devices: results, nagEntries, intents };
+  }
+
+  async operatorCleanupDevices(plans, { apply = false } = {}) {
+    if (this.config.mode !== 'active') throw new Error('Operator device cleanup requires active Home authority');
+    if (this.running) throw Object.assign(new Error('Scheduler cycle is active; retry cleanup after the cycle'), { status: 409 });
+    this.running = true;
+    let prepared = false;
+    try {
+      const inspected = await this.inspectOperatorDeviceCleanup(plans);
+      const safe = {
+        deviceCount: inspected.devices.length,
+        devices: inspected.devices.map((entry) => ({
+          deviceHash: crypto.createHash('sha256').update(entry.deviceId).digest('hex'),
+          createdAt: entry.profile.createdAt,
+          appVersion: entry.profile.appVersion,
+          channelCount: entry.channels.length,
+          directKeyCount: entry.directKeys.length,
+          reverseMembershipCount: entry.reverseSubscriberKeys.length,
+          fcmLookupCount: entry.fcmLookupKeys,
+        })),
+        nagEntries: inspected.nagEntries,
+        notificationIntents: inspected.intents,
+      };
+      if (!apply) return { applied: false, ...safe };
+
+      const journal = new MutationJournal();
+      await this.publication.prepare();
+      prepared = true;
+      const target = new RecordingKv(this.publication.target(), journal);
+      const env = {
+        ...this.config.workerBindings,
+        TUBEPULSE_KV: target,
+        TUBEPULSE_KV_MUTATION_LOCK: (name, operation) => this.kvMutationMutex.run(name, operation),
+      };
+      for (const entry of inspected.devices) {
+        await cleanupDeadDevice(entry.deviceId, env, 'operator-test-data-purge');
+        for (const name of entry.directKeys) await target.delete(name);
+        for (const name of entry.reverseSubscriberKeys) {
+          const channelId = name.slice('channel:'.length, -':subscribers'.length);
+          if (entry.channels.includes(channelId)) continue;
+          const subscribers = await getKV(target, name) || [];
+          const filtered = subscribers.filter((id) => id !== entry.deviceId);
+          if (filtered.length === 0 && subscribers.length > 0) {
+            await cleanupDeadChannel(channelId, env, 'last_subscriber_dead');
+          } else {
+            await putKV(target, name, filtered);
+          }
+        }
+      }
+      const publication = await this.publication.finish(journal);
+      prepared = false;
+      const intentPurge = typeof this.notificationCoordinator?.intentStore?.purgeDevices === 'function'
+        ? await this.notificationCoordinator.intentStore.purgeDevices([...inspected.devices.map(({ deviceId }) => deviceId)])
+        : { removed: 0 };
+      return { applied: true, ...safe, mutations: journal.summary(), publication, intentPurge };
+    } catch (error) {
+      if (prepared) await this.publication.abort('operator-device-cleanup-failed').catch(() => {});
+      throw error;
+    } finally {
+      this.running = false;
+    }
   }
 
   async scheduleCanonicalRecoveryRevalidation(recovery) {
@@ -1506,6 +1641,7 @@ export class HomeSchedulerRunner {
       }
     }
     await this.applyStatistics(target, channelRecents, due, allStatistics);
+    const pendingVideoAvailability = await this.reconcilePendingVideoAvailability(api);
     state = await this.stateFile.read();
     health = normalizeYoutubeDataApiState(state.youtubeDataApi, this.now());
     health.statsMethod = statsMethod;
@@ -1531,6 +1667,7 @@ export class HomeSchedulerRunner {
       reconciliationDueCount: candidates.length, reconciledCount: reconcileResults.filter((entry) => entry.outcome === 'ok').length,
       reconciliationDeferredCount: Math.max(0, candidates.length - selected.length),
       statisticsVideoCount: allStatistics.size, statisticsRequests,
+      pendingVideoAvailability,
     };
     state.youtubeDataApi = health;
     await this.stateFile.write(state);
@@ -1544,7 +1681,35 @@ export class HomeSchedulerRunner {
       reconciliationDueCount: candidates.length, reconciledCount: reconcileResults.filter((entry) => entry.outcome === 'ok').length,
       reconciliationDeferredCount: Math.max(0, candidates.length - selected.length),
       reconcileResults, statisticsVideoCount: allStatistics.size, statisticsRequests, statsMethod: health.statsMethod,
+      pendingVideoAvailability,
     };
+  }
+
+  async reconcilePendingVideoAvailability(api) {
+    if (this.config.mode !== 'active'
+      || typeof this.notificationCoordinator?.pendingVideoIds !== 'function'
+      || typeof this.notificationCoordinator?.observeVideoAvailability !== 'function') {
+      return { requests: 0, checked: 0, available: 0, observed: 0, resolved: 0, failures: 0 };
+    }
+
+    const pendingIds = await this.notificationCoordinator.pendingVideoIds();
+    const totals = { requests: 0, checked: 0, available: 0, observed: 0, resolved: 0, failures: 0 };
+    for (const videoIds of chunked(pendingIds, 50)) {
+      try {
+        const payload = await api.listVideoDetails(videoIds);
+        const availableIds = (payload.items || []).map((item) => item?.id).filter(Boolean);
+        const observation = await this.notificationCoordinator.observeVideoAvailability(videoIds, availableIds);
+        totals.requests++;
+        totals.checked += videoIds.length;
+        totals.available += availableIds.length;
+        totals.observed += Number(observation?.observed || 0);
+        totals.resolved += Number(observation?.resolved || 0);
+      } catch (error) {
+        totals.failures++;
+        await this.recordYoutubeApiFailure('general', error);
+      }
+    }
+    return totals;
   }
 
   async pollChannelWithRetry(env, ctx, channelId) {

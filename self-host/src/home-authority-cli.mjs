@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import fs from 'node:fs/promises';
 import path from 'node:path';
 import { loadDotEnv } from './config.mjs';
 import { AuthorityClient } from './authority-client.mjs';
@@ -181,14 +182,33 @@ async function migrateD1(config) {
   }
 }
 
+async function purgeDevices(config, planPath, apply) {
+  if (!planPath) throw new Error('purge-devices requires a cleanup plan JSON path');
+  const plan = JSON.parse(await fs.readFile(path.resolve(planPath), 'utf8'));
+  if (!Array.isArray(plan.devices) || plan.devices.length === 0) throw new Error('Cleanup plan must contain devices');
+  const port = Number(process.env.TUBEPULSE_HOME_AUTHORITY_STATUS_PORT || 8789);
+  const response = await fetch(`http://127.0.0.1:${port}/_tubepulse/admin/purge-devices`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${config.authority.secret}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ devices: plan.devices, apply }),
+  });
+  const payload = await response.json().catch(() => null);
+  if (!response.ok || payload?.ok !== true) throw new Error(payload?.error || `Cleanup request failed with HTTP ${response.status}`);
+  console.log(JSON.stringify(payload.result));
+}
+
 async function main() {
-  const [command = 'run'] = process.argv.slice(2);
+  const [command = 'run', argument, flag] = process.argv.slice(2);
   const config = readHomeSchedulerConfig();
   if (command === 'status') return await status(config);
   if (command === 'drain-pending') return await drainPending(config);
   if (command === 'reconcile') return await reconcile(config);
   if (command === 'migrate-d1') return await migrateD1(config);
-  if (command !== 'run') throw new Error('Usage: node src/home-authority-cli.mjs run|status|drain-pending|reconcile|migrate-d1');
+  if (command === 'purge-devices') return await purgeDevices(config, argument, flag === '--apply');
+  if (command !== 'run') throw new Error('Usage: node src/home-authority-cli.mjs run|status|drain-pending|reconcile|migrate-d1|purge-devices <plan.json> [--apply]');
   installServiceShutdownHandlers();
   serviceStartup = createUnifiedHomeAuthorityService(config);
   liveService = await serviceStartup;

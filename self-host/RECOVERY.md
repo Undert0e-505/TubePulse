@@ -95,7 +95,7 @@ Every host JSON state write is serialized, written to a same-directory temporary
 
 If startup still reports `StateFileCorruptionError`, stop only `home-authority`, preserve the primary, `.bak`, `.tmp`, `.swap`, and `.corrupt-*` files, then follow the signed coordinator-status and D1 reconciliation sequence below. Never delete the scheduler or notification state merely to make the container start. D1 can reconstruct canonical keys, but not local YouTube quota reservations or an ambiguous claimed notification. After any recovery, require one completed aligned cycle, zero pending/overdue notification intents, and a Home-backed feed before declaring service restored. Durable known-content watermarks suppress historical uploads; never compensate by replaying a guessed backlog.
 
-An exact D1 restore may contain an older channel feed than the host-only detector state. The reconcile result now identifies changed channel recent/known keys and schedules those channels, plus any channel named by a durable pending intent, for bounded high-priority uploads-playlist revalidation. The marker survives restart and clears only after success. Do not bypass the public-feed visibility barrier or delete the pending intent: the repaired feed must become canonical first, after which the existing intent is delivered once through its normal durable claim.
+An exact D1 restore may contain an older channel feed than the host-only detector state. The reconcile result now identifies changed channel recent/known keys and schedules those channels, plus any channel named by a durable pending intent, for bounded high-priority uploads-playlist revalidation. The marker survives restart and clears only after success. Do not bypass the public-feed visibility barrier or delete the pending intent: the repaired feed must become canonical first, after which the existing intent is delivered once through its normal durable claim. If YouTube itself has deleted, privatized, or replaced the intent's source video, active aligned cycles resolve it only after `videos.list` confirms the same missing source set twice at least four minutes apart. A single miss or API failure preserves the intent. Operators should use this automatic path; manual suppression is an incident-only last resort after a byte-for-byte state backup and independent proof that the exact source ID is permanently unavailable.
 
 A short `Home authority lease busy` at a minute boundary can be an ordinary signed app mutation, not corruption. The scheduler retries local acquisition within a bounded window. If the API lease is still valid after that window it records a contention skip, leaves Home current, performs no snapshot reconciliation, and persists any missed aligned sweep for the next safe minute. Do not manually clear the API lease. An expired lease or genuinely stale authority still fails closed into the normal integrity recovery path. Retained `scheduler.lastError` is incident history; current health is determined against the newest completed sweep, minute job, notification terminal observation, or YouTube success.
 
@@ -348,6 +348,12 @@ Only after application recovery succeeds, dry-run and install the per-user Start
 The repository now contains bounded host startup supervision, signed status, a hash-guarded pending-drain command, exact D1-to-local reconstruction, and flushed atomic primary/last-known-good JSON generations with corruption quarantine. It still cannot reconstruct both lost local generations, historical notification-intent decisions, or YouTube request counters. A future change may add checksums and always-verify startup manifests; until then, loss of both validated generations must fail closed rather than being hidden by retries.
 
 ## Restore aggregate monitoring after recovery
+
+Test-device removal must use the preconditioned `purge-devices` authority command documented in
+`self-host/README.md`. Never delete device keys directly from the Miniflare SQLite/blob store or D1:
+that bypasses reverse subscriber indexes, token lookup cleanup, notification state and canonical
+publication. Preserve the incident backup and Prometheus/JSONL history when recovering or auditing a
+cleanup.
 
 Monitoring is deliberately downstream of authority recovery. Restore and verify the authority first; monitoring must never become an activation gate.
 

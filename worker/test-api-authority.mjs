@@ -8,7 +8,7 @@ import {
   authorityTestHelpers,
   createAuthorityWorker,
 } from './tubepulse-api/authority.mjs';
-import { d1KvTestHelpers } from './tubepulse-api/d1-kv.mjs';
+import { D1KvNamespace, d1KvTestHelpers } from './tubepulse-api/d1-kv.mjs';
 import { FakeD1 } from './test-support/fake-d1.mjs';
 
 const SECRET = 'synthetic-authority-secret-that-is-at-least-32-characters';
@@ -38,14 +38,19 @@ class MemoryKv {
 }
 
 class MemoryStorage {
-  constructor() { this.values = new Map(); }
+  constructor() { this.values = new Map(); this.mutations = []; }
   async get(name) { return this.values.get(name); }
-  async put(name, value) { this.values.set(name, structuredClone(value)); }
+  async put(name, value) {
+    this.mutations.push({ operation: 'put', keys: [name] });
+    this.values.set(name, structuredClone(value));
+  }
   async delete(name) {
     if (Array.isArray(name)) {
+      this.mutations.push({ operation: 'delete', keys: [...name] });
       for (const key of name) this.values.delete(key);
       return;
     }
+    this.mutations.push({ operation: 'delete', keys: [name] });
     this.values.delete(name);
   }
   async list({ prefix = '' } = {}) {
@@ -1261,4 +1266,172 @@ test('D1 coordinator accounts conservative rows, defers at publication cap and f
     leaseId: 'publication-d1-0003', kind: 'publication',
   });
   assert.equal(result.response.status, 409);
+});
+
+test('D1 baseline migrates from legacy rows with one packed write and no billed delete burst', async () => {
+  const fixture = d1CoordinatorFixture();
+  fixture.database.backend = { active_generation: 'production-v1' };
+  const hashes = new Map([
+    ['alpha', await authoritySha256('one')],
+    ['beta', await authoritySha256('two')],
+  ]);
+  for (const [key, hash] of hashes) {
+    fixture.storage.values.set(`authority:baseline:${await authoritySha256(key)}`, { key, hash });
+  }
+  fixture.storage.mutations.length = 0;
+
+  assert.equal(await fixture.coordinator.baselineHash('alpha'), hashes.get('alpha'));
+  assert.deepEqual(fixture.storage.mutations, [{ operation: 'put', keys: ['authority:baseline-packed:v1'] }]);
+  assert.equal((await fixture.storage.list({ prefix: 'authority:baseline:' })).size, 2, 'legacy rows remain for compatibility');
+
+  const evicted = new TubePulseAuthorityCoordinator({ storage: fixture.storage }, fixture.env);
+  fixture.storage.mutations.length = 0;
+  assert.equal(await evicted.baselineHash('beta'), hashes.get('beta'));
+  assert.equal(fixture.storage.mutations.length, 0, 'packed baseline survives coordinator eviction');
+});
+
+test('D1 reconcile and large committed batches mutate baseline storage O(1)', async () => {
+  const fixture = d1CoordinatorFixture();
+  const records = Array.from({ length: 500 }, (_, index) => ({
+    key: `key-${String(index).padStart(4, '0')}`,
+    value: `old-${index}`,
+  }));
+  fixture.database.backend = { active_generation: 'production-v1' };
+  for (const record of records) {
+    fixture.database.records.set(fixture.database.id('production-v1', record.key), {
+      generation: 'production-v1', key: record.key, value: record.value, expiration: null,
+      metadata: null, content_hash: await authoritySha256(record.value),
+    });
+  }
+  fixture.storage.values.set('authority:state', {
+    schemaVersion: 1, status: 'current', reason: 'reconciled', generation: 1,
+    canonicalVersion: 0, seeded: true, backend: 'd1', backendGeneration: 'production-v1',
+  });
+  fixture.storage.mutations.length = 0;
+  const snapshot = await callCoordinator(fixture.coordinator, '/snapshot', { leaseId: 'packed-reconcile-large-01' });
+  assert.equal(snapshot.response.status, 200);
+  assert.equal(snapshot.payload.recordCount, records.length);
+  assert.equal(fixture.storage.mutations.filter(({ operation, keys }) => (
+    operation === 'put' && keys[0] === 'authority:baseline-packed:v1'
+  )).length, 1);
+  assert.equal(fixture.storage.mutations.some(({ keys }) => keys.some((key) => key.startsWith('authority:baseline:'))), false);
+  await callCoordinator(fixture.coordinator, '/activate', snapshot.payload);
+
+  fixture.storage.mutations.length = 0;
+  await callCoordinator(fixture.coordinator, '/acquire', { leaseId: 'packed-publication-large-01', kind: 'publication' });
+  const deltas = await Promise.all(records.slice(0, 100).map(async (record) => ({
+    key: record.key, operation: 'put', value: `${record.value}-new`, options: {},
+    baseHash: await authoritySha256(record.value), nextHash: await authoritySha256(`${record.value}-new`),
+  })));
+  const committed = await callCoordinator(fixture.coordinator, '/commit', {
+    leaseId: 'packed-publication-large-01', deltas,
+  });
+  assert.equal(committed.response.status, 200);
+  assert.equal(fixture.storage.mutations.filter(({ operation, keys }) => (
+    operation === 'put' && keys[0] === 'authority:baseline-packed:v1'
+  )).length, 1);
+  assert.equal(fixture.storage.mutations.some(({ keys }) => keys.some((key) => key.startsWith('authority:transaction:delta:'))), false);
+  assert.equal(fixture.storage.mutations.some(({ operation, keys }) => (
+    operation === 'delete' && keys.some((key) => key.startsWith('authority:pending:'))
+  )), false, 'an immediate publication must not delete pending rows that were never stored');
+});
+
+test('D1 recovers both embedded and legacy per-delta transactions', async () => {
+  for (const format of ['embedded', 'legacy']) {
+    const fixture = d1CoordinatorFixture();
+    const oldHash = await authoritySha256('old');
+    const newHash = await authoritySha256('new');
+    fixture.database.backend = { active_generation: 'production-v1' };
+    fixture.database.records.set(fixture.database.id('production-v1', 'alpha'), {
+      generation: 'production-v1', key: 'alpha', value: 'old', expiration: null,
+      metadata: null, content_hash: oldHash,
+    });
+    fixture.storage.values.set('authority:baseline-packed:v1', { schemaVersion: 1, entries: [['alpha', oldHash]] });
+    fixture.storage.values.set('authority:state', {
+      schemaVersion: 1, status: 'current', reason: 'reconciled', generation: 1,
+      canonicalVersion: 0, seeded: true, backend: 'd1', backendGeneration: 'production-v1',
+    });
+    fixture.storage.values.set('authority:quota', {
+      day: new Date().toISOString().slice(0, 10), backend: 'd1', backendGeneration: 'production-v1',
+      logicalWrites: 1, estimatedRowsWritten: 3, publicationEstimatedRowsWritten: 3,
+      apiEstimatedRowsWritten: 0, canonicalReads: 0, canonicalLists: 0, doRequests: 0,
+    });
+    const delta = { key: 'alpha', operation: 'put', value: 'new', options: {}, baseHash: oldHash, nextHash: newHash };
+    const transaction = {
+      id: `${format}-recovery`, kind: 'publication', count: 1, nextIndex: 0,
+      quotaReserved: true, retainLease: false, pendingStorageKeys: [],
+      backend: 'd1', backendGeneration: 'production-v1',
+      ...(format === 'embedded' ? { deltas: [delta] } : {}),
+    };
+    fixture.storage.values.set('authority:transaction', transaction);
+    if (format === 'legacy') fixture.storage.values.set('authority:transaction:delta:0000', delta);
+
+    const recovered = await callCoordinator(fixture.coordinator, '/recover', {});
+    assert.equal(recovered.response.status, 200, format);
+    assert.equal(fixture.database.records.get(fixture.database.id('production-v1', 'alpha')).value, 'new');
+    assert.equal(fixture.storage.values.has('authority:transaction'), false);
+    assert.equal(fixture.storage.values.has('authority:transaction:delta:0000'), false);
+  }
+});
+
+test('read-only status does not durably rewrite quota or request counters', async () => {
+  const fixture = d1CoordinatorFixture();
+  fixture.database.backend = { active_generation: 'production-v1' };
+  fixture.storage.values.set('authority:state', {
+    schemaVersion: 1, status: 'current', reason: 'reconciled', generation: 1,
+    canonicalVersion: 0, seeded: true, backend: 'd1', backendGeneration: 'production-v1',
+  });
+  fixture.storage.values.set('authority:quota', {
+    day: new Date().toISOString().slice(0, 10), backend: 'd1', backendGeneration: 'production-v1',
+    logicalWrites: 0, estimatedRowsWritten: 0, publicationEstimatedRowsWritten: 0,
+    apiEstimatedRowsWritten: 0, canonicalReads: 0, canonicalLists: 0, doRequests: 0,
+  });
+  fixture.storage.mutations.length = 0;
+  const status = await callCoordinator(fixture.coordinator, '/status', undefined, 'GET');
+  assert.equal(status.response.status, 200);
+  assert.equal(status.payload.quota.doRequests, 0);
+  assert.equal(fixture.storage.mutations.length, 0);
+});
+
+test('oversized packed baseline and transaction values fail before canonical mutation', async () => {
+  const fixture = d1CoordinatorFixture();
+  fixture.database.backend = { active_generation: 'production-v1' };
+  const oversizedBaseline = new Map(Array.from({ length: 5_000 }, (_, index) => [
+    `key-${index}-${'x'.repeat(380)}`, 'a'.repeat(64),
+  ]));
+  await assert.rejects(() => fixture.coordinator.storePackedBaseline(oversizedBaseline), /packed-baseline-too-large/);
+  assert.equal(fixture.storage.values.has('authority:baseline-packed:v1'), false);
+
+  const largeValue = 'x'.repeat(1_899_900);
+  const delta = {
+    key: 'large', operation: 'put', value: largeValue, options: {},
+    baseHash: null, nextHash: await authoritySha256(largeValue),
+  };
+  assert.throws(() => fixture.coordinator.transactionForStorage({ count: 1 }, [delta]), /packed-transaction-too-large/);
+  assert.equal(fixture.database.records.size, 0);
+});
+
+test('oversized migration baseline cannot activate a D1 generation', async () => {
+  const fixture = d1CoordinatorFixture();
+  for (let index = 0; index < 5_000; index++) {
+    const key = `key-${index}-${'x'.repeat(380)}`;
+    fixture.database.records.set(fixture.database.id('production-v1', key), {
+      generation: 'production-v1', key, value: 'v', expiration: null, metadata: null,
+      content_hash: await authoritySha256('v'),
+    });
+  }
+  const staged = await new D1KvNamespace(fixture.database, 'production-v1').stagedManifest();
+  fixture.storage.values.set('authority:backend-migration', {
+    leaseId: 'oversized-migration-0001', backend: 'd1', backendGeneration: 'production-v1',
+    manifestHash: staged.manifestHash, recordCount: staged.recordCount,
+    receivedCount: staged.recordCount, legacyPendingCount: 0, clearedStagedRows: 0,
+  });
+  fixture.storage.values.set('authority:lease', {
+    leaseId: 'oversized-migration-0001', kind: 'reconcile', expiresAt: Date.now() + 30_000,
+  });
+  const result = await callCoordinator(fixture.coordinator, '/backend-migration/commit', {
+    leaseId: 'oversized-migration-0001',
+  });
+  assert.equal(result.response.status, 400);
+  assert.equal(fixture.database.backend, null, 'oversized coordinator state must not activate D1');
 });

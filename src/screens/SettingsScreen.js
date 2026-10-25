@@ -1,5 +1,5 @@
 import React, {
-  useState, useCallback, useLayoutEffect, useRef,
+  useState, useCallback, useEffect, useLayoutEffect, useRef,
 } from 'react';
 import {
   View, Text, TouchableOpacity, StyleSheet,
@@ -15,6 +15,9 @@ import { getSettings, peekSettings, saveSettings } from '../utils/storage';
 import { updateSettings, getDeviceId, fetchServiceStatus } from '../utils/api';
 import { IS_TUBEPULSE_PREVIEW } from '../utils/apiEndpointConfig';
 import UpdateAvailablePill from '../components/UpdateAvailablePill';
+import { FeatureTourTarget, useFeatureTour } from '../components/FeatureTour';
+import { useTourScroll } from '@wrack/react-native-tour-guide';
+import { shouldAcceptFeatureTourReplayPress } from '../utils/featureTourPolicy.mjs';
 import {
   cachedAvailableUpdate,
   dismissUpdate,
@@ -86,7 +89,12 @@ async function refreshServiceStatusIfDue() {
 // ── Main Screen ───────────────────────────────────────────────────────────────
 export default function SettingsScreen() {
   const navigation = useNavigation();
+  const featureTour = useFeatureTour();
   const insets = useSafeAreaInsets();
+  const scrollRef = useRef(null);
+  const scrollOffsetRef = useRef(0);
+  const tourScroll = useTourScroll();
+  const lastTourReplayPressAt = useRef(Number.NEGATIVE_INFINITY);
   const [scrollEnabled, setScrollEnabled] = useState(true);
   const [settings, setSettings] = useState(() => peekSettings());
   const [availableUpdate, setAvailableUpdate] = useState(() => warmedAvailableUpdate);
@@ -96,6 +104,18 @@ export default function SettingsScreen() {
   const visitSequence = useRef(0);
   const hasFocused = useRef(false);
   const updateRequestSequence = useRef(0);
+
+  const replayFeatureTour = useCallback(() => {
+    const pressedAt = Date.now();
+    if (!shouldAcceptFeatureTourReplayPress(lastTourReplayPressAt.current, pressedAt)) return;
+    lastTourReplayPressAt.current = pressedAt;
+    featureTour.replay();
+  }, [featureTour.replay]);
+
+  useEffect(() => featureTour.registerStageScroll('settings', {
+    scrollRef,
+    getCurrentScrollOffset: () => scrollOffsetRef.current,
+  }), [featureTour.registerStageScroll]);
 
   useFocusEffect(
     useCallback(() => {
@@ -207,9 +227,16 @@ export default function SettingsScreen() {
     <View style={styles.container}>
       {settings ? (
       <ScrollView
+        ref={scrollRef}
         style={styles.scroll}
         contentContainerStyle={styles.content}
         nestedScrollEnabled
+        onScroll={(event) => {
+          scrollOffsetRef.current = event.nativeEvent.contentOffset.y;
+          tourScroll.onScroll(event);
+        }}
+        onMomentumScrollEnd={tourScroll.onMomentumScrollEnd}
+        scrollEventThrottle={16}
         scrollEnabled={scrollEnabled}
       >
 
@@ -234,6 +261,7 @@ export default function SettingsScreen() {
         </Text>
       </View>
 
+      <FeatureTourTarget targetKey="settingsTap">
       {/* Tap Action */}
       <Text style={[styles.sectionTitle, styles.sectionTitleFirst]}>On tap, open:</Text>
       <View style={styles.optionGroup}>
@@ -254,7 +282,9 @@ export default function SettingsScreen() {
           ? 'Opens the specific video in YouTube and marks it as watched.'
           : 'Opens the channel page in YouTube and marks all their videos as watched.'}
       </Text>
+      </FeatureTourTarget>
 
+      <FeatureTourTarget targetKey="settingsNotifications">
       {/* Notification Mode */}
       <Text style={styles.sectionTitle}>Notification mode</Text>
       <View style={styles.optionGroup}>
@@ -305,7 +335,9 @@ export default function SettingsScreen() {
           ? 'Chill mode reminds every 4 hours. Nag interval only applies to Relentless mode.'
           : 'Relentless mode repeats reminders using the selected interval while items remain unread.'}
       </Text>
+      </FeatureTourTarget>
 
+      <FeatureTourTarget targetKey="settingsDnd">
       {/* Do Not Disturb */}
       <Text style={styles.sectionTitle}>Do not disturb</Text>
       <View style={styles.dndRow}>
@@ -344,7 +376,9 @@ export default function SettingsScreen() {
           </View>
         </>
       )}
+      </FeatureTourTarget>
 
+      <FeatureTourTarget targetKey="settingsLive">
       {/* Prewarn time for scheduled livestreams */}
       <Text style={styles.sectionTitle}>Live stream prewarn time</Text>
       <View style={styles.optionGroupNarrow}>
@@ -363,6 +397,7 @@ export default function SettingsScreen() {
       <Text style={styles.guidance}>
         How early to be notified before a scheduled livestream goes live.
       </Text>
+      </FeatureTourTarget>
 
       {/* Community Posts toggle */}
       <Text style={styles.sectionTitle}>Content types</Text>
@@ -379,6 +414,7 @@ export default function SettingsScreen() {
         />
       </View>
 
+      <FeatureTourTarget targetKey="settingsDisplay">
       {/* HomeScreen display settings */}
       <Text style={styles.sectionTitle}>Home screen</Text>
       <Text style={styles.dndLabel} numberOfLines={1}>Videos shown per channel</Text>
@@ -418,6 +454,7 @@ export default function SettingsScreen() {
           Long-press a channel to configure its own notification settings.
         </Text>
       )}
+      </FeatureTourTarget>
 
       {/* Push Architecture Note */}
       <Text style={styles.sectionTitle}>Push notifications</Text>
@@ -426,6 +463,22 @@ export default function SettingsScreen() {
           ? 'Push is disabled in this pilot APK. API, feed and subscription testing uses a null push token.'
           : 'TubePulse receives updates from the host and pushes them to your phone. Your phone never polls. Notification action muting stays on this device and creates no backend state.'}
       </Text>
+
+      <Text style={styles.sectionTitle}>Help</Text>
+      <TouchableOpacity
+        style={styles.serverButton}
+        onPressIn={replayFeatureTour}
+        onPress={replayFeatureTour}
+        accessibilityRole="button"
+        accessibilityLabel="Show app tour"
+        accessibilityHint="Replays the TubePulse feature tour without changing your settings"
+      >
+        <View style={styles.switchLabelWrap}>
+          <Text style={styles.dndLabel}>Show app tour</Text>
+          <Text style={styles.switchSubtitle}>Review channels, reminders and personalisation</Text>
+        </View>
+        <Text style={styles.serverChevron}>›</Text>
+      </TouchableOpacity>
 
       {IS_TUBEPULSE_PREVIEW ? (
         <>

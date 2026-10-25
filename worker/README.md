@@ -8,7 +8,7 @@ The [self-host runtime](../self-host/README.md) executes these same source files
 
 `self-host/compose.authority.yaml` is the production successor to the earlier scheduler shadow. One local runtime/store combines signed all-device mutation execution and scheduled work, publishes exact changed-key journals through a SQLite Durable Object coordinator, and serves all authenticated feeds over Workers VPC while current. It performs no periodic full pull. D1 commits are atomic and content-hash guarded. The coordinator conservatively caps scheduler publication at 45,000 estimated rows/day and total coordinated D1 writes at 50,000 estimated rows/day, leaving a 5,000-row app reserve; deferred keys are coalesced and later drained by the existing publication path. App mutations no longer depend on cloud canonical read availability. Semantic `4xx`/`5xx` responses discard the buffered overlay, Home transport failures fail closed, and deferred scheduler batches still suppress FCM. WebSub is acknowledged but suppressed while authority traffic owns detection. RSS0/1/2, posts, and aux deployments are retained but all five Cron Trigger lists are empty and their handlers require an explicit frozen-KV rollback latch.
 
-The current app-facing Worker deployment is version `7d418086-f904-494e-ae23-0498a9233ac8`. Deployment authentication is intentionally external to the repository.
+The current app-facing Worker deployment is version `9eeb8a15-dc31-4e79-b310-279ecd10de54`. Deployment authentication is intentionally external to the repository.
 
 ---
 
@@ -325,7 +325,7 @@ Different channels don't collide (channel-specific tags). A dismissed notificati
 
 ### 5.5 Worker free-tier cautions
 
-D1 rows written are the primary cloud-storage budget concern. The free plan allows 100,000 rows written per UTC day (Cloudflare plan-dependent).
+D1 and Durable Objects SQLite rows written are separate cloud-storage budget concerns. Each currently has a 100,000 rows-written UTC-day free-plan allowance (Cloudflare plan-dependent); headroom in one cannot compensate for exhausting the other.
 
 - Each successful reminder changes `device:state` once (one logical canonical mutation; D1 guard/application/cleanup rows are budgeted conservatively)
 - Relentless 5-minute mode remains exactly five minutes while content stays unseen, so capacity planning must allow up to 12 reminder-state changes per hour for each continuously eligible device/channel pair
@@ -369,7 +369,17 @@ Home scheduled work reads persistent local KV. The API reads D1 only when Home i
 
 The generic schema has no secondary indexes: `canonical_records` uses a `(generation, key)` primary key, `canonical_backend` records the active manifest, and a short-lived guard table enforces content-hash preconditions. Values over 1.9 MB are rejected before publication, below D1's 2 MB row/value boundary.
 
-### 6.3.1 Historical KV evidence (superseded by D1)
+### 6.3.1 Durable Object write amplification and accounting
+
+The SQLite Durable Object serializes authority work, but its rows-written allowance is independent of D1. Cloudflare Analytics—not the coordinator's D1 estimate—is the protection source. Monitoring uses a configurable 100,000-row default guardrail, 00:00 UTC reset, 75% actual/projected warning and 90% critical threshold. Periodic/storage analytics are delayed, approximate account aggregates; this account currently has only the TubePulse authority Durable Object.
+
+For the D1 backend, the coordinator stores the entire key/hash baseline in one bounded packed record and embeds a transaction's deltas in its single transaction record. Reconciliation and a committed batch therefore write the baseline in O(1) Durable Object rows. Values are validated below 2 MiB before canonical mutation. A first load can reconstruct from old per-key baselines without deleting them; old per-delta in-flight transactions remain recoverable. Immediate publications do not delete pending keys that were never stored, and read-only coordinator calls no longer rewrite quota solely to increment a request counter. The per-key pending queue remains deliberately unpacked because its independent crash durability is part of the fail-closed contract.
+
+The finalized 2026-10-15 monitoring windows recorded approximately 97,826 Durable Objects rows written, 31,791 coordinator requests, 18,951 D1 rows written and 1,695 D1 write queries; Cloudflare's alert snapshot reported 97,398 while analytics were still settling. Twelve reconciliation spikes contributed about 30,349 Durable Objects rows. Every coordinator request had also rewritten the quota row, and D1's mutation volume drove the old per-delta journal/baseline rows. Removing those independent sources, then adding back one packed-baseline row per D1 transaction and the normal fixed lease/state/transaction rows, gives a reasonable post-change range of approximately 15,000–25,000 rows/day. Below 30% is the operational target, not a guarantee. Confirm it using a complete post-deployment UTC day because Cloudflare analytics and billing may differ.
+
+**Second-stage opportunity (not implemented):** `channel:{channelId}:recent` currently combines notification-critical structure (video identity/order/title/type/timestamps/link/thumbnail/live state) with reconstructible view/like/comment fields. Comments already cannot independently trigger publication, and view/like changes are hourly-gated, but a metric-only rewrite still publishes the combined key. A future durable local metric overlay could keep API/feed/widget values fresh locally while coalescing cloud metric backup to about two-hour boundaries. New-video/subscription/device seen/nag/prewarn/live-transition state must remain immediate; a structural change must also flush the latest metrics for that channel. This needs an explicit split/merge schema or a durable cloud-baseline-aware local coalescer—simply excluding `channel:*:recent` would break conditional base hashes and recovery. At the present fleet size, moving an hourly per-channel maximum to two-hourly would avoid at most roughly 1,400 logical metric-key publications/day (about 4,200 conservative D1 rows). After packed DO transactions it saves Durable Objects rows only when an entire otherwise-empty publication can be skipped, bounded around 1,500–2,000 fixed rows/day and probably much less. It is therefore a D1/fallback-freshness trade-off, not the primary DO fix. No such cadence change is part of the current write-amplification correction.
+
+### 6.3.2 Historical KV evidence (superseded by D1)
 
 Predeployment evidence supplied from Cloudflare adaptive analytics on 2026-09-20 (approximate and potentially delayed):
 

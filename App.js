@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, StatusBar, Text, TouchableOpacity, Platform, Linking, View } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
+import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { NavigationContainer, DefaultTheme } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import HomeScreen from './src/screens/HomeScreen';
@@ -9,7 +10,10 @@ import ChannelsScreen from './src/screens/ChannelsScreen';
 import SettingsScreen from './src/screens/SettingsScreen';
 import PreviewServerScreen from './src/screens/PreviewServerScreen';
 import { COLORS } from './src/utils/constants';
-import { getChannels, getSettings, getLastSeen, saveLastSeen, getChannelCache, saveChannelCache } from './src/utils/storage';
+import {
+  getChannels, getSettings, getLastSeen, saveLastSeen, getChannelCache, saveChannelCache,
+  wasChannelStoreMissingAtLaunch,
+} from './src/utils/storage';
 import { requestPermissionAndGetToken, onTokenRefresh, onForegroundMessage, onNotificationOpenedApp, getInitialNotification, setBackgroundMessageHandler } from './src/utils/fcm';
 import { registerDevice, markSeen, markSeenBatch, getDeviceId, subscribeChannel, updateSettings, bootstrapChannel } from './src/utils/api';
 import { setupNotificationChannel } from './src/utils/notifications';
@@ -25,6 +29,7 @@ import { processLocalNotificationActionResponse, processNotificationSeenResponse
 import { ensureNotificationResponseTaskRegistered } from './src/utils/notificationBackgroundTask';
 import { ConfirmHost } from './src/components/Confirm';
 import SettingsCogIcon from './src/components/SettingsCogIcon';
+import { FeatureTourProvider, FeatureTourTarget } from './src/components/FeatureTour';
 import { updateWidget } from './src/components/widgetTaskHandler';
 import {
   IS_TUBEPULSE_PREVIEW,
@@ -66,6 +71,7 @@ try {
 }
 
 const Stack = createNativeStackNavigator();
+const featureTourFreshInstallPromise = wasChannelStoreMissingAtLaunch();
 
 const screenOptions = {
   headerStyle: { backgroundColor: COLORS.bg },
@@ -74,8 +80,8 @@ const screenOptions = {
   contentStyle: { backgroundColor: COLORS.bg },
 };
 
-function HeaderButton({ title, children, onPress, style, textStyle, accessibilityLabel, accessibilityHint }) {
-  return (
+function HeaderButton({ title, children, onPress, style, textStyle, accessibilityLabel, accessibilityHint, tourTarget }) {
+  const button = (
     <TouchableOpacity
       onPress={onPress}
       style={[{ minHeight: 44, minWidth: 44, alignItems: 'center', justifyContent: 'center' }, style]}
@@ -90,6 +96,11 @@ function HeaderButton({ title, children, onPress, style, textStyle, accessibilit
       )}
     </TouchableOpacity>
   );
+  return tourTarget ? (
+    <FeatureTourTarget targetKey={tourTarget}>
+      {button}
+    </FeatureTourTarget>
+  ) : button;
 }
 
 // Background message handler — must be registered at top level
@@ -179,6 +190,7 @@ function TubePulseApplication() {
   const notificationCapabilityRef = useRef(null);
   const [initializationMarker] = useState(() => createAppInitializationMarker());
   const processedTapKeysRef = useRef(new Map());
+  const navigationRef = useRef(null);
 
   useEffect(() => {
     (async () => {
@@ -564,8 +576,14 @@ function TubePulseApplication() {
 
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
+      <SafeAreaProvider>
       <StatusBar barStyle="light-content" backgroundColor={COLORS.bg} />
+      <FeatureTourProvider
+        navigationRef={navigationRef}
+        freshInstallPromise={featureTourFreshInstallPromise}
+      >
       <NavigationContainer
+        ref={navigationRef}
         theme={{
           ...DefaultTheme,
           dark: true,
@@ -587,12 +605,16 @@ function TubePulseApplication() {
               title: IS_TUBEPULSE_PREVIEW ? 'TubePulse Preview' : 'TubePulse',
               headerRight: () => (
                 <>
-                  <HeaderButton title="Channels" onPress={() => navigation.navigate('Channels')} />
+                  <HeaderButton title="Channels"
+                    onPress={() => navigation.navigate('Channels')}
+                    tourTarget="homeChannels"
+                  />
                   <HeaderButton
                     onPress={() => navigation.navigate('Settings')}
                     style={{ marginLeft: 6 }}
                     accessibilityLabel="Settings"
                     accessibilityHint="Opens TubePulse settings"
+                    tourTarget="homeSettings"
                   >
                     <SettingsCogIcon />
                   </HeaderButton>
@@ -618,6 +640,8 @@ function TubePulseApplication() {
           anywhere in the app will resolve here, drawing the themed
           ConfirmDialog above whatever screen is currently visible. */}
       <ConfirmHost />
+      </FeatureTourProvider>
+      </SafeAreaProvider>
     </GestureHandlerRootView>
   );
 }

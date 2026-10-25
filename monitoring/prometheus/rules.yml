@@ -6,16 +6,22 @@ groups:
         expr: tubepulse_cloudflare_d1_rows_written{period="day"}
       - record: tubepulse:d1_rows_read_day
         expr: tubepulse_cloudflare_d1_rows_read{period="day"}
+      - record: tubepulse:do_rows_written_day
+        expr: tubepulse_cloudflare_do_rows_written{period="day"}
       - record: tubepulse:worker_requests_day
         expr: sum(tubepulse_cloudflare_worker_requests{period="day"})
       - record: tubepulse:d1_write_budget_ratio
         expr: tubepulse:d1_rows_written_day / on() tubepulse_guardrail{resource="d1_rows_written_day"}
       - record: tubepulse:d1_read_budget_ratio
         expr: tubepulse:d1_rows_read_day / on() tubepulse_guardrail{resource="d1_rows_read_day"}
+      - record: tubepulse:do_write_budget_ratio
+        expr: tubepulse:do_rows_written_day / on() tubepulse_guardrail{resource="do_rows_written_day"}
       - record: tubepulse:worker_request_budget_ratio
         expr: tubepulse:worker_requests_day / on() tubepulse_guardrail{resource="worker_requests_day"}
       - record: tubepulse:d1_write_projected_end_of_day
         expr: tubepulse:d1_rows_written_day / scalar(clamp_min(vector((time() % 86400) / 86400), 0.0416667))
+      - record: tubepulse:do_write_projected_end_of_day
+        expr: tubepulse:do_rows_written_day / scalar(clamp_min(vector((time() % 86400) / 86400), 0.0416667))
       - alert: TubePulseCollectorDown
         expr: up{job="tubepulse-aggregate-collector"} == 0
         for: 10m
@@ -51,6 +57,16 @@ groups:
         for: 10m
         labels: { severity: warning }
         annotations: { summary: "TubePulse D1 daily write usage exceeds 75% of the configured guardrail" }
+      - alert: TubePulseDurableObjectWriteBudgetWarning
+        expr: tubepulse:do_write_budget_ratio > 0.75 or tubepulse:do_write_projected_end_of_day / on() tubepulse_guardrail{resource="do_rows_written_day"} > 0.75
+        for: 10m
+        labels: { severity: warning }
+        annotations: { summary: "TubePulse Durable Objects daily rows-written usage or projection exceeds 75% of the configured guardrail" }
+      - alert: TubePulseDurableObjectWriteBudgetCritical
+        expr: tubepulse:do_write_budget_ratio >= 0.90 or tubepulse:do_write_projected_end_of_day / on() tubepulse_guardrail{resource="do_rows_written_day"} >= 0.90
+        for: 5m
+        labels: { severity: critical }
+        annotations: { summary: "TubePulse Durable Objects daily rows-written usage or projection exceeds 90% of the configured guardrail" }
       - alert: TubePulseWorkerRequestBudgetWarning
         expr: tubepulse:worker_request_budget_ratio > 0.75
         for: 10m

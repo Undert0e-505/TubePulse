@@ -66,6 +66,7 @@ export function loadConfig(env = process.env) {
     limits: {
       d1RowsWritten: integer(env.TUBEPULSE_D1_ROWS_WRITTEN_GUARDRAIL, 100_000, 1),
       d1RowsRead: integer(env.TUBEPULSE_D1_ROWS_READ_GUARDRAIL, 5_000_000, 1),
+      durableObjectRowsWritten: integer(env.TUBEPULSE_DO_ROWS_WRITTEN_GUARDRAIL, 100_000, 1),
       workerRequests: integer(env.TUBEPULSE_WORKER_REQUEST_GUARDRAIL, 100_000, 1),
     },
   };

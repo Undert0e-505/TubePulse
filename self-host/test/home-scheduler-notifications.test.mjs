@@ -74,6 +74,65 @@ test('notification intent summary exposes only aggregate backlog and outcome cou
   assert.equal(overdue.oldestPendingAgeSeconds, 60.001);
 });
 
+test('operator device cleanup removes only intents belonging to explicitly selected devices', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'tubepulse-intent-device-cleanup-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const store = new DurableNotificationIntentStore(directory);
+  await store.stage([
+    intent({ deviceId: 'test-device-a', channelId: 'channel-a', contentIds: ['video-a'] }),
+    intent({ deviceId: 'real-device', channelId: 'channel-b', contentIds: ['video-b'] }),
+  ]);
+  assert.deepEqual(await store.inspectDevices(['test-device-a']), { records: 1, pending: 1, callbackPending: 0 });
+  assert.deepEqual(await store.purgeDevices(['test-device-a']), { removed: 1 });
+  assert.deepEqual(await store.inspectDevices(['test-device-a']), { records: 0, pending: 0, callbackPending: 0 });
+  assert.equal((await store.pending())[0].intent.deviceId, 'real-device');
+});
+
+test('a durable video intent is suppressed only after two separated unavailable-source observations', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'tubepulse-notification-source-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  let now = Date.parse('2026-10-24T20:10:00Z');
+  const store = new DurableNotificationIntentStore(directory, { now: () => now });
+  const [staged] = await store.stage([intent()]);
+
+  assert.deepEqual(await store.pendingVideoIds(), ['video-new']);
+  assert.deepEqual(await store.observeVideoAvailability(['video-new'], []), { observed: 1, resolved: 0 });
+  assert.equal((await store.summary()).pending, 1);
+
+  now += 60 * 1000;
+  assert.deepEqual(await store.observeVideoAvailability(['video-new'], []), { observed: 1, resolved: 0 });
+  assert.equal((await store.summary()).pending, 1);
+
+  now += 4 * 60 * 1000;
+  assert.deepEqual(await store.observeVideoAvailability(['video-new'], []), { observed: 1, resolved: 1 });
+  const summary = await store.summary();
+  assert.equal(summary.pending, 0);
+  assert.equal(summary.resolved, 1);
+  assert.equal(summary.suppressed, 1);
+
+  const persisted = JSON.parse(await fs.readFile(path.join(directory, 'home-notification-intents.json'), 'utf8'));
+  const record = persisted.records[staged.id];
+  assert.equal(record.status, 'resolved');
+  assert.equal(record.delivery, 'suppressed');
+  assert.equal(record.suppressionReason, 'source-content-unavailable');
+  assert.equal(record.callbackApplied, true);
+});
+
+test('an available-source observation resets pending video disappearance confirmation', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'tubepulse-notification-source-reset-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  let now = Date.parse('2026-10-24T20:10:00Z');
+  const store = new DurableNotificationIntentStore(directory, { now: () => now });
+  await store.stage([intent()]);
+
+  await store.observeVideoAvailability(['video-new'], []);
+  now += 5 * 60 * 1000;
+  await store.observeVideoAvailability(['video-new'], ['video-new']);
+  now += 5 * 60 * 1000;
+  assert.deepEqual(await store.observeVideoAvailability(['video-new'], []), { observed: 1, resolved: 0 });
+  assert.equal((await store.summary()).pending, 1);
+});
+
 test('canonical reconciliation and production feed visibility precede exactly one FCM send', async () => {
   const events = [];
   const fetchImpl = async (url) => {

@@ -34,6 +34,7 @@ import { updateWidget } from '../components/widgetTaskHandler';
 import { orderChannels } from '../utils/channelOrdering.mjs';
 import { prepareChannelNotificationSettings } from '../utils/channelNotificationSettings.mjs';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { FeatureTourTarget } from '../components/FeatureTour';
 
 // Default per-channel settings (mirrors global defaults)
 const DEFAULT_CHANNEL_NOTIF = {
@@ -618,7 +619,10 @@ export default function ChannelsScreen() {
         </View>
         </GestureHandlerRootView>
       </Modal>
-      <View style={styles.autoOrderRow}>
+      <FeatureTourTarget
+        targetKey="channelsOrder"
+        style={styles.autoOrderRow}
+      >
         <View style={styles.autoOrderText}>
           <Text style={styles.autoOrderTitle}>Auto-order channels</Text>
           <Text style={styles.autoOrderHint}>Newest video first</Text>
@@ -631,9 +635,12 @@ export default function ChannelsScreen() {
           accessibilityLabel="Auto-order channels"
           accessibilityHint="Orders channels by newest cached video without changing your manual order"
         />
-      </View>
+      </FeatureTourTarget>
       {/* Add row */}
-      <View style={styles.addSection}>
+      <FeatureTourTarget
+        targetKey="channelsAdd"
+        style={styles.addSection}
+      >
         <View style={styles.addRow}>
           <TextInput
             style={styles.input}
@@ -654,7 +661,7 @@ export default function ChannelsScreen() {
           </TouchableOpacity>
         </View>
         {addError ? <Text style={styles.errorText}>{addError}</Text> : null}
-      </View>
+      </FeatureTourTarget>
 
       {channels.length === 0 && (
         <Text style={styles.emptyText}>No channels yet. Add one above.</Text>

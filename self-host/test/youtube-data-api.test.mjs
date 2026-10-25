@@ -60,6 +60,46 @@ test('live-state lookup is one quota unit for up to 50 IDs and uses public parti
   await assert.rejects(() => api.listLiveStates([...ids, 'overflow']), /at most 50/);
 });
 
+test('active scheduler checks pending source videos and never resolves them after an API failure', async (t) => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tubepulse-pending-source-'));
+  t.after(() => fs.rm(dataDir, { recursive: true, force: true }));
+  const checked = [];
+  const observations = [];
+  const coordinator = {
+    async pendingVideoIds() { return ['available-video', 'missing-video']; },
+    async observeVideoAvailability(ids, availableIds) {
+      observations.push({ ids, availableIds });
+      return { observed: 2, resolved: 0 };
+    },
+  };
+  const runner = new HomeSchedulerRunner({
+    config: { mode: 'active', dataDir, workerBindings: {}, sync: { configured: false } },
+    stateFile: createHomeSchedulerStateFile(dataDir, 'active'),
+    notificationCoordinator: coordinator,
+  });
+  const result = await runner.reconcilePendingVideoAvailability({
+    async listVideoDetails(ids) {
+      checked.push(ids);
+      return { items: [{ id: 'available-video' }] };
+    },
+  });
+  assert.deepEqual(checked, [['available-video', 'missing-video']]);
+  assert.deepEqual(observations, [{
+    ids: ['available-video', 'missing-video'], availableIds: ['available-video'],
+  }]);
+  assert.deepEqual(result, {
+    requests: 1, checked: 2, available: 1, observed: 2, resolved: 0, failures: 0,
+  });
+
+  observations.length = 0;
+  const failed = await runner.reconcilePendingVideoAvailability({
+    async listVideoDetails() { throw new Error('temporary YouTube failure'); },
+  });
+  assert.equal(failed.failures, 1);
+  assert.equal(failed.resolved, 0);
+  assert.deepEqual(observations, []);
+});
+
 test('playlist reconciliation stops at known overlap and bounds no-overlap pagination', async () => {
   const pages = [];
   const api = {

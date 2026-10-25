@@ -103,7 +103,7 @@ export function parseCloudflareAnalytics(payload, { windowStart, windowEnd }) {
     },
     d1StorageBytes: maxRows(account.d1Storage, 'databaseSizeBytes'),
     durableObjectStorageBytes: maxRows(account.doStorage, 'storedBytes'),
-    analyticsNote: 'GraphQL analytics are delayed/approximate and are not authoritative billing data.',
+    analyticsNote: 'GraphQL analytics are delayed/approximate and are not authoritative billing data. Durable Object periodic/storage usage is account-wide; this account currently runs only the TubePulse authority Durable Object.',
   };
 }
 

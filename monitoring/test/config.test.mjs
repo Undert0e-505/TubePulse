@@ -28,6 +28,16 @@ test('wallboard and diagnostics dashboards are valid, provisioned, and use one d
   assert.match(read('monitoring', 'grafana', 'provisioning', 'datasources', 'prometheus.yml'), /http:\/\/prometheus:9090/);
 });
 
+test('Prometheus rules record and alert on the separate Durable Objects write budget', () => {
+  const rules = read('monitoring', 'prometheus', 'rules.yml');
+  assert.match(rules, /record: tubepulse:do_rows_written_day/);
+  assert.match(rules, /record: tubepulse:do_write_budget_ratio/);
+  assert.match(rules, /record: tubepulse:do_write_projected_end_of_day/);
+  assert.match(rules, /alert: TubePulseDurableObjectWriteBudgetWarning[\s\S]*0\.75/);
+  assert.match(rules, /alert: TubePulseDurableObjectWriteBudgetCritical[\s\S]*0\.90/);
+  assert.match(read('monitoring', 'compose.yaml'), /TUBEPULSE_DO_ROWS_WRITTEN_GUARDRAIL/);
+});
+
 test('wallboard is a readable one-screen calm health overview', () => {
   const dashboard = JSON.parse(read('monitoring', 'grafana', 'dashboards', 'tubepulse-operations.json'));
   assert.equal(dashboard.refresh, '30s');
@@ -63,6 +73,8 @@ test('wallboard is a readable one-screen calm health overview', () => {
   assert.match(status.targets[0].expr, /tubepulse_authority_pending_backup_consecutive_samples < bool 2/);
   assert.match(status.targets[0].expr, /tubepulse_authority_transaction_active_consecutive_samples < bool 2/);
   assert.match(status.targets[0].expr, /tubepulse_live_watch_degraded == bool 0/);
+  assert.match(status.targets[0].expr, /tubepulse:do_write_budget_ratio/);
+  assert.match(status.targets[0].expr, /tubepulse:do_write_projected_end_of_day/);
   assert.doesNotMatch(status.targets[0].expr, /tubepulse_youtube_api_failures/);
   assert.ok(status.options.text.valueSize >= 30);
 
@@ -81,10 +93,12 @@ test('wallboard is a readable one-screen calm health overview', () => {
   assert.match(attention.targets[0].expr, /tubepulse_subscription_integrity_consistent/);
   assert.match(attention.targets[0].expr, /tubepulse_notifications_durable_backlog/);
   assert.match(attention.targets[0].expr, /tubepulse_cloudflare_worker_errors/);
+  assert.match(attention.targets[0].expr, /tubepulse:do_write_budget_ratio/);
   assert.doesNotMatch(attention.targets[0].expr, /tubepulse_youtube_api_failures/);
   for (const required of ['Core availability', 'D1 queue', 'D1 transaction', 'YouTube error', 'Live precision degraded']) {
     assert.ok(attention.targets.some(({ legendFormat }) => legendFormat === required));
   }
+  assert.ok(attention.targets.some(({ legendFormat }) => legendFormat === 'DO write capacity'));
   for (const target of attention.targets) {
     assert.equal(target.instant, true);
     assert.equal(target.range, false);
@@ -245,7 +259,11 @@ test('wallboard is a readable one-screen calm health overview', () => {
   assert.equal(capacity.type, 'bargauge');
   assert.equal(capacity.fieldConfig.defaults.unit, 'percent');
   assert.deepEqual(capacity.fieldConfig.defaults.thresholds.steps.map(({ value }) => value), [null, 70, 90]);
-  assert.equal(capacity.targets.length, 5);
+  assert.equal(capacity.targets.length, 7);
+  assert.equal(capacity.targets.find(({ legendFormat }) => legendFormat === 'DO today').expr,
+    '100 * tubepulse:do_write_budget_ratio');
+  assert.match(capacity.targets.find(({ legendFormat }) => legendFormat === 'DO projected').expr,
+    /tubepulse:do_write_projected_end_of_day/);
   const liveWatch = capacity.targets.find(({ legendFormat }) => legendFormat === 'Live watch');
   assert.ok(liveWatch);
   assert.equal(liveWatch.expr, '100 * tubepulse_live_watch_quota_ratio');
@@ -468,7 +486,7 @@ test('every dashboard target is well formed and references an exported or record
     collector: {
       lastCollectionSuccess: true, errorsTotal: 0,
       lastAttemptAt: '2026-10-06T00:05:00Z', lastSuccessAt: '2026-10-06T00:05:00Z',
-      limits: { d1RowsWritten: 1, d1RowsRead: 1, workerRequests: 1 },
+      limits: { d1RowsWritten: 1, d1RowsRead: 1, durableObjectRowsWritten: 1, workerRequests: 1 },
     },
     snapshot: {
       intervalStart: '2026-10-06T00:00:00Z', collection: { hostSuccess: true, cloudflareSuccess: true },

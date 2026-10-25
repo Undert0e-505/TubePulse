@@ -4,8 +4,13 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import {
-  createCollector, intervalFor, nextCollectionAt, waitForSchedulerSettlement,
+  createCollector, intervalFor, loadConfig, nextCollectionAt, waitForSchedulerSettlement,
 } from '../src/collector.mjs';
+
+test('collector config treats Durable Objects rows written as a separate daily guardrail', () => {
+  assert.equal(loadConfig({}).limits.durableObjectRowsWritten, 100_000);
+  assert.equal(loadConfig({ TUBEPULSE_DO_ROWS_WRITTEN_GUARDRAIL: '75000' }).limits.durableObjectRowsWritten, 75_000);
+});
 
 const jsonResponse = (value, status = 200) => new Response(JSON.stringify(value), {
   status, headers: { 'Content-Type': 'application/json' },
