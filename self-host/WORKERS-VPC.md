@@ -40,7 +40,7 @@ During this retired phase Cloudflare KV remained canonical and continued polling
 - Production-account tunnel ID: `12a924ab-a238-4f83-8610-26347abb9558`
 - VPC Service: `tubepulse-home-origin` (`01a106c3-0990-7410-b88d-08d96a726127`)
 
-The `cloudflared` image is digest-pinned to version 2026.9.3, above the Workers VPC minimum of 2025.7.0. It uses the remotely managed token through a read-only file mount and logs at `info`, never `debug`. Workers VPC requires QUIC/automatic transport, so outbound UDP 7844 must work. There is no inbound Tunnel firewall rule.
+The `cloudflared` image is digest-pinned to version 2026.10.4, above the Workers VPC minimum of 2025.7.0. It uses the remotely managed token through a read-only file mount and logs at `info`, never `debug`. Workers VPC requires QUIC/automatic transport, so outbound UDP 7844 must work. There is no inbound Tunnel firewall rule.
 
 ## One-time local provisioning
 
