@@ -4,6 +4,17 @@ import {
 } from './public-service-status.mjs';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+const PUBLICATION_MUTATION_FAMILIES = [
+  'channels-active', 'nag-active', 'upcoming-events', 'fcm-token-cache', 'prewarn-sent',
+  'upcoming-legacy', 'channel-known-videos', 'channel-known-posts', 'channel-recent-posts',
+  'channel-recent-videos', 'channel-meta', 'channel-post-first-poll', 'channel-subscribers',
+  'device-state', 'device-record', 'other',
+];
+const PUBLICATION_MUTATION_REASONS = [
+  'cleanup', 'metrics-only', 'new-content-cache', 'post-metrics-only',
+  'post-observation-metadata-only', 'community-content-cache', 'dedupe-watermark',
+  'notification-state', 'token-cache', 'channel-metadata', 'first-run-suppression', 'state',
+];
 
 function finite(value, fallback = 0) {
   const number = Number(value);
@@ -80,6 +91,10 @@ function percentile(sorted, ratio) {
 function ageSeconds(value, nowMs) {
   const parsed = timestamp(value);
   return parsed === null ? null : Math.max(0, Math.floor((nowMs - parsed) / 1000));
+}
+
+function allowlistedCounts(source, allowed) {
+  return Object.fromEntries(allowed.map((name) => [name, Math.max(0, finite(source?.[name]))]));
 }
 
 export const FORBIDDEN_AGGREGATE_FIELDS = new Set([
@@ -233,6 +248,12 @@ export async function collectAggregateMonitoring({
   const lastSweep = scheduler.lastSweep || {};
   const remoteQuota = remoteStatus?.quota || {};
   const remoteLimits = remoteQuota.limits || {};
+  const publicationRows = Math.max(0, finite(remoteQuota.publicationEstimatedRowsWritten));
+  const publicationLimit = Math.max(0, finite(remoteLimits.publicationEstimatedRows));
+  // Clamp the first UTC hour just like the Cloudflare analytics projection;
+  // very early samples otherwise produce a misleadingly volatile forecast.
+  const utcDayFraction = Math.max((nowMs % DAY_MS) / DAY_MS, 1 / 24);
+  const publicationProjectedRows = publicationRows / utcDayFraction;
   const progressAtMs = latestSchedulerProgressTimestamp(scheduler);
   const progressAt = progressAtMs === null ? null : new Date(progressAtMs).toISOString();
   const schedulerErrorAt = timestamp(scheduler.lastError?.at);
@@ -372,13 +393,24 @@ export async function collectAggregateMonitoring({
       backendReady: remoteStatus?.backend?.selected === 'd1' && remoteStatus?.backend?.ready === true,
       estimatedRows: {
         total: finite(remoteQuota.estimatedRowsWritten),
-        publication: finite(remoteQuota.publicationEstimatedRowsWritten),
+        publication: publicationRows,
         api: finite(remoteQuota.apiEstimatedRowsWritten),
       },
       limits: {
         total: finite(remoteLimits.totalEstimatedRows),
         publication: finite(remoteLimits.publicationEstimatedRows),
         appReserve: finite(remoteLimits.appReserveEstimatedRows),
+      },
+      publicationProjection: {
+        rows: publicationProjectedRows,
+        ratio: publicationLimit > 0 ? publicationProjectedRows / publicationLimit : 0,
+        exhaustionRisk: publicationLimit > 0 && publicationProjectedRows >= publicationLimit,
+      },
+      publicationMutations: {
+        localMutations: Math.max(0, finite(lastSweep.mutations?.localMutations)),
+        uniqueKeys: Math.max(0, finite(lastSweep.mutations?.uniqueKeys)),
+        byFamily: allowlistedCounts(lastSweep.mutations?.byFamily, PUBLICATION_MUTATION_FAMILIES),
+        byReason: allowlistedCounts(lastSweep.mutations?.byReason, PUBLICATION_MUTATION_REASONS),
       },
       resetsAt: remoteQuota.resetsAt || null,
     },

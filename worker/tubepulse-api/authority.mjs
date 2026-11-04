@@ -229,13 +229,13 @@ export class TubePulseAuthorityCoordinator {
     if (this.configuredBackend().backend === 'd1') {
       const totalEstimatedRows = boundedInteger(
         this.env.TUBEPULSE_AUTHORITY_D1_ROW_WRITE_HARD_CAP,
-        50_000,
+        80_000,
         1_000,
         90_000,
       );
       const publicationEstimatedRows = boundedInteger(
         this.env.TUBEPULSE_AUTHORITY_D1_PUBLICATION_ROW_CAP,
-        45_000,
+        70_000,
         0,
         totalEstimatedRows,
       );
@@ -613,10 +613,26 @@ export class TubePulseAuthorityCoordinator {
     return { ...incoming, baseHash: previous.baseHash };
   }
 
-  async storePending(entries) {
+  async storePending(entries, previousEntries = []) {
+    const previousByStorageKey = new Map(previousEntries.map((entry) => [entry.storageKey, entry.delta]));
     for (const { storageKey, delta } of entries) {
-      if (delta.nextHash === delta.baseHash) await this.state.storage.delete(storageKey);
-      else await this.state.storage.put(storageKey, { key: delta.key, delta });
+      const previous = previousByStorageKey.get(storageKey);
+      if (delta.nextHash === delta.baseHash) {
+        if (previous) await this.state.storage.delete(storageKey);
+        continue;
+      }
+      // A deferred publication is reconsidered every scheduler cycle. Durable
+      // Object storage charges by mutated rows, so persisting the exact same
+      // coalesced delta again is both unnecessary and expensive. The content
+      // hash and options comparison preserves the existing divergence fence:
+      // any real value, baseline or metadata change still rewrites the row.
+      const unchanged = previous
+        && previous.key === delta.key
+        && previous.operation === delta.operation
+        && previous.baseHash === delta.baseHash
+        && previous.nextHash === delta.nextHash
+        && JSON.stringify(previous.options || {}) === JSON.stringify(delta.options || {});
+      if (!unchanged) await this.state.storage.put(storageKey, { key: delta.key, delta });
     }
   }
 
@@ -777,7 +793,7 @@ export class TubePulseAuthorityCoordinator {
         const retained = new Set([...pending.values()].map(({ storageKey }) => storageKey));
         const removed = before.map(({ storageKey }) => storageKey).filter((key) => !retained.has(key));
         if (removed.length) await this.state.storage.delete(removed);
-        await this.storePending([...pending.values()]);
+        await this.storePending([...pending.values()], before);
         await this.state.storage.delete(LEASE_KEY);
         replication.canonicalVersion = Number(replication.canonicalVersion || 0) + 1;
         await this.state.storage.put(STATE_KEY, replication);
@@ -797,7 +813,7 @@ export class TubePulseAuthorityCoordinator {
         const retained = new Set([...pending.values()].map(({ storageKey }) => storageKey));
         const removed = before.map(({ storageKey }) => storageKey).filter((key) => !retained.has(key));
         if (removed.length) await this.state.storage.delete(removed);
-        await this.storePending([...pending.values()]);
+        await this.storePending([...pending.values()], before);
         await this.state.storage.delete(LEASE_KEY);
         return json({
           ok: true,

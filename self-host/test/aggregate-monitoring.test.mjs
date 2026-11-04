@@ -42,6 +42,14 @@ test('aggregate monitoring counts profiles and subscriptions without exposing re
       status: 'ready', mode: 'active', authority: { replication: { status: 'current' } },
       scheduler: {
         mode: 'active', lease: { state: 'held' }, lastMinuteJobs: { scheduledAt: now - 10_000 },
+        lastSweep: {
+          outcome: 'ok',
+          mutations: {
+            localMutations: 5, uniqueKeys: 4,
+            byFamily: { 'channel-recent-videos': 3, 'device-state': 2, privateIdentifier: 99 },
+            byReason: { 'metrics-only': 3, 'notification-state': 2, privateReason: 99 },
+          },
+        },
         lastNotificationDelivery: {
           barrier: 'failed', reason: 'feed-not-visible', visibilityBlocked: 1,
           visibilityDevices: 1, visibilityChannels: 1,
@@ -71,7 +79,7 @@ test('aggregate monitoring counts profiles and subscriptions without exposing re
       ok: true, replication: { status: 'current' }, pendingBackupKeys: 0,
       backend: { selected: 'd1', ready: true }, quota: {
         estimatedRowsWritten: 10, publicationEstimatedRowsWritten: 8, apiEstimatedRowsWritten: 2,
-        limits: { totalEstimatedRows: 50_000, publicationEstimatedRows: 45_000, appReserveEstimatedRows: 5_000 },
+        limits: { totalEstimatedRows: 80_000, publicationEstimatedRows: 70_000, appReserveEstimatedRows: 10_000 },
       },
     },
   });
@@ -127,6 +135,12 @@ test('aggregate monitoring counts profiles and subscriptions without exposing re
     degradedReason: null,
   });
   assert.equal(payload.authority.backendReady, true);
+  assert.equal(payload.authority.publicationProjection.rows, 16);
+  assert.equal(payload.authority.publicationProjection.exhaustionRisk, false);
+  assert.equal(payload.authority.publicationMutations.byFamily['channel-recent-videos'], 3);
+  assert.equal(payload.authority.publicationMutations.byReason['metrics-only'], 3);
+  assert.equal(Object.hasOwn(payload.authority.publicationMutations.byFamily, 'privateIdentifier'), false);
+  assert.equal(Object.hasOwn(payload.authority.publicationMutations.byReason, 'privateReason'), false);
   assertAggregateMonitoringSafe(payload);
   const serialized = JSON.stringify(payload);
   for (const secret of ['private-install', 'private-fcm', 'UCprivate', 'private title', 'private-video']) {
@@ -153,6 +167,29 @@ test('backend-seen rolling windows are derived from the coordinated profile last
   assert.equal(payload.installs.active.h24, 1);
   assert.equal(payload.installs.active.d7, 1);
   assertAggregateMonitoringSafe(payload);
+});
+
+test('authority publication projection warns before the internal cap is reached', async () => {
+  const now = Date.parse('2026-11-04T12:00:00.000Z');
+  const payload = await collectAggregateMonitoring({
+    adapter: new MemoryAdapter({ 'channels:active': '[]' }),
+    nowMs: now,
+    remoteStatus: {
+      ok: true,
+      quota: {
+        publicationEstimatedRowsWritten: 36_000,
+        limits: {
+          totalEstimatedRows: 80_000,
+          publicationEstimatedRows: 70_000,
+          appReserveEstimatedRows: 10_000,
+        },
+      },
+    },
+  });
+  assert.equal(payload.authority.estimatedRows.publication, 36_000);
+  assert.equal(payload.authority.publicationProjection.rows, 72_000);
+  assert.equal(payload.authority.publicationProjection.exhaustionRisk, true);
+  assert.ok(payload.authority.publicationProjection.ratio > 1);
 });
 
 test('aggregate monitoring distinguishes a current YouTube error from cumulative failure history', async () => {

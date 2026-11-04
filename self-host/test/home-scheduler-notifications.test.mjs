@@ -520,6 +520,86 @@ test('nags bypass durable storage and an invisible attempt can be reconsidered l
   assert.equal((await store.summary()).pending, 0);
 });
 
+test('canonical publication deferral retains durable alerts but never persists or replays nags', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'tubepulse-canonical-deferral-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const store = new DurableNotificationIntentStore(directory);
+  let sends = 0;
+  const coordinator = new ProductionNotificationCoordinator({
+    ...barrierConfig, gatewayConvergenceRequired: false,
+  }, {
+    intentStore: store,
+    fetchImpl: async () => jsonResponse({ channels: [{
+      channelId: 'UC-synthetic',
+      videos: [{ videoId: 'video-new', unwatched: true }],
+      posts: [{ activityId: 'activity', unwatched: true }],
+    }] }),
+    tokenProvider: async () => 'token',
+    sender: async () => { sends++; return { sent: true, deadToken: false }; },
+  });
+  const deferred = [
+    intent(),
+    intent({
+      kind: 'community-post', contentIds: ['post:activity'], dedupeVersion: 'post',
+      payload: { data: { type: 'post' }, tag: 'post-activity' },
+    }),
+    intent({
+      kind: 'prewarn', dedupeVersion: 'prewarn:60', requireUnwatched: false,
+      payload: { data: { type: 'prewarn', prewarnMinutes: '60' }, tag: 'prewarn' },
+    }),
+    intent({
+      dedupeVersion: 'live-now', requireUnwatched: false,
+      payload: { data: { type: 'video', live: 'true' }, tag: 'live-now' },
+    }),
+    intent({
+      kind: 'nag', dedupeVersion: 'nag:cycle',
+      payload: { data: { type: 'nag' }, tag: 'nag' },
+    }),
+  ];
+
+  const suppressed = await coordinator.suppress(deferred, 'canonical-backup-deferred');
+  assert.equal(suppressed.barrier, 'suppressed');
+  assert.equal(suppressed.suppressed, 5);
+  assert.equal(suppressed.durableDeferred, 4);
+  assert.equal((await store.summary()).pending, 4);
+  assert.equal((await store.summary()).suppressed, 0);
+
+  const recovered = await coordinator.flush([], {});
+  assert.equal(recovered.sent, 4);
+  assert.equal(sends, 4, 'only durable unique alerts recover; the nag is regenerated or discarded');
+  await coordinator.flush([], {});
+  assert.equal(sends, 4, 'recovered durable alerts deliver exactly once');
+});
+
+test('a deferred durable alert already marked seen resolves without FCM', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'tubepulse-deferred-seen-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const store = new DurableNotificationIntentStore(directory);
+  await store.stage([intent()]);
+  let sends = 0;
+  const coordinator = new ProductionNotificationCoordinator({
+    ...barrierConfig, gatewayConvergenceRequired: false,
+  }, {
+    intentStore: store,
+    fetchImpl: async () => jsonResponse({ channels: [{
+      channelId: 'UC-synthetic',
+      videos: [{ videoId: 'video-new', unwatched: false }],
+      posts: [],
+    }] }),
+    tokenProvider: async () => 'token',
+    sender: async () => { sends++; return { sent: true, deadToken: false }; },
+  });
+
+  const result = await coordinator.flush([], {});
+  assert.equal(result.barrier, 'passed');
+  assert.equal(result.staleResolved, 1);
+  assert.equal(result.reason, 'stale-intent-resolved');
+  assert.equal(sends, 0);
+  const summary = await store.summary();
+  assert.equal(summary.pending, 0);
+  assert.equal(summary.suppressed, 1);
+});
+
 test('FCM outcome totals cover every coordinator path and survive idle cycles and restart', async (t) => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'tubepulse-notification-totals-'));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));

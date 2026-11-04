@@ -116,7 +116,7 @@
         { "expr": "tubepulse:d1_rows_read_day", "legendFormat": "rows read today", "refId": "C" },
         { "expr": "tubepulse_cloudflare_d1_storage_bytes", "legendFormat": "database bytes", "refId": "D" }
       ],
-      "fieldConfig": { "defaults": { "unit": "short", "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 45000 }, { "color": "red", "value": 90000 }] } }, "overrides": [{ "matcher": { "id": "byName", "options": "database bytes" }, "properties": [{ "id": "unit", "value": "bytes" }] }] },
+      "fieldConfig": { "defaults": { "unit": "short", "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 70000 }, { "color": "red", "value": 90000 }] } }, "overrides": [{ "matcher": { "id": "byName", "options": "database bytes" }, "properties": [{ "id": "unit", "value": "bytes" }] }] },
       "options": { "colorMode": "value", "graphMode": "area", "orientation": "horizontal", "reduceOptions": { "calcs": ["lastNotNull"], "values": false } }
     },
     {

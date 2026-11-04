@@ -1268,6 +1268,43 @@ test('D1 coordinator accounts conservative rows, defers at publication cap and f
   assert.equal(result.response.status, 409);
 });
 
+test('D1 authority defaults reserve 10,000 app rows and 20,000 free-tier headroom', () => {
+  const fixture = d1CoordinatorFixture();
+  assert.deepEqual(fixture.coordinator.quotaLimits(), {
+    totalEstimatedRows: 80_000,
+    publicationEstimatedRows: 70_000,
+    appReserveEstimatedRows: 10_000,
+    estimatedRowsPerLogicalWrite: 3,
+  });
+});
+
+test('unchanged 301-key deferred queue produces no repeated Durable Object row writes', async () => {
+  const fixture = d1CoordinatorFixture();
+  const entries = Array.from({ length: 301 }, (_, index) => ({
+    storageKey: `authority:pending:synthetic-${index}`,
+    delta: {
+      key: `channel:synthetic-${index}:recent`, operation: 'put',
+      value: `value-${index}`, options: {}, baseHash: null,
+      nextHash: String(index).padStart(64, '0').slice(-64),
+    },
+  }));
+  await fixture.coordinator.storePending(entries);
+  assert.equal(fixture.storage.mutations.filter(({ operation }) => operation === 'put').length, 301);
+
+  fixture.storage.mutations.length = 0;
+  await fixture.coordinator.storePending(entries, entries);
+  assert.equal(fixture.storage.mutations.length, 0,
+    'reconsidering an unchanged deferred queue must not mutate Durable Object rows');
+
+  const changed = structuredClone(entries);
+  changed[150].delta.nextHash = 'f'.repeat(64);
+  changed[150].delta.value = 'changed';
+  await fixture.coordinator.storePending(changed, entries);
+  assert.deepEqual(fixture.storage.mutations, [{
+    operation: 'put', keys: [changed[150].storageKey],
+  }], 'only the genuinely changed coalesced delta is persisted');
+});
+
 test('D1 baseline migrates from legacy rows with one packed write and no billed delete burst', async () => {
   const fixture = d1CoordinatorFixture();
   fixture.database.backend = { active_generation: 'production-v1' };

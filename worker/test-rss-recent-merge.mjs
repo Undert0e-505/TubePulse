@@ -30,14 +30,14 @@ function makeCached(upload, overrides = {}) {
     views: upload.views,
     likes: upload.likes,
     dislikes: upload.dislikes,
-    viewsLastCheckedHour: CURRENT_HOUR - 1,
-    likesLastCheckedHour: CURRENT_HOUR - 1,
+    viewsLastCheckedHour: CURRENT_HOUR - 2,
+    likesLastCheckedHour: CURRENT_HOUR - 2,
     ...overrides,
   };
 }
 
-// Any known metric movement may persist in a later UTC hour, including a
-// change that was below the former percentage threshold.
+// Any known metric movement may persist once the two-hour cadence is due,
+// including a change that was below the former percentage threshold.
 {
   const upload = makeUpload('latest', { views: '1001', likes: '101', dislikes: '20' });
   const cached = makeCached(upload, { views: '1000', likes: '100', dislikes: '20' });
@@ -48,7 +48,24 @@ function makeCached(upload, overrides = {}) {
   assert.equal(merged.likesLastCheckedHour, CURRENT_HOUR);
 }
 
-// A large view change also refreshes in a later UTC hour.
+// A known metric movement one hour after the last canonical observation is
+// coalesced; the following hour publishes the freshest value.
+{
+  const upload = makeUpload('cadence', { views: '1001', likes: '101' });
+  const cached = makeCached(upload, {
+    views: '1000', likes: '100',
+    viewsLastCheckedHour: CURRENT_HOUR - 1,
+    likesLastCheckedHour: CURRENT_HOUR - 1,
+  });
+  assert.deepEqual(mergeRssUploadsIntoRecentVideos([cached], [upload], NOW_MS), [cached]);
+  const [merged] = mergeRssUploadsIntoRecentVideos([cached], [upload], NOW_MS + HOUR_MS);
+  assert.equal(merged.views, '1001');
+  assert.equal(merged.likes, '101');
+  assert.equal(merged.viewsLastCheckedHour, CURRENT_HOUR + 1);
+  assert.equal(merged.likesLastCheckedHour, CURRENT_HOUR + 1);
+}
+
+// A large view change also refreshes when the bounded cadence is due.
 {
   const upload = makeUpload('latest', { views: '1251' });
   const cached = makeCached(upload, { views: '1000' });
@@ -89,7 +106,7 @@ function makeCached(upload, overrides = {}) {
     likes: '100',
     dislikes: '20',
     viewsLastCheckedHour: CURRENT_HOUR,
-    likesLastCheckedHour: CURRENT_HOUR - 1,
+    likesLastCheckedHour: CURRENT_HOUR - 2,
   });
   const [merged] = mergeRssUploadsIntoRecentVideos([cached], [upload], NOW_MS);
   assert.equal(merged.views, '1000');
@@ -255,7 +272,7 @@ function makeCached(upload, overrides = {}) {
   });
   const cached = makeCached(upload, {
     views: '100', comments: '9',
-    viewsLastCheckedHour: CURRENT_HOUR - 1,
+    viewsLastCheckedHour: CURRENT_HOUR - 2,
     likesLastCheckedHour: CURRENT_HOUR,
     commentsLastCheckedHour: CURRENT_HOUR - 1,
   });

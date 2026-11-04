@@ -36,6 +36,8 @@ test('Prometheus rules record and alert on the separate Durable Objects write bu
   assert.match(rules, /alert: TubePulseDurableObjectWriteBudgetWarning[\s\S]*0\.75/);
   assert.match(rules, /alert: TubePulseDurableObjectWriteBudgetCritical[\s\S]*0\.90/);
   assert.match(read('monitoring', 'compose.yaml'), /TUBEPULSE_DO_ROWS_WRITTEN_GUARDRAIL/);
+  assert.match(rules, /alert: TubePulseAuthorityPublicationProjectionWarning/);
+  assert.match(rules, /tubepulse_authority_d1_publication_exhaustion_risk/);
 });
 
 test('wallboard is a readable one-screen calm health overview', () => {
@@ -94,11 +96,13 @@ test('wallboard is a readable one-screen calm health overview', () => {
   assert.match(attention.targets[0].expr, /tubepulse_notifications_durable_backlog/);
   assert.match(attention.targets[0].expr, /tubepulse_cloudflare_worker_errors/);
   assert.match(attention.targets[0].expr, /tubepulse:do_write_budget_ratio/);
+  assert.match(attention.targets[0].expr, /tubepulse_authority_d1_publication_exhaustion_risk/);
   assert.doesNotMatch(attention.targets[0].expr, /tubepulse_youtube_api_failures/);
   for (const required of ['Core availability', 'D1 queue', 'D1 transaction', 'YouTube error', 'Live precision degraded']) {
     assert.ok(attention.targets.some(({ legendFormat }) => legendFormat === required));
   }
   assert.ok(attention.targets.some(({ legendFormat }) => legendFormat === 'DO write capacity'));
+  assert.ok(attention.targets.some(({ legendFormat }) => legendFormat === 'D1 publication projection'));
   for (const target of attention.targets) {
     assert.equal(target.instant, true);
     assert.equal(target.range, false);

@@ -481,6 +481,27 @@ export class DurableNotificationIntentStore {
     }
     return staged.length;
   }
+
+  async resolvePending(ids, reason) {
+    const selected = new Set(ids || []);
+    if (selected.size === 0) return 0;
+    const state = await this.stateFile.read();
+    state.records ||= {};
+    let resolved = 0;
+    for (const id of selected) {
+      const record = state.records[id];
+      if (!record || record.status !== 'pending') continue;
+      record.status = 'resolved';
+      record.delivery = 'suppressed';
+      record.suppressionReason = String(reason || 'no-longer-relevant').slice(0, 80);
+      record.completedAt = this.now();
+      record.updatedAt = this.now();
+      record.callbackApplied = true;
+      resolved++;
+    }
+    if (resolved > 0) await this.stateFile.write(state);
+    return resolved;
+  }
 }
 
 class MemoryNotificationIntentStore extends DurableNotificationIntentStore {
@@ -514,15 +535,22 @@ function uniqueIntents(intents) {
   return [...result.values()];
 }
 
-function channelContainsIntent(channel, intent) {
-  if (!channel || channel.channelId !== intent.channelId) return false;
+function channelIntentState(channel, intent) {
+  if (!channel || channel.channelId !== intent.channelId) return 'missing';
   const videos = new Map((channel.videos || []).map((video) => [video.videoId, video]));
   const posts = new Map((channel.posts || []).map((post) => [`post:${post.activityId}`, post]));
-  return (intent.contentIds || []).every((contentId) => {
-    const entry = String(contentId).startsWith('post:') ? posts.get(contentId) : videos.get(contentId);
-    if (!entry) return false;
+  const entries = (intent.contentIds || []).map((contentId) => (
+    String(contentId).startsWith('post:') ? posts.get(contentId) : videos.get(contentId)
+  ));
+  if (entries.some((entry) => !entry)) return 'missing';
+  const visible = entries.every((entry) => {
     return intent.requireUnwatched === false || entry.unwatched === true;
   });
+  return visible ? 'visible' : 'irrelevant';
+}
+
+function channelContainsIntent(channel, intent) {
+  return channelIntentState(channel, intent) === 'visible';
 }
 
 export class ProductionNotificationCoordinator {
@@ -600,8 +628,12 @@ export class ProductionNotificationCoordinator {
     const transient = unique.filter(isTransientIntent);
     const durable = unique.filter((intent) => !isTransientIntent(intent));
     const transientExpired = await this.intentStore.expirePendingKind?.('nag', 'transient-nag-expired') || 0;
-    const durableSuppressed = await this.intentStore.suppress(durable, reason);
-    const suppressed = durableSuppressed + transient.length;
+    const canonicalDeferred = reason === 'canonical-backup-deferred';
+    const durableResult = canonicalDeferred
+      ? await this.intentStore.stage(durable)
+      : await this.intentStore.suppress(durable, reason);
+    const durableCount = canonicalDeferred ? durable.length : durableResult;
+    const suppressed = durableCount + transient.length;
     return {
       queued: intents.length,
       deduplicated: intents.length - unique.length,
@@ -609,6 +641,7 @@ export class ProductionNotificationCoordinator {
       failed: 0,
       suppressed,
       transientExpired,
+      ...(canonicalDeferred ? { durableDeferred: durableCount } : {}),
       barrier: 'suppressed',
       reason,
     };
@@ -664,6 +697,7 @@ export class ProductionNotificationCoordinator {
   async verifyProductionFeeds(intents) {
     const unresolved = new Map(uniqueIntents(intents).map((intent) => [intentKey(intent), intent]));
     const visibleIntentIds = new Set();
+    const irrelevantIntentIds = new Set();
 
     for (let attempt = 0; attempt <= this.config.retryCount; attempt++) {
       const byDevice = new Map();
@@ -685,10 +719,11 @@ export class ProductionNotificationCoordinator {
           }
           const channels = new Map(payload.channels.map((channel) => [channel.channelId, channel]));
           for (const intent of deviceIntents) {
-            if (!channelContainsIntent(channels.get(intent.channelId), intent)) continue;
             const id = intentKey(intent);
-            visibleIntentIds.add(id);
-            unresolved.delete(id);
+            const state = channelIntentState(channels.get(intent.channelId), intent);
+            if (state === 'visible') visibleIntentIds.add(id);
+            if (state === 'irrelevant') irrelevantIntentIds.add(id);
+            if (state !== 'missing') unresolved.delete(id);
           }
         } catch { /* retry only the intents that have not yet been proven visible */ }
       }
@@ -698,6 +733,7 @@ export class ProductionNotificationCoordinator {
           attempts: attempt + 1,
           deviceCount: new Set(intents.map((intent) => intent.deviceId)).size,
           visibleIntentIds: [...visibleIntentIds],
+          irrelevantIntentIds: [...irrelevantIntentIds],
           invisibleCount: 0,
         };
       }
@@ -710,6 +746,7 @@ export class ProductionNotificationCoordinator {
       invisibleDeviceCount: new Set([...unresolved.values()].map((intent) => intent.deviceId)).size,
       invisibleChannelCount: new Set([...unresolved.values()].map((intent) => intent.channelId)).size,
       visibleIntentIds: [...visibleIntentIds],
+      irrelevantIntentIds: [...irrelevantIntentIds],
       invisibleCount: unresolved.size,
       reason: 'feed-not-visible',
     };
@@ -787,13 +824,26 @@ export class ProductionNotificationCoordinator {
     }
     const visibility = await this.verifyProductionFeeds(pendingIntents);
     const visibleIntentIds = new Set(visibility.visibleIntentIds || []);
+    const irrelevantIntentIds = new Set(visibility.irrelevantIntentIds || []);
+    const staleResolved = await this.intentStore.resolvePending?.(
+      [...irrelevantIntentIds],
+      'content-already-seen',
+    ) || 0;
     const deliverable = pending.filter(({ id }) => visibleIntentIds.has(id));
-    const blockedCount = pending.length - deliverable.length;
+    const blockedCount = pending.length - deliverable.length - irrelevantIntentIds.size;
     if (deliverable.length === 0) {
+      if (blockedCount === 0) {
+        return {
+          queued: queued.length, deduplicated, recovered, sent: 0, failed: 0,
+          suppressed: recovered + staleResolved, transientExpired, staleResolved,
+          barrier: 'passed', reason: 'stale-intent-resolved',
+          convergenceAttempts: convergence.attempts, visibilityAttempts: visibility.attempts,
+        };
+      }
       return {
         queued: queued.length, deduplicated, recovered, sent: 0, failed: 0, suppressed: pending.length,
         transientExpired, barrier: 'failed', reason: visibility.reason, convergenceAttempts: convergence.attempts,
-        visibilityAttempts: visibility.attempts, visibilityBlocked: visibility.invisibleCount,
+        visibilityAttempts: visibility.attempts, visibilityBlocked: blockedCount,
         visibilityDevices: visibility.invisibleDeviceCount,
         visibilityChannels: visibility.invisibleChannelCount,
       };
@@ -848,7 +898,8 @@ export class ProductionNotificationCoordinator {
       transientExpired,
       sent,
       failed,
-      suppressed: recovered + blockedCount,
+      suppressed: recovered + staleResolved + blockedCount,
+      staleResolved,
       barrier: blockedCount > 0 ? 'partial' : 'passed',
       ...(blockedCount > 0 ? { reason: visibility.reason, visibilityBlocked: blockedCount } : {}),
       ...(blockedCount > 0 ? {

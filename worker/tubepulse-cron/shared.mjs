@@ -192,6 +192,7 @@ export function parseRSSFeed(xmlText) {
 // ─── RSS recent-video persistence ────────────────────────────────────────
 
 const RSS_METRIC_FORCE_REFRESH_HOURS = 24;
+const RSS_METRIC_MIN_REFRESH_HOURS = 2;
 
 function normalizedKnownMetric(value) {
   if (value === undefined || value === null) return null;
@@ -211,8 +212,8 @@ function shouldPersistMetricGroup(lastCheckedHour, currentHour, metricPairs) {
   // Structural discovery can seed a brand-new video with unknown metrics and
   // then enrich it from the batched statistics endpoint seconds later. Allow
   // that one-time null -> known hydration even though both operations happen
-  // in the same hour; subsequent known values remain subject to the normal
-  // once-per-UTC-hour write gate.
+  // in the same hour; subsequent known values remain subject to the bounded
+  // metric-only persistence cadence.
   const hydratesMissingMetric = metricPairs.some(([persistedValue, incomingValue]) => (
     (persistedValue === undefined || persistedValue === null)
     && incomingValue !== undefined
@@ -225,10 +226,12 @@ function shouldPersistMetricGroup(lastCheckedHour, currentHour, metricPairs) {
   const differentHour = missingLastCheckedHour || normalizedLastCheckedHour !== currentHour;
   const stale = missingLastCheckedHour
     || currentHour - normalizedLastCheckedHour >= RSS_METRIC_FORCE_REFRESH_HOURS;
+  const metricCadenceDue = missingLastCheckedHour
+    || currentHour - normalizedLastCheckedHour >= RSS_METRIC_MIN_REFRESH_HOURS;
   return differentHour && (
-    stale || metricPairs.some(([persistedValue, incomingValue]) => (
+    stale || (metricCadenceDue && metricPairs.some(([persistedValue, incomingValue]) => (
       knownMetricChanged(persistedValue, incomingValue)
-    ))
+    )))
   );
 }
 
@@ -967,10 +970,13 @@ export function mergeCachedCommunityPostForPersistence(latestPost, cachedPosts) 
   ));
   const differentHour = latestHour !== null && (cachedHour === null || latestHour !== cachedHour);
   const stale = latestHour !== null && (cachedHour === null || latestHour - cachedHour >= RSS_METRIC_FORCE_REFRESH_HOURS);
+  const metricCadenceDue = latestHour !== null
+    && (cachedHour === null || latestHour - cachedHour >= RSS_METRIC_MIN_REFRESH_HOURS);
   const metricChanged = ['likeCount', 'viewCount'].some((field) => (
     knownCommunityMetricChanged(cached[field], candidate[field])
   ));
-  if (!hydratesClock && !hydratesMetric && !(differentHour && (stale || metricChanged))) return cached;
+  if (!hydratesClock && !hydratesMetric
+    && !(differentHour && (stale || (metricCadenceDue && metricChanged)))) return cached;
 
   const merged = { ...cached };
   if (candidate.fetchedAt) merged.fetchedAt = candidate.fetchedAt;

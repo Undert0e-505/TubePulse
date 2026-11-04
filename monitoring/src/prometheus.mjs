@@ -146,6 +146,17 @@ export function prometheusText({ snapshot, collector, nowMs = Date.now() }) {
   metric('tubepulse_authority_backend_ready', bool(host.authority?.backendReady));
   for (const field of ['total', 'publication', 'api']) metric('tubepulse_authority_d1_estimated_rows', host.authority?.estimatedRows?.[field], { kind: field });
   for (const field of ['total', 'publication', 'appReserve']) metric('tubepulse_authority_d1_estimated_row_limit', host.authority?.limits?.[field], { kind: field });
+  metric('tubepulse_authority_d1_publication_projected_rows', host.authority?.publicationProjection?.rows);
+  metric('tubepulse_authority_d1_publication_projection_ratio', host.authority?.publicationProjection?.ratio);
+  metric('tubepulse_authority_d1_publication_exhaustion_risk', bool(host.authority?.publicationProjection?.exhaustionRisk));
+  metric('tubepulse_authority_publication_mutations', host.authority?.publicationMutations?.localMutations, { kind: 'local_mutations' });
+  metric('tubepulse_authority_publication_mutations', host.authority?.publicationMutations?.uniqueKeys, { kind: 'unique_keys' });
+  for (const [family, value] of Object.entries(host.authority?.publicationMutations?.byFamily || {})) {
+    metric('tubepulse_authority_publication_mutations_by_family', value, { family });
+  }
+  for (const [reason, value] of Object.entries(host.authority?.publicationMutations?.byReason || {})) {
+    metric('tubepulse_authority_publication_mutations_by_reason', value, { reason });
+  }
   for (const period of ['window', 'day']) {
     const data = cloudflare?.[period] || {};
     for (const worker of data.workers || []) {

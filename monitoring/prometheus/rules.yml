@@ -57,6 +57,11 @@ groups:
         for: 10m
         labels: { severity: warning }
         annotations: { summary: "TubePulse D1 daily write usage exceeds 75% of the configured guardrail" }
+      - alert: TubePulseAuthorityPublicationProjectionWarning
+        expr: tubepulse_authority_d1_publication_exhaustion_risk > 0
+        for: 10m
+        labels: { severity: warning }
+        annotations: { summary: "TubePulse authority publication writes are projected to exhaust before the UTC reset" }
       - alert: TubePulseDurableObjectWriteBudgetWarning
         expr: tubepulse:do_write_budget_ratio > 0.75 or tubepulse:do_write_projected_end_of_day / on() tubepulse_guardrail{resource="do_rows_written_day"} > 0.75
         for: 10m

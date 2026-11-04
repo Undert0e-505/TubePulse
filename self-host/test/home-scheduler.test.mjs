@@ -1269,7 +1269,7 @@ test('community post cache ignores only rotating YouTube thumbnail delivery para
   }, [{ ...cached, publishedAt: null }]), true, 'relative label remains authoritative without a timestamp');
 });
 
-test('community post persistence uses hourly engagement gates without delaying structure', () => {
+test('community post persistence uses two-hour engagement gates without delaying structure', () => {
   const cached = {
     id: 'post:Ugpost', activityId: 'Ugpost', postId: 'Ugpost',
     fetchedAt: '2026-10-04T10:05:00.000Z',
@@ -1294,11 +1294,18 @@ test('community post persistence uses hourly engagement gates without delaying s
     'a same-hour spike cannot cause a second persistence write',
   );
 
-  const changed = mergeCachedCommunityPostForPersistence(
+  const coalesced = mergeCachedCommunityPostForPersistence(
     latest({ likeCount: 101, likeText: '101 likes' }), [cached],
   );
-  assert.equal(changed.likeCount, 101, 'a small known change persists in a later UTC hour');
-  assert.equal(changed.fetchedAt, '2026-10-04T11:05:00.000Z');
+  assert.equal(coalesced, cached, 'a small known change is coalesced at the one-hour boundary');
+
+  const changed = mergeCachedCommunityPostForPersistence(
+    latest({
+      fetchedAt: '2026-10-04T12:05:00.000Z', likeCount: 101, likeText: '101 likes',
+    }), [cached],
+  );
+  assert.equal(changed.likeCount, 101, 'a small known change persists once two hours have elapsed');
+  assert.equal(changed.fetchedAt, '2026-10-04T12:05:00.000Z');
   assert.equal(changed.thumbnail, cached.thumbnail);
 
   const forced = mergeCachedCommunityPostForPersistence(latest({
