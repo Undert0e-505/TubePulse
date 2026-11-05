@@ -1,4 +1,4 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useLayoutEffect } from 'react';
 import {
   View,
   Text,
@@ -35,6 +35,7 @@ import { orderChannels } from '../utils/channelOrdering.mjs';
 import { prepareChannelNotificationSettings } from '../utils/channelNotificationSettings.mjs';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { FeatureTourTarget } from '../components/FeatureTour';
+import ChannelTransferDialog from '../components/ChannelTransferDialog';
 
 // Default per-channel settings (mirrors global defaults)
 const DEFAULT_CHANNEL_NOTIF = {
@@ -52,7 +53,7 @@ const DEFAULT_CHANNEL_NOTIF = {
   latestVideosPerChannel: null,
 };
 
-export default function ChannelsScreen() {
+export default function ChannelsScreen({ navigation }) {
   const insets = useSafeAreaInsets();
   const [channels, setChannels] = useState([]);
   const [cache, setCache] = useState({});
@@ -66,22 +67,46 @@ export default function ChannelsScreen() {
   const [channelDisplaySettings, setChannelDisplaySettings] = useState({});
   const [appSettings, setAppSettings] = useState(null);
   const [modalScrollEnabled, setModalScrollEnabled] = useState(true);
+  const [transferVisible, setTransferVisible] = useState(false);
   const autoOrderChannels = appSettings?.autoOrderChannels === true;
+
+  const loadChannelState = useCallback(async () => {
+    const [chs, ca, settings, notifSettings, displaySettings] = await Promise.all([
+      getChannels(),
+      getChannelCache(),
+      getSettings(),
+      getChannelNotifSettings(),
+      getChannelDisplaySettings(),
+    ]);
+    setChannels(chs);
+    setCache(ca);
+    setPerChannelEnabled(settings.perChannelNotifications || false);
+    setAppSettings(settings);
+    setChannelNotifSettings(notifSettings);
+    setChannelDisplaySettings(displaySettings);
+  }, []);
 
   useFocusEffect(
     useCallback(() => {
-      Promise.all([getChannels(), getChannelCache(), getSettings(), getChannelNotifSettings(), getChannelDisplaySettings()]).then(
-        ([chs, ca, settings, notifSettings, displaySettings]) => {
-          setChannels(chs);
-          setCache(ca);
-          setPerChannelEnabled(settings.perChannelNotifications || false);
-          setAppSettings(settings);
-          setChannelNotifSettings(notifSettings);
-          setChannelDisplaySettings(displaySettings);
-        }
-      );
-    }, [])
+      loadChannelState().catch((error) => console.warn('Could not refresh channel settings:', error));
+    }, [loadChannelState])
   );
+
+  useLayoutEffect(() => {
+    navigation.setOptions({
+      headerRight: () => (
+        <TouchableOpacity
+          style={styles.transferMenuButton}
+          onPress={() => setTransferVisible(true)}
+          accessibilityRole="button"
+          accessibilityLabel="Channel transfer options"
+          accessibilityHint="Import or export TubePulse channels"
+        >
+          <Text style={styles.transferMenuText}>⋮</Text>
+        </TouchableOpacity>
+      ),
+    });
+  }, [navigation]);
 
   const setAutoOrder = async (enabled) => {
     const current = appSettings || await getSettings();
@@ -447,6 +472,11 @@ export default function ChannelsScreen() {
       style={styles.container}
       behavior={Platform.OS === 'ios' ? 'padding' : undefined}
     >
+      <ChannelTransferDialog
+        visible={transferVisible}
+        onClose={() => setTransferVisible(false)}
+        onApplied={loadChannelState}
+      />
       {/* Per-channel notification settings modal */}
       <Modal
         visible={!!editingChannel}
@@ -681,6 +711,18 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: COLORS.bg,
+  },
+  transferMenuButton: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    minHeight: 48,
+    minWidth: 48,
+    marginRight: -8,
+  },
+  transferMenuText: {
+    color: COLORS.accent,
+    fontSize: 28,
+    lineHeight: 30,
   },
   addSection: {
     padding: 16,

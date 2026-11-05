@@ -44,6 +44,10 @@ async function saveState(state) {
   return state;
 }
 
+export async function writeLocalNotificationSilence(state, now = Date.now()) {
+  return await saveState(normalizeSilenceState(state, now));
+}
+
 export async function applyLocalNotificationAction(actionIdentifier, channelId, now = Date.now()) {
   const state = await readLocalNotificationSilence(now);
   return await saveState(applyNotificationSilenceAction(state, actionIdentifier, channelId, now));

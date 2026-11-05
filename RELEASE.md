@@ -44,8 +44,9 @@ releases normally use the semantic version with dots removed as their baseline c
 higher monotonic integer when necessary to remain installable over a distributed preview or other signed
 build. The guarded runner accepts that explicit code when it is at least the semantic-version baseline.
 TubePulse v4.4.0 therefore uses Android `versionCode 441`, above the distributed onboarding preview
-code 440. Signing material
-stays at its existing path and is neither copied nor printed. Remove all four task registrations with:
+code 440. TubePulse v4.5.0 uses the semantic baseline Android `versionCode 450`, above the
+distributed import/export preview code 442. Signing material stays at its existing path and is
+neither copied nor printed. Remove all four task registrations with:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Install-AndroidBuildRunner.ps1 -Remove

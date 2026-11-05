@@ -1,8 +1,9 @@
 # TubePulse user guide
 
 TubePulse is an Android app for following selected YouTube channels through a focused Home feed,
-home-screen widget and configurable notifications. It has no TubePulse account or cross-device
-sync: each installation manages its own channels and settings.
+home-screen widget and configurable notifications. It has no TubePulse account or automatic
+cross-device sync: each installation manages its own channels and settings, with local file
+import/export available for backup and transfer.
 
 ## Install and update
 
@@ -38,6 +39,78 @@ displays, without overwriting the saved manual order. Turning it off restores th
 Long-press a channel to inspect its local sound state. When per-channel controls are enabled, the
 same panel can override notification mode, quiet hours, community-post preference or livestream
 prewarning. **Save** applies those controls; **Cancel** leaves the existing override untouched.
+
+## Back up, restore or transfer channels
+
+Open **Channels**, then use the three-dot menu in the header. These actions work with local files;
+they do not create a TubePulse account or turn on automatic cloud sync.
+
+### Export channels
+
+1. Tap **Export channels**.
+2. Android opens its native share sheet with a dated `.tubepulse` file.
+3. Save it to a file provider or send it through a destination you trust.
+
+The UTF-8 JSON file is intentionally readable. It contains the schema version and export time,
+the ordered channel handles and stable identities, supported global notification/display settings,
+supported per-channel overrides, and current global or per-channel mute state. The list order is the
+saved manual order even when automatic newest-first display is enabled.
+
+The export never contains the installation/device ID, Firebase push token, credentials or secrets,
+service endpoints, seen/unseen history, notification-delivery history, or cached videos, posts,
+thumbnails and metrics. Treat it as personal configuration nonetheless, because it names the
+channels you follow.
+
+### Import a TubePulse backup
+
+1. Tap **Import channels** and choose a `.tubepulse` file with Android's file picker.
+2. TubePulse reads and validates it locally, resolves every incoming channel, removes duplicates and
+   shows counts for channels found, new channels, channels already followed, and channels a Replace
+   would remove. It also shows whether transferable settings are present.
+3. Choose **Merge**, **Replace** or **Cancel**. Android Back and **Cancel** leave the current setup
+   unchanged.
+
+**Merge** is the safest default. It keeps every existing channel, the existing saved order, current
+global settings, and all existing per-channel settings. Missing channels are appended in imported
+order; imported per-channel settings and mute state apply only to those newly added channels.
+
+**Replace** makes the imported channel set and order authoritative. TubePulse shows a second explicit
+confirmation with the number of channels that will be removed. A `.tubepulse` Replace applies the
+supported imported global settings, per-channel overrides and mute state. Unknown future fields are
+ignored, while a backup created by a newer unsupported schema is rejected with an update prompt.
+
+TubePulse validates and adds every required new subscription before it begins destructive removals.
+If an addition fails, no existing subscription is removed. A later unsubscribe failure is reported
+and the affected channel remains visible rather than being silently lost. After success, the Home
+feed, Channels screen and widget refresh from the imported state.
+
+Newly restored subscriptions use the same silent first-subscription seed as adding a channel by
+hand. Current cached content establishes the starting point and is marked seen, so importing an old
+list does not create a flood of historical upload or post notifications. The installation identity,
+push token and notification cadence remain those of the receiving installation.
+
+### Import a plain-text handle list
+
+For a channel-only transfer, choose a UTF-8 text file containing YouTube handles. Use one `@handle`
+per line, or separate unambiguous handles with commas. Blank lines are ignored and a line beginning
+with `#` is a comment, for example:
+
+```text
+# Weather channels
+@ReedTimmerWx
+@anotherChannel, @thirdChannel
+```
+
+The same validation, deduplication, preview and safety rules apply. A text-file **Merge** adds missing
+channels without changing settings. A text-file **Replace** uses normal defaults for per-channel
+settings and preserves the receiving installation's current global settings and local mute state.
+
+### Reinstall or move to another device
+
+Export before uninstalling or clearing app data, keep the `.tubepulse` file somewhere the receiving
+device can open, install TubePulse, then import with Merge or Replace. The backup restores supported
+configuration, not seen history or cached feed content. Because the receiving installation keeps its
+own identity and Firebase token, Android notification permission may need to be granted again.
 
 ## Home feed and seen state
 
@@ -199,7 +272,9 @@ if the widget remains stale after connectivity returns.
 
 TubePulse creates a pseudonymous installation identifier for its service authentication and sends a
 Firebase token when push permission is available. It stores the channel list, settings and seen
-state needed to provide the product. It does not provide a TubePulse account or cross-device sync.
+state needed to provide the product. It does not provide a TubePulse account or automatic cross-device
+sync. Local import/export moves only the documented configuration fields and never transfers the
+installation identity, push token, credentials, seen history or cached content.
 The update indicator sends a rate-limited request to GitHub's public releases API; it sends no
 TubePulse installation identifier, channels or notification state.
 

@@ -1,9 +1,9 @@
 # TubePulse - Project Status
 
-**Last updated:** 2026-10-25
+**Last updated:** 2026-11-05
 **Current repo branch:** `master`
-**Current app version in repo:** `4.4.0`
-**Android versionCode/versionName in repo:** `441` / `4.4.0`
+**Current app version in repo:** `4.5.0`
+**Android versionCode/versionName in repo:** `450` / `4.5.0`
 **Repo:** [Undert0e-505/TubePulse](https://github.com/Undert0e-505/TubePulse)
 **Platform:** Android only (React Native + Expo)
 
@@ -17,8 +17,8 @@ Repo evidence as of this document update:
 
 | Area | Current evidence |
 |---|---|
-| App version | `app.json` has `expo.version = 4.4.0` |
-| Android version | `android/app/build.gradle` has `versionCode 441`, `versionName "4.4.0"` |
+| App version | `app.json` has `expo.version = 4.5.0` |
+| Android version | `android/app/build.gradle` has `versionCode 450`, `versionName "4.5.0"` |
 | API base URL | `src/utils/api.js` uses `EXPO_PUBLIC_TUBEPULSE_API_URL` when built with one and otherwise preserves `https://tubepulse-api.jimothyoakley55.workers.dev`; optional fallback is disabled unless separately configured |
 | Release script | `build-and-release.ps1` is the current local release path |
 | Feature preview build | The limited, current-user `FeaturePreview` scheduled task signs a production-package APK from reviewed uncommitted feature work while rejecting secrets and app identity/signing/endpoint-policy changes; it keeps the checked-in visible versionName, injects checked-in versionCode + 1 without editing version files, and runs no Git/GitHub actions. The next official code must exceed the latest preview code. |
@@ -37,6 +37,8 @@ The stack was activated locally on 2026-10-06. Live validation proved a successf
 Same-LAN anonymous Viewer access is enabled for Grafana on the production host through ignored host configuration plus a Windows Firewall rule restricted to the active physical interface, the Private profile, `LocalSubnet`, and TCP port 3000. Prometheus, the collector, and authority status remain loopback-only. The tracked default for a fresh clone is still loopback-only; [`monitoring/README.md`](monitoring/README.md) documents inspection, DHCP/address caveats, and removal.
 
 Release v4.4.0 adds a nine-step, route-local guided tour for adding channels and discovering the app's notification, DND, live-warning and display controls. It runs automatically only for genuine fresh installs, can be replayed from Settings, uses the actual highlighted controls on each screen, and returns cleanly to Home after Done, Skip or Android Back. The isolated emulator-validation route is push-disabled and uses a separate package and loopback Home endpoint so UI tests cannot register production devices.
+
+Release v4.5.0 adds local, versioned channel/configuration backup and transfer through native Android sharing and file picking. Imports validate and deduplicate every channel before a previewed Merge or explicitly confirmed Replace, add missing subscriptions before removals, and silently seed restored channels so historical content does not generate a notification flood. Backups deliberately exclude installation identity, push tokens, credentials, history and cached content; they are a local transfer mechanism, not account sync.
 
 The 2026-10-15 host consistency repair closes a recovery race where an exact D1 snapshot could legitimately restore an older channel feed while the host-only YouTube detector retained its newer `videoCount` and reconciliation clock. Canonical recovery now reports changed video-feed keys, persists a bounded revalidation marker for those channels and any durable pending-intent channels, and clears each marker only after successful uploads-playlist reconciliation. Active startup also prioritizes channels implicated by pending durable intents. The public notification visibility barrier remains fail-closed and at-most-once delivery is unchanged. A bounded one-device/one-channel `feed-not-visible` mismatch is now an amber degraded condition for up to 15 minutes; broader, larger, or older mismatches remain a red outage. Monitoring carries the same distinction.
 
@@ -59,7 +61,7 @@ The scheduled Worker deployments below are retained rollback/history assets. The
 | `tubepulse-api` | Version `9eeb8a15-dc31-4e79-b310-279ecd10de54`; serves the unchanged app URL and the privacy-safe service-status route. Every authenticated feed uses the unified Home store over VPC while current, with D1 fallback; authenticated mutations are Home-first with deferred atomic D1 backup. See the production D1 cutover section for the currently verified deployment. |
 | `worker/archive/tubepulse-resolver` | Not deployed; archive remains reference-only. |
 
-The checked-in app version is `4.4.0` with Android `versionCode 441`. Worker deployment is separate from app APK release; the Android release uses the existing production Worker endpoint and notification service.
+The checked-in app version is `4.5.0` with Android `versionCode 450`. Worker deployment is separate from app APK release; the Android release uses the existing production Worker endpoint and notification service.
 
 Community-post worker/app support is enabled only when `TUBEPULSE_ENABLE_COMMUNITY_POSTS` is set to `1`, `true`, or `yes`. When enabled, cron polls active subscribed channels from `channels:active`. `TUBEPULSE_COMMUNITY_POST_CHANNEL_ALLOWLIST` is optional and narrows polling only when non-empty; missing or blank means all active channels are eligible. First-poll seeding remains silent to avoid old-post spam for newly added channels.
 
@@ -98,7 +100,7 @@ Safe read-only checks showed:
 
 Keep these version labels distinct:
 
-- App/release version evidence in this repo is `4.4.0` with Android `versionCode 441`.
+- App/release version evidence in this repo is `4.5.0` with Android `versionCode 450`.
 - API worker health response reports Worker contract `version: "3.0.0"`; it is intentionally independent of the Android app release version.
 
 `worker/tubepulse-api/wrangler.toml` intentionally commits no custom route. The live `workers.dev` endpoint remains enabled and unchanged; route ownership is separate from the app release version.

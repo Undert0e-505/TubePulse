@@ -10,7 +10,7 @@ YouTube channels into a focused feed, widget and configurable notification flow.
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 [Download the latest release](https://github.com/Undert0e-505/TubePulse/releases/latest) ·
-[What’s new in v4.3.1](RELEASE_NOTES_v4.3.1.md) · [User guide](docs/USER_GUIDE.md)
+[What’s new in v4.5.0](RELEASE_NOTES_v4.5.0.md) · [User guide](docs/USER_GUIDE.md)
 
 ## See your channels at a glance
 
@@ -48,6 +48,8 @@ seen or unseen state. Manual ordering stays yours even when automatic newest-fir
 - Provides exact-snapshot **Mark seen** actions on notifications and channel rows, plus one batched
   **Mark all seen** Home action that cannot consume content arriving after the tap.
 - Supports saved manual channel order or automatic newest-first ordering across the app and widget.
+- Exports the ordered channel setup and supported settings to a readable local backup, with previewed
+  Merge or Replace import for reinstalls and device transfers.
 - Provides an Android home-screen widget with the newest published video or post for each displayed
   channel.
 
@@ -76,7 +78,9 @@ Detailed component, storage and recovery behavior lives in the
 5. Use the Home feed or add the TubePulse widget to the Android home screen.
 
 Existing installations can install a newer signed release over the current app. Each device keeps
-its own channel list and settings; TubePulse does not provide cross-device sync.
+its own channel list and settings. TubePulse does not provide an account or automatic cross-device
+sync, but **Import channels** and **Export channels** on the Channels screen can move a local backup
+between installations.
 
 ## Privacy and limitations
 
@@ -85,6 +89,8 @@ its own channel list and settings; TubePulse does not provide cross-device sync.
   permitted, a Firebase push token. These are required for per-device subscriptions and delivery.
 - Operational monitoring is aggregate-only. It is designed not to expose installation or channel
   identifiers, push tokens, titles or content.
+- A local `.tubepulse` export contains transferable channel and settings data, but deliberately omits
+  the installation identifier, push token, credentials, seen history and cached content.
 - Community posts are distinct from YouTube comments. Post detection depends on an unofficial web
   surface; video rows may show the public comment total, but comment threads are not retrieved.
 - Push delivery, Android background behavior, YouTube availability and network connectivity can
@@ -104,7 +110,7 @@ See [SECURITY.md](SECURITY.md) for security reporting and the
 - [Aggregate monitoring](monitoring/README.md) — privacy boundary, dashboard and retention
 - [Cloud services](worker/README.md) and [Worker contracts](worker/CONTRACTS.md) — implementation,
   endpoints and canonical storage contracts
-- [Release process](RELEASE.md) and [release notes](RELEASE_NOTES_v4.3.1.md)
+- [Release process](RELEASE.md) and [release notes](RELEASE_NOTES_v4.5.0.md)
 - [Historical plans](MIGRATION_PLAN.md) — retained for context, not current operating instructions
 
 ## Build from source
