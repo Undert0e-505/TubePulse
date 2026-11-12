@@ -163,20 +163,22 @@
       "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
     },
     {
-      "type": "timeseries", "title": "Durable Object aggregate usage", "description": "Verified Cloudflare datasets: invocations, errors, periodic SQL rows/storage units and storage bytes.",
+      "type": "timeseries", "title": "Durable Object aggregate usage", "description": "Cloudflare sampled invocations and storage plus volatile per-instance coordinator route counters. Volatile counters reset on eviction/deploy and perform no durable writes.",
       "gridPos": { "x": 12, "y": 33, "w": 12, "h": 7 },
       "targets": [
         { "expr": "tubepulse_cloudflare_do_requests{period=\"window\"}", "legendFormat": "requests", "refId": "A" },
         { "expr": "tubepulse_cloudflare_do_errors{period=\"window\"}", "legendFormat": "errors", "refId": "B" },
         { "expr": "tubepulse_cloudflare_do_rows_read{period=\"window\"}", "legendFormat": "rows read", "refId": "C" },
         { "expr": "tubepulse_cloudflare_do_rows_written{period=\"window\"}", "legendFormat": "rows written", "refId": "D" },
-        { "expr": "tubepulse_cloudflare_do_storage_bytes", "legendFormat": "storage bytes", "refId": "E" }
+        { "expr": "tubepulse_cloudflare_do_storage_bytes", "legendFormat": "storage bytes", "refId": "E" },
+        { "expr": "tubepulse_authority_coordinator_requests_by_route_volatile", "legendFormat": "volatile {{route}}", "refId": "F" },
+        { "expr": "tubepulse_authority_coordinator_acquire_contention_volatile", "legendFormat": "volatile acquire contention", "refId": "G" }
       ],
       "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [{ "matcher": { "id": "byName", "options": "storage bytes" }, "properties": [{ "id": "unit", "value": "bytes" }] }] },
       "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
     },
     {
-      "type": "stat", "title": "Cloudflare daily guardrails", "description": "UTC-day raw usage and percentage of configurable plan guardrails. Analytics are delayed/approximate rather than billing authority.",
+      "type": "stat", "title": "Cloudflare daily guardrails", "description": "UTC-day resources are independent. DO request confidence and projections are sampled GraphQL analytics, not the billing ledger. Request monitoring target is 90k, warning is 75k, and the official limit is 100k. The target is not a runtime throttle.",
       "gridPos": { "x": 0, "y": 40, "w": 8, "h": 7 },
       "targets": [
         { "expr": "tubepulse:worker_requests_day", "legendFormat": "Worker requests", "refId": "A" },
@@ -185,13 +187,21 @@
         { "expr": "100 * tubepulse:d1_write_budget_ratio", "legendFormat": "D1 write %", "refId": "D" },
         { "expr": "tubepulse:do_rows_written_day", "legendFormat": "DO rows written", "refId": "E" },
         { "expr": "100 * tubepulse:do_write_budget_ratio", "legendFormat": "DO write %", "refId": "F" },
-        { "expr": "tubepulse:do_write_projected_end_of_day", "legendFormat": "DO projected EOD", "refId": "G" }
+        { "expr": "tubepulse:do_write_projected_end_of_day", "legendFormat": "DO write projected EOD", "refId": "G" },
+        { "expr": "tubepulse:do_requests_day", "legendFormat": "DO request estimate", "refId": "H" },
+        { "expr": "tubepulse:do_requests_lower_day", "legendFormat": "DO request lower 95%", "refId": "I" },
+        { "expr": "tubepulse:do_requests_upper_day", "legendFormat": "DO request upper 95%", "refId": "J" },
+        { "expr": "100 * tubepulse:do_request_safe_budget_ratio", "legendFormat": "DO request monitoring-target %", "refId": "K" },
+        { "expr": "100 * tubepulse:do_request_official_budget_ratio", "legendFormat": "DO request official-limit %", "refId": "L" },
+        { "expr": "tubepulse:do_request_projected_end_of_day", "legendFormat": "DO request projected EOD", "refId": "M" }
       ],
       "fieldConfig": { "defaults": { "unit": "short", "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 75 }, { "color": "red", "value": 90 }] } }, "overrides": [
         { "matcher": { "id": "byName", "options": "Worker request %" }, "properties": [{ "id": "unit", "value": "percent" }] },
         { "matcher": { "id": "byName", "options": "D1 read %" }, "properties": [{ "id": "unit", "value": "percent" }] },
         { "matcher": { "id": "byName", "options": "D1 write %" }, "properties": [{ "id": "unit", "value": "percent" }] },
-        { "matcher": { "id": "byName", "options": "DO write %" }, "properties": [{ "id": "unit", "value": "percent" }] }
+        { "matcher": { "id": "byName", "options": "DO write %" }, "properties": [{ "id": "unit", "value": "percent" }] },
+        { "matcher": { "id": "byName", "options": "DO request monitoring-target %" }, "properties": [{ "id": "unit", "value": "percent" }] },
+        { "matcher": { "id": "byName", "options": "DO request official-limit %" }, "properties": [{ "id": "unit", "value": "percent" }] }
       ] },
       "options": { "colorMode": "value", "graphMode": "area", "orientation": "horizontal", "reduceOptions": { "calcs": ["lastNotNull"], "values": false } }
     },

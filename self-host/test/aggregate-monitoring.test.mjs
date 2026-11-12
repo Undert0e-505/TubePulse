@@ -81,6 +81,12 @@ test('aggregate monitoring counts profiles and subscriptions without exposing re
         estimatedRowsWritten: 10, publicationEstimatedRowsWritten: 8, apiEstimatedRowsWritten: 2,
         limits: { totalEstimatedRows: 80_000, publicationEstimatedRows: 70_000, appReserveEstimatedRows: 10_000 },
       },
+      requestTelemetry: {
+        scope: 'current-durable-object-instance', persistence: 'volatile',
+        startedAt: '2026-10-06T11:00:00.000Z', total: 50, acquireContention: 2,
+        byRoute: { '/status': 10, '/acquire': 20, privateDeviceRoute: 99 },
+        byOutcome: { success: 48, contention: 2, privateOutcome: 99 },
+      },
     },
   });
 
@@ -141,6 +147,10 @@ test('aggregate monitoring counts profiles and subscriptions without exposing re
   assert.equal(payload.authority.publicationMutations.byReason['metrics-only'], 3);
   assert.equal(Object.hasOwn(payload.authority.publicationMutations.byFamily, 'privateIdentifier'), false);
   assert.equal(Object.hasOwn(payload.authority.publicationMutations.byReason, 'privateReason'), false);
+  assert.equal(payload.authority.requestTelemetry.total, 50);
+  assert.equal(payload.authority.requestTelemetry.byRoute['/acquire'], 20);
+  assert.equal(payload.authority.requestTelemetry.byOutcome.contention, 2);
+  assert.equal(Object.hasOwn(payload.authority.requestTelemetry.byRoute, 'privateDeviceRoute'), false);
   assertAggregateMonitoringSafe(payload);
   const serialized = JSON.stringify(payload);
   for (const secret of ['private-install', 'private-fcm', 'UCprivate', 'private title', 'private-video']) {

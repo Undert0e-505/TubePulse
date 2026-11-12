@@ -157,6 +157,14 @@ export function prometheusText({ snapshot, collector, nowMs = Date.now() }) {
   for (const [reason, value] of Object.entries(host.authority?.publicationMutations?.byReason || {})) {
     metric('tubepulse_authority_publication_mutations_by_reason', value, { reason });
   }
+  metric('tubepulse_authority_coordinator_requests_volatile', host.authority?.requestTelemetry?.total);
+  metric('tubepulse_authority_coordinator_acquire_contention_volatile', host.authority?.requestTelemetry?.acquireContention);
+  for (const [route, value] of Object.entries(host.authority?.requestTelemetry?.byRoute || {})) {
+    metric('tubepulse_authority_coordinator_requests_by_route_volatile', value, { route });
+  }
+  for (const [outcome, value] of Object.entries(host.authority?.requestTelemetry?.byOutcome || {})) {
+    metric('tubepulse_authority_coordinator_requests_by_outcome_volatile', value, { outcome });
+  }
   for (const period of ['window', 'day']) {
     const data = cloudflare?.[period] || {};
     for (const worker of data.workers || []) {
@@ -170,15 +178,18 @@ export function prometheusText({ snapshot, collector, nowMs = Date.now() }) {
     for (const field of ['readQueries', 'writeQueries', 'rowsRead', 'rowsWritten', 'responseBytes']) {
       metric(`tubepulse_cloudflare_d1_${field.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`)}`, data.d1?.[field], { period });
     }
-    for (const field of ['requests', 'errors', 'wallTimeMilliseconds', 'activeTimeMilliseconds', 'durationMilliseconds', 'rowsRead', 'rowsWritten', 'storageReadUnits', 'storageWriteUnits', 'storageDeletes', 'subrequests']) {
+    for (const field of ['requests', 'requestsLower', 'requestsUpper', 'requestsSampleSize', 'errors', 'wallTimeMilliseconds', 'activeTimeMilliseconds', 'durationMilliseconds', 'rowsRead', 'rowsWritten', 'storageReadUnits', 'storageWriteUnits', 'storageDeletes', 'subrequests']) {
       metric(`tubepulse_cloudflare_do_${field.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`)}`, data.durableObjects?.[field], { period });
     }
+    metric('tubepulse_cloudflare_do_requests_confidence_valid', bool(data.durableObjects?.requestsConfidenceValid), { period });
   }
   metric('tubepulse_cloudflare_d1_storage_bytes', cloudflare?.d1StorageBytes);
   metric('tubepulse_cloudflare_do_storage_bytes', cloudflare?.durableObjectStorageBytes);
   metric('tubepulse_guardrail', collector.limits.d1RowsWritten, { resource: 'd1_rows_written_day' });
   metric('tubepulse_guardrail', collector.limits.d1RowsRead, { resource: 'd1_rows_read_day' });
   metric('tubepulse_guardrail', collector.limits.durableObjectRowsWritten, { resource: 'do_rows_written_day' });
+  metric('tubepulse_guardrail', collector.limits.durableObjectRequests, { resource: 'do_requests_day' });
+  metric('tubepulse_guardrail', collector.limits.durableObjectRequestsSafeTarget, { resource: 'do_requests_safe_target_day' });
   metric('tubepulse_guardrail', collector.limits.workerRequests, { resource: 'worker_requests_day' });
   return `${lines.join('\n')}\n`;
 }

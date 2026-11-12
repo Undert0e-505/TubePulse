@@ -38,10 +38,21 @@ test('Prometheus rules record and alert on the separate Durable Objects write bu
   assert.match(read('monitoring', 'compose.yaml'), /TUBEPULSE_DO_ROWS_WRITTEN_GUARDRAIL/);
   assert.match(rules, /alert: TubePulseAuthorityPublicationProjectionWarning/);
   assert.match(rules, /tubepulse_authority_d1_publication_exhaustion_risk/);
+  assert.match(rules, /record: tubepulse:do_requests_day/);
+  assert.match(rules, /record: tubepulse:do_request_safe_budget_ratio/);
+  assert.match(rules, /record: tubepulse:do_request_projected_end_of_day/);
+  assert.match(rules, /sum\(tubepulse:do_requests_day\) >= bool 75000/);
+  assert.match(rules, /sum\(tubepulse:do_request_projected_end_of_day\) >= bool 75000/);
+  assert.match(rules, /sum\(tubepulse:do_requests_day\) >= bool 90000/);
+  assert.match(rules, /sum\(tubepulse:do_request_projected_end_of_day\) >= bool 90000/);
+  assert.match(rules, /alert: TubePulseDurableObjectRequestBudgetWarning/);
+  assert.match(rules, /alert: TubePulseDurableObjectRequestBudgetCritical/);
+  assert.match(read('monitoring', 'compose.yaml'), /TUBEPULSE_DO_REQUEST_SAFE_TARGET:-90000/);
 });
 
 test('wallboard is a readable one-screen calm health overview', () => {
   const dashboard = JSON.parse(read('monitoring', 'grafana', 'dashboards', 'tubepulse-operations.json'));
+  const diagnostics = JSON.parse(read('monitoring', 'grafana', 'dashboards', 'tubepulse-diagnostics.json'));
   assert.equal(dashboard.refresh, '30s');
   assert.deepEqual(dashboard.time, { from: 'now-24h', to: 'now' });
   assert.equal(dashboard.timezone, 'utc');
@@ -77,6 +88,7 @@ test('wallboard is a readable one-screen calm health overview', () => {
   assert.match(status.targets[0].expr, /tubepulse_live_watch_degraded == bool 0/);
   assert.match(status.targets[0].expr, /tubepulse:do_write_budget_ratio/);
   assert.match(status.targets[0].expr, /tubepulse:do_write_projected_end_of_day/);
+  assert.match(status.targets[0].expr, /tubepulse:do_request_critical_state/);
   assert.doesNotMatch(status.targets[0].expr, /tubepulse_youtube_api_failures/);
   assert.ok(status.options.text.valueSize >= 30);
 
@@ -102,6 +114,7 @@ test('wallboard is a readable one-screen calm health overview', () => {
     assert.ok(attention.targets.some(({ legendFormat }) => legendFormat === required));
   }
   assert.ok(attention.targets.some(({ legendFormat }) => legendFormat === 'DO write capacity'));
+  assert.ok(attention.targets.some(({ legendFormat }) => legendFormat === 'DO request capacity'));
   assert.ok(attention.targets.some(({ legendFormat }) => legendFormat === 'D1 publication projection'));
   for (const target of attention.targets) {
     assert.equal(target.instant, true);
@@ -263,11 +276,18 @@ test('wallboard is a readable one-screen calm health overview', () => {
   assert.equal(capacity.type, 'bargauge');
   assert.equal(capacity.fieldConfig.defaults.unit, 'percent');
   assert.deepEqual(capacity.fieldConfig.defaults.thresholds.steps.map(({ value }) => value), [null, 70, 90]);
-  assert.equal(capacity.targets.length, 7);
-  assert.equal(capacity.targets.find(({ legendFormat }) => legendFormat === 'DO today').expr,
+  assert.equal(capacity.targets.length, 9);
+  assert.equal(capacity.targets.find(({ legendFormat }) => legendFormat === 'DO storage writes today').expr,
     '100 * tubepulse:do_write_budget_ratio');
-  assert.match(capacity.targets.find(({ legendFormat }) => legendFormat === 'DO projected').expr,
+  assert.match(capacity.targets.find(({ legendFormat }) => legendFormat === 'DO storage writes projected').expr,
     /tubepulse:do_write_projected_end_of_day/);
+  assert.match(capacity.targets.find(({ legendFormat }) => legendFormat === 'DO requests today \/ 90k target').expr,
+    /do_request_safe_budget_ratio/);
+  assert.ok(capacity.targets.some(({ legendFormat }) => legendFormat === 'DO requests projected / 90k target'));
+  assert.doesNotMatch(JSON.stringify(dashboard), /DO requests (?:today|projected) \/ 60k target/);
+  const diagnosticsGuardrails = diagnostics.panels.find(({ title }) => title === 'Cloudflare daily guardrails');
+  assert.ok(diagnosticsGuardrails.targets.some(({ legendFormat }) => legendFormat === 'DO request monitoring-target %'));
+  assert.match(diagnosticsGuardrails.description, /monitoring target is 90k/);
   const liveWatch = capacity.targets.find(({ legendFormat }) => legendFormat === 'Live watch');
   assert.ok(liveWatch);
   assert.equal(liveWatch.expr, '100 * tubepulse_live_watch_quota_ratio');
@@ -490,7 +510,10 @@ test('every dashboard target is well formed and references an exported or record
     collector: {
       lastCollectionSuccess: true, errorsTotal: 0,
       lastAttemptAt: '2026-10-06T00:05:00Z', lastSuccessAt: '2026-10-06T00:05:00Z',
-      limits: { d1RowsWritten: 1, d1RowsRead: 1, durableObjectRowsWritten: 1, workerRequests: 1 },
+      limits: {
+        d1RowsWritten: 1, d1RowsRead: 1, durableObjectRowsWritten: 1,
+        durableObjectRequests: 1, durableObjectRequestsSafeTarget: 1, workerRequests: 1,
+      },
     },
     snapshot: {
       intervalStart: '2026-10-06T00:00:00Z', collection: { hostSuccess: true, cloudflareSuccess: true },
@@ -501,7 +524,10 @@ test('every dashboard target is well formed and references an exported or record
           invalidTokenEvents: [{
             bucket: '2026-10-06T00:00:00.000Z', permanentResponses: 1, uniqueCleanups: 1,
           }],
-        }, authority: { estimatedRows: {}, limits: {} },
+        }, authority: {
+          estimatedRows: {}, limits: {},
+          requestTelemetry: { byRoute: { '/status': 1 }, byOutcome: { success: 1 } },
+        },
       },
       cloudflare: {
         window: { workers: [{ script: 'active', status: 'success' }], d1: {}, durableObjects: {} },

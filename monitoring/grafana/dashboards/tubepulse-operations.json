@@ -34,7 +34,7 @@
       },
       "targets": [
         {
-          "expr": "(tubepulse_collector_collection_success * tubepulse_collector_host_collection_success * tubepulse_host_ready * tubepulse_host_authority_current * tubepulse_host_scheduler_active * tubepulse_authority_backend_ready * tubepulse_notifications_barrier_healthy * (tubepulse_host_last_error_present == bool 0) * ((time() - tubepulse_collector_last_success_timestamp_seconds) < bool 960) * (scalar(sum(tubepulse_cloudflare_worker_errors{period=\"window\"}) or vector(0)) == bool 0) * (scalar(tubepulse:d1_write_budget_ratio) < bool 0.9) * (scalar(tubepulse:do_write_budget_ratio) < bool 0.9) * (scalar(tubepulse:do_write_projected_end_of_day / on() tubepulse_guardrail{resource=\"do_rows_written_day\"}) < bool 0.9) * (scalar(tubepulse:worker_request_budget_ratio) < bool 0.9) * (scalar(max(tubepulse_youtube_quota_used / tubepulse_youtube_quota_limit)) < bool 0.9)) * (1 + (tubepulse_collector_cloudflare_collection_success * tubepulse_subscription_integrity_consistent * (tubepulse_authority_pending_backup_consecutive_samples < bool 2) * (tubepulse_authority_transaction_active_consecutive_samples < bool 2) * (tubepulse_authority_d1_publication_exhaustion_risk == bool 0) * (tubepulse_notifications_barrier_degraded == bool 0) * (tubepulse_notifications_durable_backlog == bool 0) * (tubepulse_notifications_callback_pending == bool 0) * (tubepulse_notifications_ambiguous_sending == bool 0) * (tubepulse_notifications_retained_failures == bool 0) * (tubepulse_notifications_failed == bool 0) * (tubepulse_youtube_last_error_present == bool 0) * (tubepulse_live_watch_degraded == bool 0) * ((time() - tubepulse_collector_last_success_timestamp_seconds) < bool 660) * (scalar(tubepulse:d1_write_budget_ratio) < bool 0.7) * (scalar(tubepulse:d1_read_budget_ratio) < bool 0.7) * (scalar(tubepulse:d1_write_projected_end_of_day / on() tubepulse_guardrail{resource=\"d1_rows_written_day\"}) < bool 0.7) * (scalar(tubepulse:do_write_budget_ratio) < bool 0.75) * (scalar(tubepulse:do_write_projected_end_of_day / on() tubepulse_guardrail{resource=\"do_rows_written_day\"}) < bool 0.75) * (scalar(tubepulse:worker_request_budget_ratio) < bool 0.7) * (scalar(max(tubepulse_youtube_quota_used / tubepulse_youtube_quota_limit)) < bool 0.7) * (scalar(sum(tubepulse_cloudflare_worker_requests{period=\"window\",script!=\"tubepulse-api\"}) or vector(0)) == bool 0)))",
+          "expr": "(tubepulse_collector_collection_success * tubepulse_collector_host_collection_success * tubepulse_host_ready * tubepulse_host_authority_current * tubepulse_host_scheduler_active * tubepulse_authority_backend_ready * tubepulse_notifications_barrier_healthy * (tubepulse_host_last_error_present == bool 0) * ((time() - tubepulse_collector_last_success_timestamp_seconds) < bool 960) * (scalar(sum(tubepulse_cloudflare_worker_errors{period=\"window\"}) or vector(0)) == bool 0) * (scalar(tubepulse:d1_write_budget_ratio) < bool 0.9) * (scalar(tubepulse:do_write_budget_ratio) < bool 0.9) * (scalar(tubepulse:do_write_projected_end_of_day / on() tubepulse_guardrail{resource=\"do_rows_written_day\"}) < bool 0.9) * (scalar(tubepulse:do_request_critical_state) < bool 1) * (scalar(tubepulse:worker_request_budget_ratio) < bool 0.9) * (scalar(max(tubepulse_youtube_quota_used / tubepulse_youtube_quota_limit)) < bool 0.9)) * (1 + (tubepulse_collector_cloudflare_collection_success * tubepulse_subscription_integrity_consistent * (tubepulse_authority_pending_backup_consecutive_samples < bool 2) * (tubepulse_authority_transaction_active_consecutive_samples < bool 2) * (tubepulse_authority_d1_publication_exhaustion_risk == bool 0) * (tubepulse_notifications_barrier_degraded == bool 0) * (tubepulse_notifications_durable_backlog == bool 0) * (tubepulse_notifications_callback_pending == bool 0) * (tubepulse_notifications_ambiguous_sending == bool 0) * (tubepulse_notifications_retained_failures == bool 0) * (tubepulse_notifications_failed == bool 0) * (tubepulse_youtube_last_error_present == bool 0) * (tubepulse_live_watch_degraded == bool 0) * ((time() - tubepulse_collector_last_success_timestamp_seconds) < bool 660) * (scalar(tubepulse:d1_write_budget_ratio) < bool 0.7) * (scalar(tubepulse:d1_read_budget_ratio) < bool 0.7) * (scalar(tubepulse:d1_write_projected_end_of_day / on() tubepulse_guardrail{resource=\"d1_rows_written_day\"}) < bool 0.7) * (scalar(tubepulse:do_write_budget_ratio) < bool 0.75) * (scalar(tubepulse:do_write_projected_end_of_day / on() tubepulse_guardrail{resource=\"do_rows_written_day\"}) < bool 0.75) * (scalar(tubepulse:do_request_warning_state) < bool 1) * (scalar(tubepulse:worker_request_budget_ratio) < bool 0.7) * (scalar(max(tubepulse_youtube_quota_used / tubepulse_youtube_quota_limit)) < bool 0.7) * (scalar(sum(tubepulse_cloudflare_worker_requests{period=\"window\",script!=\"tubepulse-api\"}) or vector(0)) == bool 0)))",
           "legendFormat": "System",
           "refId": "A",
           "instant": true,
@@ -257,7 +257,7 @@
       "id": 2,
       "type": "stat",
       "title": "Attention",
-      "description": "Quiet when no action is required. Current queues, transactions, drift, API failures, notification failures, Worker errors or legacy traffic appear here only when actionable.",
+      "description": "Quiet when no action is required. Current queues, transactions, drift, request/storage capacity, API failures, notification failures, Worker errors or legacy traffic appear here only when actionable.",
       "gridPos": {
         "x": 15,
         "y": 0,
@@ -266,7 +266,7 @@
       },
       "targets": [
         {
-          "expr": "tubepulse_host_last_error_present + (tubepulse_authority_pending_backup_consecutive_samples >= bool 2) + (tubepulse_authority_transaction_active_consecutive_samples >= bool 2) + tubepulse_authority_d1_publication_exhaustion_risk + (1 - tubepulse_subscription_integrity_consistent) + tubepulse_youtube_last_error_present + tubepulse_live_watch_degraded + tubepulse_notifications_barrier_degraded + (tubepulse_notifications_failed > bool 0) + (tubepulse_notifications_durable_backlog > bool 0) + (tubepulse_notifications_callback_pending > bool 0) + (tubepulse_notifications_ambiguous_sending > bool 0) + (scalar(sum(tubepulse_cloudflare_worker_errors{period=\"window\"}) or vector(0)) > bool 0) + (scalar(sum(tubepulse_cloudflare_worker_requests{period=\"window\",script!=\"tubepulse-api\"}) or vector(0)) > bool 0) + (scalar(tubepulse:do_write_budget_ratio) >= bool 0.75) + (scalar(tubepulse:do_write_projected_end_of_day / on() tubepulse_guardrail{resource=\"do_rows_written_day\"}) >= bool 0.75) + 1000 * (1 - (tubepulse_collector_collection_success * tubepulse_collector_host_collection_success * tubepulse_host_ready * tubepulse_host_authority_current * tubepulse_host_scheduler_active * tubepulse_authority_backend_ready * tubepulse_notifications_barrier_healthy * (tubepulse_host_last_error_present == bool 0) * ((time() - tubepulse_collector_last_success_timestamp_seconds) < bool 960) * (scalar(sum(tubepulse_cloudflare_worker_errors{period=\"window\"}) or vector(0)) == bool 0) * (scalar(tubepulse:d1_write_budget_ratio) < bool 0.9) * (scalar(tubepulse:do_write_budget_ratio) < bool 0.9) * (scalar(tubepulse:do_write_projected_end_of_day / on() tubepulse_guardrail{resource=\"do_rows_written_day\"}) < bool 0.9) * (scalar(tubepulse:worker_request_budget_ratio) < bool 0.9) * (scalar(max(tubepulse_youtube_quota_used / tubepulse_youtube_quota_limit)) < bool 0.9)))",
+          "expr": "tubepulse_host_last_error_present + (tubepulse_authority_pending_backup_consecutive_samples >= bool 2) + (tubepulse_authority_transaction_active_consecutive_samples >= bool 2) + tubepulse_authority_d1_publication_exhaustion_risk + (1 - tubepulse_subscription_integrity_consistent) + tubepulse_youtube_last_error_present + tubepulse_live_watch_degraded + tubepulse_notifications_barrier_degraded + (tubepulse_notifications_failed > bool 0) + (tubepulse_notifications_durable_backlog > bool 0) + (tubepulse_notifications_callback_pending > bool 0) + (tubepulse_notifications_ambiguous_sending > bool 0) + (scalar(sum(tubepulse_cloudflare_worker_errors{period=\"window\"}) or vector(0)) > bool 0) + (scalar(sum(tubepulse_cloudflare_worker_requests{period=\"window\",script!=\"tubepulse-api\"}) or vector(0)) > bool 0) + (scalar(tubepulse:do_write_budget_ratio) >= bool 0.75) + (scalar(tubepulse:do_write_projected_end_of_day / on() tubepulse_guardrail{resource=\"do_rows_written_day\"}) >= bool 0.75) + scalar(tubepulse:do_request_warning_state) + 1000 * (1 - (tubepulse_collector_collection_success * tubepulse_collector_host_collection_success * tubepulse_host_ready * tubepulse_host_authority_current * tubepulse_host_scheduler_active * tubepulse_authority_backend_ready * tubepulse_notifications_barrier_healthy * (tubepulse_host_last_error_present == bool 0) * ((time() - tubepulse_collector_last_success_timestamp_seconds) < bool 960) * (scalar(sum(tubepulse_cloudflare_worker_errors{period=\"window\"}) or vector(0)) == bool 0) * (scalar(tubepulse:d1_write_budget_ratio) < bool 0.9) * (scalar(tubepulse:do_write_budget_ratio) < bool 0.9) * (scalar(tubepulse:do_write_projected_end_of_day / on() tubepulse_guardrail{resource=\"do_rows_written_day\"}) < bool 0.9) * (scalar(tubepulse:do_request_critical_state) < bool 1) * (scalar(tubepulse:worker_request_budget_ratio) < bool 0.9) * (scalar(max(tubepulse_youtube_quota_used / tubepulse_youtube_quota_limit)) < bool 0.9)))",
           "legendFormat": "Live checks",
           "refId": "A",
           "instant": true,
@@ -343,7 +343,7 @@
           "range": false
         },
         {
-          "expr": "(1 - (tubepulse_collector_collection_success * tubepulse_collector_host_collection_success * tubepulse_host_ready * tubepulse_host_authority_current * tubepulse_host_scheduler_active * tubepulse_authority_backend_ready * tubepulse_notifications_barrier_healthy * (tubepulse_host_last_error_present == bool 0) * ((time() - tubepulse_collector_last_success_timestamp_seconds) < bool 960) * (scalar(sum(tubepulse_cloudflare_worker_errors{period=\"window\"}) or vector(0)) == bool 0) * (scalar(tubepulse:d1_write_budget_ratio) < bool 0.9) * (scalar(tubepulse:do_write_budget_ratio) < bool 0.9) * (scalar(tubepulse:do_write_projected_end_of_day / on() tubepulse_guardrail{resource=\"do_rows_written_day\"}) < bool 0.9) * (scalar(tubepulse:worker_request_budget_ratio) < bool 0.9) * (scalar(max(tubepulse_youtube_quota_used / tubepulse_youtube_quota_limit)) < bool 0.9))) > 0",
+          "expr": "(1 - (tubepulse_collector_collection_success * tubepulse_collector_host_collection_success * tubepulse_host_ready * tubepulse_host_authority_current * tubepulse_host_scheduler_active * tubepulse_authority_backend_ready * tubepulse_notifications_barrier_healthy * (tubepulse_host_last_error_present == bool 0) * ((time() - tubepulse_collector_last_success_timestamp_seconds) < bool 960) * (scalar(sum(tubepulse_cloudflare_worker_errors{period=\"window\"}) or vector(0)) == bool 0) * (scalar(tubepulse:d1_write_budget_ratio) < bool 0.9) * (scalar(tubepulse:do_write_budget_ratio) < bool 0.9) * (scalar(tubepulse:do_write_projected_end_of_day / on() tubepulse_guardrail{resource=\"do_rows_written_day\"}) < bool 0.9) * (scalar(tubepulse:do_request_critical_state) < bool 1) * (scalar(tubepulse:worker_request_budget_ratio) < bool 0.9) * (scalar(max(tubepulse_youtube_quota_used / tubepulse_youtube_quota_limit)) < bool 0.9))) > 0",
           "legendFormat": "Core availability",
           "refId": "L",
           "instant": true,
@@ -362,6 +362,13 @@
         "refId": "N",
         "instant": true,
         "range": false
+        },
+        {
+          "expr": "tubepulse:do_request_warning_state > 0",
+          "legendFormat": "DO request capacity",
+          "refId": "P",
+          "instant": true,
+          "range": false
         },
         {
           "expr": "tubepulse_authority_d1_publication_exhaustion_risk > 0",
@@ -983,7 +990,7 @@
       "id": 4,
       "type": "bargauge",
       "title": "Capacity",
-      "description": "Current and projected D1 and Durable Objects rows written are separate UTC-day resources. Values come from delayed, approximate Cloudflare analytics; cyan is comfortable, amber and coral indicate capacity risk.",
+      "description": "Separate UTC-day resources. DO request bars use the 90,000/day monitoring target; this is not a runtime throttle. Warning begins at 75,000, while the official request limit remains 100,000/day. DO storage bars are SQL rows written. D1 is separate. Cloudflare GraphQL is delayed/sampled and is not the billing ledger.",
       "gridPos": {
         "x": 0,
         "y": 13,
@@ -992,15 +999,29 @@
       },
       "targets": [
         {
+          "expr": "100 * tubepulse:do_request_safe_budget_ratio",
+          "legendFormat": "DO requests today / 90k target",
+          "refId": "H",
+          "instant": true,
+          "range": false
+        },
+        {
+          "expr": "100 * tubepulse:do_request_safe_projection_ratio",
+          "legendFormat": "DO requests projected / 90k target",
+          "refId": "I",
+          "instant": true,
+          "range": false
+        },
+        {
           "expr": "100 * tubepulse:do_write_budget_ratio",
-          "legendFormat": "DO today",
+          "legendFormat": "DO storage writes today",
           "refId": "F",
           "instant": true,
           "range": false
         },
         {
           "expr": "100 * tubepulse:do_write_projected_end_of_day / on() tubepulse_guardrail{resource=\"do_rows_written_day\"}",
-          "legendFormat": "DO projected",
+          "legendFormat": "DO storage writes projected",
           "refId": "G",
           "instant": true,
           "range": false

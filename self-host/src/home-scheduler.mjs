@@ -683,6 +683,7 @@ export class ActivePublicationStrategy {
     this.leaseId = null;
     this.heartbeat = null;
     this.remoteLeaseId = null;
+    this.remotePendingKeys = 0;
     this.totals = { batches: 0, writes: 0, authorityRequests: 0 };
   }
   async prepare() {
@@ -738,9 +739,29 @@ export class ActivePublicationStrategy {
         this.leaseId = null;
         remoteLease = await this.client.acquirePublication({ ttlMs: this.leaseTtlMs });
         this.remoteLeaseId = remoteLease.leaseId;
+        this.remotePendingKeys = Math.max(0, Number(remoteLease.result?.pendingBackupKeys || 0));
         this.leaseId = `scheduler-publish-${crypto.randomUUID()}`;
         await this.gate.acquire({ leaseId: this.leaseId, kind: 'scheduler' });
         this.startHeartbeat();
+      }
+      if (!final && deltas.length === 0 && this.remotePendingKeys === 0) {
+        // Keep the already-acquired global lease for the notification phase,
+        // but avoid an empty intermediate commit request. The final phase will
+        // either commit its notification deltas or release/no-op the lease.
+        await this.gate.verifyScheduler(this.leaseId, deltas, { release: false });
+        journal.checkpoint();
+        this.totals.authorityRequests = this.client.operations.requests;
+        return {
+          apply: true,
+          periodicCanonicalPull: false,
+          noOpCommitAvoided: true,
+          predictedCanonicalWrites: 0,
+          appliedWrites: 0,
+          queuedBackupWrites: 0,
+          conflicts: 0,
+          pending: 0,
+          authorityRequests: this.client.operations.requests,
+        };
       }
       const commit = await this.client.commitPublication(this.remoteLeaseId, deltas, { retainLease: !final });
       if (commit?.deferred === true) {
@@ -748,6 +769,7 @@ export class ActivePublicationStrategy {
         // lease is already released; Home remains current/readable and app
         // mutations flush any overlapping queued key from reserved headroom.
         this.remoteLeaseId = null;
+        this.remotePendingKeys = 0;
         remoteLease = null;
         await this.gate.verifyScheduler(this.leaseId, deltas, { release: false });
         journal.checkpoint();
@@ -771,6 +793,7 @@ export class ActivePublicationStrategy {
       }
       {
         if (final) this.remoteLeaseId = null;
+        if (final) this.remotePendingKeys = 0;
         remoteLease = null;
         await this.gate.verifyScheduler(this.leaseId, deltas, { release: false });
         this.totals.batches++;
@@ -781,6 +804,7 @@ export class ActivePublicationStrategy {
         if (this.remoteLeaseId) {
           await this.client.releasePublication(this.remoteLeaseId);
           this.remoteLeaseId = null;
+          this.remotePendingKeys = 0;
         }
         await this.gate.release(this.leaseId);
         this.stopHeartbeat();
@@ -801,6 +825,7 @@ export class ActivePublicationStrategy {
       if (remoteLease) await this.client.releasePublication(remoteLease.leaseId).catch(() => {});
       if (this.remoteLeaseId) await this.client.releasePublication(this.remoteLeaseId).catch(() => {});
       this.remoteLeaseId = null;
+      this.remotePendingKeys = 0;
       const leaseId = this.leaseId;
       this.stopHeartbeat();
       this.leaseId = null;
@@ -814,6 +839,7 @@ export class ActivePublicationStrategy {
     const leaseId = this.leaseId;
     if (this.remoteLeaseId) await this.client.releasePublication(this.remoteLeaseId).catch(() => {});
     this.remoteLeaseId = null;
+    this.remotePendingKeys = 0;
     this.stopHeartbeat();
     this.leaseId = null;
     await this.gate.failLease(leaseId, reason);

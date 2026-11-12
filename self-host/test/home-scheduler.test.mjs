@@ -1563,6 +1563,36 @@ test('simultaneous API mutation and scheduler publication use global-then-local 
   ]);
 });
 
+test('empty intermediate scheduler phase retains its lease without a coordinator commit', async () => {
+  const local = new MemoryAdapter({ alpha: 'one' });
+  const gate = new FakeAuthorityGate();
+  let commits = 0;
+  const client = {
+    operations: { requests: 0, failures: 0 },
+    async acquirePublication() {
+      this.operations.requests++;
+      return { leaseId: 'remote-empty-phase-lease', result: { pendingBackupKeys: 0 } };
+    },
+    async commitPublication(_leaseId, deltas) {
+      this.operations.requests++;
+      commits++;
+      assert.deepEqual(deltas, []);
+      return { ok: true, applied: 0, deferred: false, noOp: true };
+    },
+    async releasePublication() { this.operations.requests++; },
+  };
+  const strategy = new ActivePublicationStrategy({ local, gate, client, leaseTtlMs: 10_000 });
+  await strategy.prepare();
+  const journal = new MutationJournal();
+  const first = await strategy.finish(journal, { final: false });
+  assert.equal(first.noOpCommitAvoided, true);
+  assert.equal(commits, 0);
+  const final = await strategy.finish(journal, { final: true });
+  assert.equal(final.appliedWrites, 0);
+  assert.equal(commits, 1);
+  assert.equal(gate.lease, null);
+});
+
 test('active scheduler waits for a short API lease and completes without recovery or stale authority', async (t) => {
   const dataDir = await temporaryDirectory(t);
   const { entries } = canonicalChannels(1);

@@ -7,7 +7,10 @@ test('Prometheus exposition contains aggregate labels and excludes identifiers',
     collector: {
       lastCollectionSuccess: true, errorsTotal: 0,
       lastAttemptAt: '2026-10-06T11:05:00Z', lastSuccessAt: '2026-10-06T11:05:00Z',
-      limits: { d1RowsWritten: 100000, d1RowsRead: 5000000, durableObjectRowsWritten: 100000, workerRequests: 100000 },
+      limits: {
+        d1RowsWritten: 100000, d1RowsRead: 5000000, durableObjectRowsWritten: 100000,
+        durableObjectRequests: 100000, durableObjectRequestsSafeTarget: 90000, workerRequests: 100000,
+      },
     },
     snapshot: {
       intervalStart: '2026-10-06T11:00:00Z', collection: { hostSuccess: true, cloudflareSuccess: true },
@@ -52,11 +55,18 @@ test('Prometheus exposition contains aggregate labels and excludes identifiers',
             byFamily: { 'channel-recent-videos': 4 },
             byReason: { 'metrics-only': 4 },
           },
+          requestTelemetry: {
+            total: 50, acquireContention: 2,
+            byRoute: { '/status': 10, '/acquire': 20 }, byOutcome: { success: 48, contention: 2 },
+          },
         },
       },
       cloudflare: {
         window: { workers: [{ script: 'tubepulse-api', status: 'success', requests: 5 }], d1: {}, durableObjects: {} },
-        day: { workers: [], d1: {}, durableObjects: { rowsWritten: 97398 } },
+        day: { workers: [], d1: {}, durableObjects: {
+          requests: 57000, requestsLower: 56000, requestsUpper: 58000,
+          requestsSampleSize: 1200, requestsConfidenceValid: true, rowsWritten: 97398,
+        } },
       },
     },
   });
@@ -70,6 +80,12 @@ test('Prometheus exposition contains aggregate labels and excludes identifiers',
   assert.match(metrics, /tubepulse_cloudflare_worker_requests\{period="window",script="tubepulse-api",status="success"\} 5/);
   assert.match(metrics, /tubepulse_cloudflare_do_rows_written\{period="day"\} 97398/);
   assert.match(metrics, /tubepulse_guardrail\{resource="do_rows_written_day"\} 100000/);
+  assert.match(metrics, /tubepulse_guardrail\{resource="do_requests_day"\} 100000/);
+  assert.match(metrics, /tubepulse_guardrail\{resource="do_requests_safe_target_day"\} 90000/);
+  assert.match(metrics, /tubepulse_cloudflare_do_requests\{period="day"\} 57000/);
+  assert.match(metrics, /tubepulse_cloudflare_do_requests_lower\{period="day"\} 56000/);
+  assert.match(metrics, /tubepulse_cloudflare_do_requests_upper\{period="day"\} 58000/);
+  assert.match(metrics, /tubepulse_authority_coordinator_requests_by_route_volatile\{route="\/acquire"\} 20/);
   assert.match(metrics, /tubepulse_notifications_pending 2/);
   assert.match(metrics, /tubepulse_notifications_oldest_pending_age_seconds 75/);
   assert.match(metrics, /tubepulse_notifications_durable_backlog 1/);

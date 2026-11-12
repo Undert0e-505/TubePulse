@@ -936,6 +936,47 @@ test('activity touch failure never changes a successful primary response', async
   assert.equal(status.payload.pendingBackupKeys, 0);
 });
 
+test('best-effort activity touch makes one coordinator attempt under contention', async () => {
+  const fixture = coordinatorFixture();
+  await seedCoordinator(fixture);
+  let acquireCalls = 0;
+  let activityHomeCalls = 0;
+  const realNamespace = fixture.namespace;
+  const busyNamespace = {
+    idFromName: (name) => realNamespace.idFromName(name),
+    get(id) {
+      const stub = realNamespace.get(id);
+      return { async fetch(input, init) {
+        const request = input instanceof Request ? input : new Request(input, init);
+        if (new URL(request.url).pathname === '/acquire') {
+          acquireCalls++;
+          return Response.json({ error: 'Authority lease busy' }, { status: 409 });
+        }
+        return await stub.fetch(request);
+      } };
+    },
+  };
+  const worker = createAuthorityWorker({ async fetch() { throw new Error('fallback must not run'); } }, {
+    logger: { info() {}, warn() {} }, sleep: async () => { throw new Error('activity touch must not retry'); },
+  });
+  const env = authorityEnv(fixture, async (input) => {
+    const request = input instanceof Request ? input : new Request(input);
+    if (new URL(request.url).pathname === '/_tubepulse/authority/feed') {
+      return Response.json({ channels: [], source: 'home' });
+    }
+    activityHomeCalls++;
+    return Response.json({ error: 'unexpected' }, { status: 500 });
+  }, { TUBEPULSE_AUTHORITY_COORDINATOR: busyNamespace });
+  const context = capturingContext();
+  const response = await worker.fetch(new Request('https://api.example.test/feed', {
+    headers: { Authorization: `Bearer ${DEVICE}` },
+  }), env, context);
+  assert.equal(response.status, 200);
+  await context.flush();
+  assert.equal(acquireCalls, 1);
+  assert.equal(activityHomeCalls, 0);
+});
+
 test('unauthenticated, unknown and internal routes do not schedule activity touches', async () => {
   const fixture = coordinatorFixture();
   await seedCoordinator(fixture);
@@ -999,6 +1040,64 @@ test('feed seqlock discards a response spanning a canonical version change and r
   assert.equal(response.status, 200);
   assert.equal((await response.json()).attempt, 2);
   assert.equal(appCalls, 2);
+});
+
+test('feed seqlock is bounded to three attempts under continuous version churn', async () => {
+  const fixture = coordinatorFixture();
+  await seedCoordinator(fixture);
+  await callCoordinator(fixture.coordinator, '/stale', { reason: 'force-canonical-fallback' });
+  let appCalls = 0;
+  const waits = [];
+  const worker = createAuthorityWorker({
+    async fetch() {
+      appCalls++;
+      const state = fixture.storage.values.get('authority:state');
+      fixture.storage.values.set('authority:state', {
+        ...state, canonicalVersion: Number(state.canonicalVersion || 0) + 1,
+      });
+      return Response.json({ channels: [], attempt: appCalls });
+    },
+  }, { logger: { info() {}, warn() {} }, sleep: async (ms) => waits.push(ms), random: () => 0 });
+  const response = await worker.fetch(new Request('https://api.example.test/feed', {
+    headers: { Authorization: `Bearer ${DEVICE}` },
+  }), authorityEnv(fixture, async () => { throw new Error('stale Home must not be called'); }), {});
+  assert.equal(response.status, 503);
+  assert.equal(appCalls, 3);
+  assert.deepEqual(waits, [100, 200]);
+});
+
+test('state-changing app mutation makes at most four jittered contention attempts', async () => {
+  const fixture = coordinatorFixture();
+  await seedCoordinator(fixture);
+  let acquireCalls = 0;
+  let homeCalls = 0;
+  const waits = [];
+  const realNamespace = fixture.namespace;
+  const busyNamespace = {
+    idFromName: (name) => realNamespace.idFromName(name),
+    get(id) {
+      const stub = realNamespace.get(id);
+      return { async fetch(input, init) {
+        const request = input instanceof Request ? input : new Request(input, init);
+        if (new URL(request.url).pathname === '/acquire') {
+          acquireCalls++;
+          return Response.json({ error: 'Authority lease busy' }, { status: 409 });
+        }
+        return await stub.fetch(request);
+      } };
+    },
+  };
+  const worker = createAuthorityWorker({ async fetch() { throw new Error('handler must not run'); } }, {
+    logger: { info() {}, warn() {} }, sleep: async (ms) => waits.push(ms), random: () => 0,
+  });
+  const response = await worker.fetch(appRequest('/seen'), authorityEnv(fixture, async () => {
+    homeCalls++;
+    return Response.json({ ok: true });
+  }, { TUBEPULSE_AUTHORITY_COORDINATOR: busyNamespace }), {});
+  assert.equal(response.status, 503);
+  assert.equal(acquireCalls, 4);
+  assert.deepEqual(waits, [100, 200, 400]);
+  assert.equal(homeCalls, 0);
 });
 
 test('authenticated mutations use Home responses and durably defer exact Cloudflare backup', async () => {
@@ -1427,7 +1526,43 @@ test('read-only status does not durably rewrite quota or request counters', asyn
   const status = await callCoordinator(fixture.coordinator, '/status', undefined, 'GET');
   assert.equal(status.response.status, 200);
   assert.equal(status.payload.quota.doRequests, 0);
+  assert.equal(status.payload.requestTelemetry.persistence, 'volatile');
+  assert.equal(status.payload.requestTelemetry.total, 0);
+  const next = await callCoordinator(fixture.coordinator, '/status', undefined, 'GET');
+  assert.equal(next.payload.requestTelemetry.total, 1);
+  assert.equal(next.payload.requestTelemetry.byRoute['/status'], 1);
+  assert.equal(next.payload.requestTelemetry.byOutcome.success, 1);
+  assert.doesNotMatch(JSON.stringify(next.payload.requestTelemetry), /device|channel|token|UC[A-Za-z0-9_-]{20}/i);
   assert.equal(fixture.storage.mutations.length, 0);
+});
+
+test('empty retained and final commits avoid transaction and packed-baseline rewrites', async () => {
+  const fixture = d1CoordinatorFixture();
+  fixture.database.backend = { active_generation: 'production-v1' };
+  fixture.storage.values.set('authority:state', {
+    schemaVersion: 1, status: 'current', reason: 'reconciled', generation: 1,
+    canonicalVersion: 0, seeded: true, backend: 'd1', backendGeneration: 'production-v1',
+  });
+  await callCoordinator(fixture.coordinator, '/acquire', {
+    leaseId: 'empty-publication-lease-01', kind: 'publication',
+  });
+  fixture.storage.mutations.length = 0;
+  let result = await callCoordinator(fixture.coordinator, '/commit', {
+    leaseId: 'empty-publication-lease-01', deltas: [], retainLease: true,
+  });
+  assert.equal(result.payload.noOp, true);
+  assert.equal(result.payload.retainedLease, true);
+  assert.equal(fixture.storage.values.has('authority:lease'), true);
+  assert.equal(fixture.storage.values.has('authority:transaction'), false);
+  assert.equal(fixture.storage.mutations.length, 0);
+
+  result = await callCoordinator(fixture.coordinator, '/commit', {
+    leaseId: 'empty-publication-lease-01', deltas: [], retainLease: false,
+  });
+  assert.equal(result.payload.noOp, true);
+  assert.equal(fixture.storage.values.has('authority:lease'), false);
+  assert.equal(fixture.storage.values.has('authority:transaction'), false);
+  assert.deepEqual(fixture.storage.mutations, [{ operation: 'delete', keys: ['authority:lease'] }]);
 });
 
 test('oversized packed baseline and transaction values fail before canonical mutation', async () => {

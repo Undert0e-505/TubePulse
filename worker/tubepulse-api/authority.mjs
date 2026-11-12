@@ -190,6 +190,44 @@ export class TubePulseAuthorityCoordinator {
     this.state = state;
     this.env = env;
     this.packedBaseline = null;
+    // Volatile, privacy-safe diagnostics only. This deliberately lives in
+    // isolate memory: persisting request accounting would itself consume the
+    // Durable Object storage quota we are trying to protect. It resets on
+    // eviction/deploy and is therefore an operational sample, not billing.
+    this.requestTelemetry = {
+      startedAt: new Date().toISOString(),
+      total: 0,
+      byRoute: {},
+      byOutcome: {},
+      acquireContention: 0,
+    };
+  }
+
+  recordRequest(pathname, status) {
+    const route = new Set([
+      '/status', '/acquire', '/release', '/commit', '/snapshot', '/activate',
+      '/stale', '/recover', '/backend-migration/begin',
+      '/backend-migration/chunk', '/backend-migration/commit',
+    ]).has(pathname) ? pathname : 'other';
+    const outcome = status === 409 ? 'contention'
+      : status >= 500 ? 'server-error'
+        : status >= 400 ? 'rejected' : 'success';
+    this.requestTelemetry.total++;
+    this.requestTelemetry.byRoute[route] = (this.requestTelemetry.byRoute[route] || 0) + 1;
+    this.requestTelemetry.byOutcome[outcome] = (this.requestTelemetry.byOutcome[outcome] || 0) + 1;
+    if (route === '/acquire' && status === 409) this.requestTelemetry.acquireContention++;
+  }
+
+  requestTelemetrySnapshot() {
+    return {
+      scope: 'current-durable-object-instance',
+      persistence: 'volatile',
+      startedAt: this.requestTelemetry.startedAt,
+      total: this.requestTelemetry.total,
+      byRoute: { ...this.requestTelemetry.byRoute },
+      byOutcome: { ...this.requestTelemetry.byOutcome },
+      acquireContention: this.requestTelemetry.acquireContention,
+    };
   }
 
   async readJson(request) {
@@ -789,6 +827,15 @@ export class TubePulseAuthorityCoordinator {
         }
       }
 
+      if (appliedDeltas.length === 0) {
+        const retainLease = lease.kind === 'publication' && payload.retainLease === true;
+        if (!retainLease) await this.state.storage.delete(LEASE_KEY);
+        return json({
+          ok: true, applied: 0, incoming: deltas.length, deferred: false,
+          noOp: true, retainedLease: retainLease,
+        });
+      }
+
       if (lease.kind === 'home-api') {
         const retained = new Set([...pending.values()].map(({ storageKey }) => storageKey));
         const removed = before.map(({ storageKey }) => storageKey).filter((key) => !retained.has(key));
@@ -839,6 +886,23 @@ export class TubePulseAuthorityCoordinator {
         await this.state.storage.delete(LEASE_KEY);
         return json({ error: 'Canonical app-write reserve exhausted', reason: 'hard-cap' }, 429);
       }
+    }
+
+    // A leased empty batch has no canonical effect. Avoid creating and then
+    // deleting a transaction journal (and rewriting the packed baseline) for
+    // it. A retained publication lease remains held for the notification
+    // phase; otherwise releasing it is the only required durable mutation.
+    if (appliedDeltas.length === 0) {
+      const retainLease = lease.kind === 'publication' && payload.retainLease === true;
+      if (!retainLease) await this.state.storage.delete(LEASE_KEY);
+      return json({
+        ok: true,
+        applied: 0,
+        incoming: deltas.length,
+        deferred: false,
+        noOp: true,
+        retainedLease: retainLease,
+      });
     }
 
     const transaction = {
@@ -1190,33 +1254,40 @@ export class TubePulseAuthorityCoordinator {
         legacyKvFrozen: identity.backend === 'd1',
       },
       quota: { ...quota, limits: this.quotaLimits(), resetsAt: reset.toISOString() },
+      requestTelemetry: this.requestTelemetrySnapshot(),
     });
   }
 
   async fetch(request) {
+    let pathname = 'other';
+    let response;
     try {
       const url = new URL(request.url);
-      if (request.method === 'GET' && url.pathname === '/status') return await this.status();
-      if (request.method !== 'POST') return json({ error: 'Method not allowed' }, 405);
+      pathname = url.pathname;
+      if (request.method === 'GET' && url.pathname === '/status') response = await this.status();
+      else if (request.method !== 'POST') response = json({ error: 'Method not allowed' }, 405);
+      else {
       const payload = await this.readJson(request);
-      if (url.pathname === '/acquire') return await this.acquire(payload);
-      if (url.pathname === '/release') return await this.release(payload);
-      if (url.pathname === '/stale') return await this.markStale(payload);
-      if (url.pathname === '/commit') return await this.commit(payload);
-      if (url.pathname === '/snapshot') return await this.snapshot(payload);
-      if (url.pathname === '/activate') return await this.activate(payload);
-      if (url.pathname === '/backend-migration/begin') return await this.beginBackendMigration(payload);
-      if (url.pathname === '/backend-migration/chunk') return await this.appendBackendMigration(payload);
-      if (url.pathname === '/backend-migration/commit') return await this.commitBackendMigration(payload);
-      if (url.pathname === '/recover') {
+      if (url.pathname === '/acquire') response = await this.acquire(payload);
+      else if (url.pathname === '/release') response = await this.release(payload);
+      else if (url.pathname === '/stale') response = await this.markStale(payload);
+      else if (url.pathname === '/commit') response = await this.commit(payload);
+      else if (url.pathname === '/snapshot') response = await this.snapshot(payload);
+      else if (url.pathname === '/activate') response = await this.activate(payload);
+      else if (url.pathname === '/backend-migration/begin') response = await this.beginBackendMigration(payload);
+      else if (url.pathname === '/backend-migration/chunk') response = await this.appendBackendMigration(payload);
+      else if (url.pathname === '/backend-migration/commit') response = await this.commitBackendMigration(payload);
+      else if (url.pathname === '/recover') {
         const result = await this.recoverTransaction();
-        return json({ ok: true, result });
+        response = json({ ok: true, result });
+      } else response = json({ error: 'Not found' }, 404);
       }
-      return json({ error: 'Not found' }, 404);
     } catch (error) {
       const status = error?.message === 'body-too-large' ? 413 : 400;
-      return json({ error: status === 413 ? 'Request too large' : 'Invalid authority request' }, status);
+      response = json({ error: status === 413 ? 'Request too large' : 'Invalid authority request' }, status);
     }
+    this.recordRequest(pathname, response.status);
+    return response;
   }
 }
 
@@ -1515,6 +1586,13 @@ async function coordinatorRequest(env, pathname, body, method = 'POST') {
   return { response, payload: await response.clone().json().catch(() => null) };
 }
 
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function boundedRetryDelay(attempt, random = Math.random) {
+  const base = Math.min(500, 100 * (2 ** Math.max(0, attempt - 1)));
+  return base + Math.floor(base * 0.25 * Math.max(0, Math.min(1, Number(random()) || 0)));
+}
+
 async function signedHeaders(config, { requestId, operation, method, target, authorization = '', body = '' }) {
   const timestamp = Date.now();
   const bodyDigest = await authoritySha256(body);
@@ -1601,20 +1679,36 @@ async function verifyAuthorityRequest(config, request, bodyText, expectedOperati
   return true;
 }
 
-async function acquireCoordinatorLease(env, leaseId, kind, timeoutMs, options = {}) {
-  const deadline = Date.now() + timeoutMs;
-  do {
+async function acquireCoordinatorLease(env, leaseId, kind, timeoutMs, leaseOptions = {}, retry = {}) {
+  const now = retry.now || Date.now;
+  const sleep = retry.sleep || delay;
+  const random = retry.random || Math.random;
+  const maxAttempts = Math.max(1, Math.min(4, Number(retry.maxAttempts) || 4));
+  const deadline = now() + timeoutMs;
+  let contention = 0;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const result = await coordinatorRequest(env, '/acquire', {
       leaseId,
       kind,
       ttlMs: Math.max(30_000, timeoutMs * 3),
-      ...options,
+      ...leaseOptions,
     });
-    if (result.response.ok) return result;
-    if (result.response.status !== 409) return result;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  } while (Date.now() < deadline);
-  return { response: new Response(null, { status: 409 }), payload: { error: 'Authority lease busy' } };
+    if (result.response.ok || result.response.status !== 409) {
+      return { ...result, attempts: attempt, retries: attempt - 1, contention };
+    }
+    contention++;
+    if (attempt >= maxAttempts) break;
+    const waitMs = boundedRetryDelay(attempt, random);
+    if (now() + waitMs >= deadline) break;
+    await sleep(waitMs);
+  }
+  return {
+    response: new Response(null, { status: 409 }),
+    payload: { error: 'Authority lease busy' },
+    attempts: contention,
+    retries: Math.max(0, contention - 1),
+    contention,
+  };
 }
 
 async function coordinatorReadVersion(env) {
@@ -1632,10 +1726,16 @@ function withAuthorityRoute(response, route) {
   return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
 }
 
-async function canonicalFeedWithVersionRetry(appWorker, request, env, ctx, timeoutMs, initialStatus = undefined) {
-  const deadline = Date.now() + timeoutMs;
+async function canonicalFeedWithVersionRetry(
+  appWorker, request, env, ctx, timeoutMs, initialStatus = undefined, retry = {},
+) {
+  const now = retry.now || Date.now;
+  const sleep = retry.sleep || delay;
+  const random = retry.random || Math.random;
+  const maxAttempts = Math.max(1, Math.min(3, Number(retry.maxAttempts) || 3));
+  const deadline = now() + timeoutMs;
   let beforeResult = initialStatus;
-  do {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     if (beforeResult === undefined) {
       try { beforeResult = await coordinatorRequest(env, '/status', undefined, 'GET'); }
       catch {
@@ -1652,23 +1752,34 @@ async function canonicalFeedWithVersionRetry(appWorker, request, env, ctx, timeo
       return json({ error: 'Canonical fallback is temporarily unavailable' }, 503);
     }
     if (!Number.isSafeInteger(before) || before < 0) {
-      await new Promise((resolve) => setTimeout(resolve, 25));
+      if (attempt >= maxAttempts) break;
+      const waitMs = boundedRetryDelay(attempt, random);
+      if (now() + waitMs >= deadline) break;
+      await sleep(waitMs);
       beforeResult = undefined;
       continue;
     }
     const candidate = await appWorker.fetch(request, env, ctx);
     const after = await coordinatorReadVersion(env);
     if (after !== null && before === after) return withAuthorityRoute(candidate, 'cloudflare');
+    if (attempt >= maxAttempts) break;
+    const waitMs = boundedRetryDelay(attempt, random);
+    if (now() + waitMs >= deadline) break;
+    await sleep(waitMs);
     beforeResult = undefined;
-  } while (Date.now() < deadline);
+  }
   return json({ error: 'Canonical feed is temporarily unavailable' }, 503);
 }
 
-async function coordinateActivityTouch(config, env, authorization) {
+async function coordinateActivityTouch(config, env, authorization, retry = {}) {
   const leaseId = crypto.randomUUID();
   let acquired;
   try {
-    acquired = await acquireCoordinatorLease(env, leaseId, 'home-api', config.timeoutMs);
+    // Activity freshness is best effort. A busy authority must never turn one
+    // feed read into a contention spin or affect the successful response.
+    acquired = await acquireCoordinatorLease(
+      env, leaseId, 'home-api', config.timeoutMs, {}, { ...retry, maxAttempts: 1 },
+    );
   } catch {
     throw new Error('activity-coordinator-unavailable');
   }
@@ -1737,6 +1848,12 @@ export function createAuthorityWorker(appWorker, options = {}) {
   const logger = options.logger || console;
   const activityTouchInFlight = new Map();
   const activityTouchNotBefore = new Map();
+  const retryControl = {
+    sleep: options.sleep || delay,
+    random: options.random || Math.random,
+    now: options.now || Date.now,
+  };
+  const telemetry = (event) => logger.info?.(`[TubePulse coordinator] ${JSON.stringify(event)}`);
   return {
     async fetch(request, env, ctx) {
       const config = readAuthorityConfig(env);
@@ -1813,13 +1930,14 @@ export function createAuthorityWorker(appWorker, options = {}) {
 
         const now = Date.now();
         if ((activityTouchNotBefore.get(deviceId) || 0) > now || activityTouchInFlight.has(deviceId)) return response;
-        const touch = coordinateActivityTouch(config, env, authorization)
+        const touch = coordinateActivityTouch(config, env, authorization, retryControl)
           .then((result) => {
             if (result.profilePresent && result.retryAfterMs > 0) {
               activityTouchNotBefore.set(deviceId, Date.now() + result.retryAfterMs);
             }
           })
           .catch(() => {
+            telemetry({ family: 'activity-touch', outcome: 'skipped-best-effort', maxAttempts: 1 });
             logger.warn?.('[TubePulse authority] best-effort activity touch skipped');
           })
           .finally(() => activityTouchInFlight.delete(deviceId));
@@ -1840,7 +1958,9 @@ export function createAuthorityWorker(appWorker, options = {}) {
       if (route === 'GET /feed') {
         let status;
         try { status = await coordinatorRequest(env, '/status', undefined, 'GET'); } catch {
-          return await canonicalFeedWithVersionRetry(appWorker, request, env, ctx, config.timeoutMs);
+          return await canonicalFeedWithVersionRetry(
+            appWorker, request, env, ctx, config.timeoutMs, undefined, retryControl,
+          );
         }
         const homeCurrent = status.response.ok
           && !status.payload?.transaction
@@ -1862,7 +1982,9 @@ export function createAuthorityWorker(appWorker, options = {}) {
             }
           } catch { /* bounded canonical fallback below */ }
         }
-        return withActivityTouch(await canonicalFeedWithVersionRetry(appWorker, request, appEnv, ctx, config.timeoutMs, status));
+        return withActivityTouch(await canonicalFeedWithVersionRetry(
+          appWorker, request, appEnv, ctx, config.timeoutMs, status, retryControl,
+        ));
       }
 
       if (!AUTHORITY_MUTATIONS.has(route)) return withActivityTouch(await appWorker.fetch(request, appEnv, ctx));
@@ -1878,13 +2000,21 @@ export function createAuthorityWorker(appWorker, options = {}) {
       const leaseId = crypto.randomUUID();
       let acquired;
       try {
-        acquired = await acquireCoordinatorLease(env, leaseId, 'home-api', config.timeoutMs);
+        acquired = await acquireCoordinatorLease(
+          env, leaseId, 'home-api', config.timeoutMs, {}, retryControl,
+        );
       } catch {
         // The DO is the only global ordering primitive. Continuing a write
         // while it is unreachable could let Home publish over an unseen app
         // mutation after the DO recovers, so this narrow failure is fail-closed.
         return json({ error: 'Canonical mutation coordinator unavailable' }, 503);
       }
+      telemetry({
+        family: 'app-mutation-acquire',
+        outcome: acquired.response.ok ? 'success' : acquired.response.status === 409 ? 'contention' : 'rejected',
+        attempts: acquired.attempts || 1,
+        retries: acquired.retries || 0,
+      });
       if (!acquired.response.ok) return json({ error: 'Canonical mutation coordinator unavailable' }, 503);
 
       let home;
@@ -1931,6 +2061,7 @@ export function createAuthorityWorker(appWorker, options = {}) {
       }
       let committed;
       try {
+        if (!deltas.length) telemetry({ family: 'app-mutation', outcome: 'no-op-commit-avoided' });
         committed = deltas.length
           ? await coordinatorRequest(env, '/commit', { leaseId, deltas })
           : await coordinatorRequest(env, '/release', { leaseId });

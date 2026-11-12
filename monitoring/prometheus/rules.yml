@@ -8,6 +8,12 @@ groups:
         expr: tubepulse_cloudflare_d1_rows_read{period="day"}
       - record: tubepulse:do_rows_written_day
         expr: tubepulse_cloudflare_do_rows_written{period="day"}
+      - record: tubepulse:do_requests_day
+        expr: tubepulse_cloudflare_do_requests{period="day"}
+      - record: tubepulse:do_requests_lower_day
+        expr: tubepulse_cloudflare_do_requests_lower{period="day"}
+      - record: tubepulse:do_requests_upper_day
+        expr: tubepulse_cloudflare_do_requests_upper{period="day"}
       - record: tubepulse:worker_requests_day
         expr: sum(tubepulse_cloudflare_worker_requests{period="day"})
       - record: tubepulse:d1_write_budget_ratio
@@ -16,12 +22,24 @@ groups:
         expr: tubepulse:d1_rows_read_day / on() tubepulse_guardrail{resource="d1_rows_read_day"}
       - record: tubepulse:do_write_budget_ratio
         expr: tubepulse:do_rows_written_day / on() tubepulse_guardrail{resource="do_rows_written_day"}
+      - record: tubepulse:do_request_official_budget_ratio
+        expr: tubepulse:do_requests_day / on() tubepulse_guardrail{resource="do_requests_day"}
+      - record: tubepulse:do_request_safe_budget_ratio
+        expr: tubepulse:do_requests_day / on() tubepulse_guardrail{resource="do_requests_safe_target_day"}
       - record: tubepulse:worker_request_budget_ratio
         expr: tubepulse:worker_requests_day / on() tubepulse_guardrail{resource="worker_requests_day"}
       - record: tubepulse:d1_write_projected_end_of_day
         expr: tubepulse:d1_rows_written_day / scalar(clamp_min(vector((time() % 86400) / 86400), 0.0416667))
       - record: tubepulse:do_write_projected_end_of_day
         expr: tubepulse:do_rows_written_day / scalar(clamp_min(vector((time() % 86400) / 86400), 0.0416667))
+      - record: tubepulse:do_request_projected_end_of_day
+        expr: tubepulse:do_requests_day / scalar(clamp_min(vector((time() % 86400) / 86400), 0.125))
+      - record: tubepulse:do_request_safe_projection_ratio
+        expr: tubepulse:do_request_projected_end_of_day / on() tubepulse_guardrail{resource="do_requests_safe_target_day"}
+      - record: tubepulse:do_request_warning_state
+        expr: (sum(tubepulse:do_requests_day) >= bool 75000) or (((time() % 86400) >= bool 10800) * (sum(tubepulse:do_request_projected_end_of_day) >= bool 75000))
+      - record: tubepulse:do_request_critical_state
+        expr: (sum(tubepulse:do_requests_day) >= bool 90000) or (((time() % 86400) >= bool 10800) * (sum(tubepulse:do_request_projected_end_of_day) >= bool 90000)) or (sum(tubepulse_cloudflare_do_errors{period="window"}) > bool 0)
       - alert: TubePulseCollectorDown
         expr: up{job="tubepulse-aggregate-collector"} == 0
         for: 10m
@@ -72,6 +90,16 @@ groups:
         for: 5m
         labels: { severity: critical }
         annotations: { summary: "TubePulse Durable Objects daily rows-written usage or projection exceeds 90% of the configured guardrail" }
+      - alert: TubePulseDurableObjectRequestBudgetWarning
+        expr: tubepulse:do_request_warning_state > 0
+        for: 10m
+        labels: { severity: warning }
+        annotations: { summary: "TubePulse Durable Objects compute requests reached or credibly project above 75,000 today" }
+      - alert: TubePulseDurableObjectRequestBudgetCritical
+        expr: tubepulse:do_request_critical_state > 0
+        for: 5m
+        labels: { severity: critical }
+        annotations: { summary: "TubePulse Durable Objects compute requests reached or credibly project above 90,000, or Cloudflare reported an error" }
       - alert: TubePulseWorkerRequestBudgetWarning
         expr: tubepulse:worker_request_budget_ratio > 0.75
         for: 10m

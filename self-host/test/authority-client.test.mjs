@@ -79,6 +79,7 @@ test('publication acquisition retries a transient coordinator lease conflict', a
   const client = new AuthorityClient({
     baseUrl: 'https://api.example.test', secret: SECRET,
     sleep: async (ms) => { waits.push(ms); },
+    random: () => 0,
     fetchImpl: async () => {
       calls++;
       if (calls === 1) return Response.json({ error: 'Authority lease busy' }, { status: 409 });
@@ -88,7 +89,23 @@ test('publication acquisition retries a transient coordinator lease conflict', a
   const acquired = await client.acquirePublication();
   assert.match(acquired.leaseId, /^home-/);
   assert.equal(calls, 2);
-  assert.deepEqual(waits, [50]);
+  assert.deepEqual(waits, [100]);
+});
+
+test('publication acquisition stops after four bounded contention attempts', async () => {
+  let calls = 0;
+  const waits = [];
+  const client = new AuthorityClient({
+    baseUrl: 'https://api.example.test', secret: SECRET,
+    sleep: async (ms) => { waits.push(ms); }, random: () => 0,
+    fetchImpl: async () => {
+      calls++;
+      return Response.json({ error: 'Authority lease busy' }, { status: 409 });
+    },
+  });
+  await assert.rejects(() => client.acquirePublication(), /Authority acquire rejected/);
+  assert.equal(calls, 4);
+  assert.deepEqual(waits, [100, 200, 400]);
 });
 
 test('pending drain uses an API lease, flushes all pending, and releases it', async () => {

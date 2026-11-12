@@ -10,6 +10,9 @@ import {
 test('collector config treats Durable Objects rows written as a separate daily guardrail', () => {
   assert.equal(loadConfig({}).limits.durableObjectRowsWritten, 100_000);
   assert.equal(loadConfig({ TUBEPULSE_DO_ROWS_WRITTEN_GUARDRAIL: '75000' }).limits.durableObjectRowsWritten, 75_000);
+  assert.equal(loadConfig({}).limits.durableObjectRequests, 100_000);
+  assert.equal(loadConfig({}).limits.durableObjectRequestsSafeTarget, 90_000);
+  assert.equal(loadConfig({ TUBEPULSE_DO_REQUEST_SAFE_TARGET: '55000' }).limits.durableObjectRequestsSafeTarget, 55_000);
 });
 
 const jsonResponse = (value, status = 200) => new Response(JSON.stringify(value), {

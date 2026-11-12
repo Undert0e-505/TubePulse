@@ -25,7 +25,11 @@ test('parser keeps TubePulse script aggregates and sums D1 and Durable Object us
     quantiles: { cpuTimeP50: 10, cpuTimeP99: 20 },
   });
   const d1 = { sum: { readQueries: 2, writeQueries: 3, rowsRead: 4, rowsWritten: 5, queryBatchResponseBytes: 6 } };
-  const invocation = { dimensions: { status: 'success' }, sum: { requests: 7, errors: 1, wallTime: 8 }, quantiles: { cpuTimeP50: 9, cpuTimeP99: 10 } };
+  const invocation = {
+    dimensions: { status: 'success' }, sum: { requests: 7, errors: 1, wallTime: 8 },
+    quantiles: { cpuTimeP50: 9, cpuTimeP99: 10 },
+    confidence: { sum: { requests: { estimate: 7, lower: 6, upper: 8, sampleSize: 5, isValid: true } } },
+  };
   const periodic = { dimensions: { name: 'coordinator' }, sum: { activeTime: 11, duration: 12, rowsRead: 13, rowsWritten: 14, storageReadUnits: 15, storageWriteUnits: 16, storageDeletes: 17, subrequests: 18 } };
   const account = {
     workerWindow: [worker('tubepulse-api', 20), worker('unrelated-worker', 999)],
@@ -39,6 +43,9 @@ test('parser keeps TubePulse script aggregates and sums D1 and Durable Object us
   assert.equal(parsed.window.workers[0].script, 'tubepulse-api');
   assert.equal(parsed.window.d1.rowsWritten, 10);
   assert.equal(parsed.window.durableObjects.rowsWritten, 14);
+  assert.equal(parsed.window.durableObjects.requestsLower, 6);
+  assert.equal(parsed.window.durableObjects.requestsUpper, 8);
+  assert.equal(parsed.window.durableObjects.requestsConfidenceValid, true);
   assert.equal(parsed.d1StorageBytes, 100);
   assert.equal(parsed.durableObjectStorageBytes, 200);
   assert.match(parsed.analyticsNote, /Durable Object periodic\/storage usage is account-wide/);

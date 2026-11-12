@@ -15,6 +15,12 @@ const PUBLICATION_MUTATION_REASONS = [
   'post-observation-metadata-only', 'community-content-cache', 'dedupe-watermark',
   'notification-state', 'token-cache', 'channel-metadata', 'first-run-suppression', 'state',
 ];
+const COORDINATOR_TELEMETRY_ROUTES = [
+  '/status', '/acquire', '/release', '/commit', '/snapshot', '/activate', '/stale',
+  '/recover', '/backend-migration/begin', '/backend-migration/chunk',
+  '/backend-migration/commit', 'other',
+];
+const COORDINATOR_TELEMETRY_OUTCOMES = ['success', 'contention', 'rejected', 'server-error'];
 
 function finite(value, fallback = 0) {
   const number = Number(value);
@@ -411,6 +417,15 @@ export async function collectAggregateMonitoring({
         uniqueKeys: Math.max(0, finite(lastSweep.mutations?.uniqueKeys)),
         byFamily: allowlistedCounts(lastSweep.mutations?.byFamily, PUBLICATION_MUTATION_FAMILIES),
         byReason: allowlistedCounts(lastSweep.mutations?.byReason, PUBLICATION_MUTATION_REASONS),
+      },
+      requestTelemetry: {
+        scope: remoteStatus?.requestTelemetry?.scope || 'unavailable',
+        persistence: remoteStatus?.requestTelemetry?.persistence || 'volatile',
+        startedAt: remoteStatus?.requestTelemetry?.startedAt || null,
+        total: Math.max(0, finite(remoteStatus?.requestTelemetry?.total)),
+        acquireContention: Math.max(0, finite(remoteStatus?.requestTelemetry?.acquireContention)),
+        byRoute: allowlistedCounts(remoteStatus?.requestTelemetry?.byRoute, COORDINATOR_TELEMETRY_ROUTES),
+        byOutcome: allowlistedCounts(remoteStatus?.requestTelemetry?.byOutcome, COORDINATOR_TELEMETRY_OUTCOMES),
       },
       resetsAt: remoteQuota.resetsAt || null,
     },

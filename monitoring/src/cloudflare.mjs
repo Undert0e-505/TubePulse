@@ -21,7 +21,7 @@ export function buildCloudflareQuery({ accountId, d1DatabaseId, workerScript, wi
   const dayStart = new Date(Date.UTC(endDate.getUTCFullYear(), endDate.getUTCMonth(), endDate.getUTCDate())).toISOString();
   const workerFields = 'dimensions { scriptName status } sum { requests errors subrequests } quantiles { cpuTimeP50 cpuTimeP99 }';
   const d1Fields = 'sum { readQueries writeQueries rowsRead rowsWritten queryBatchResponseBytes }';
-  const doInvocationFields = 'dimensions { status } sum { requests errors wallTime } quantiles { cpuTimeP50 cpuTimeP99 }';
+  const doInvocationFields = 'dimensions { status } sum { requests errors wallTime } quantiles { cpuTimeP50 cpuTimeP99 } confidence(level: 0.95) { level sum { requests { estimate lower upper sampleSize isValid } } }';
   const doPeriodicFields = 'dimensions { name } sum { activeTime cpuTime duration rowsRead rowsWritten storageDeletes storageReadUnits storageWriteUnits subrequests }';
   return `query TubePulseOperations {
     viewer { accounts(filter: { accountTag: "${account}" }) {
@@ -65,8 +65,17 @@ function d1(rows) {
 }
 
 function durableObjects(invocations, periodic) {
+  const requestConfidence = (invocations || []).map((row) => row?.confidence?.sum?.requests);
+  const confidenceValid = requestConfidence.length > 0
+    && requestConfidence.every((entry) => entry?.isValid === true);
   return {
     requests: sumRows(invocations, 'requests'),
+    requestsLower: confidenceValid
+      ? requestConfidence.reduce((total, entry) => total + number(entry.lower), 0) : 0,
+    requestsUpper: confidenceValid
+      ? requestConfidence.reduce((total, entry) => total + number(entry.upper), 0) : 0,
+    requestsSampleSize: requestConfidence.reduce((total, entry) => total + number(entry?.sampleSize), 0),
+    requestsConfidenceValid: confidenceValid,
     errors: sumRows(invocations, 'errors'),
     wallTimeMilliseconds: sumRows(invocations, 'wallTime'),
     cpuP50Microseconds: Math.max(0, ...(invocations || []).map((row) => number(row.quantiles?.cpuTimeP50))),
