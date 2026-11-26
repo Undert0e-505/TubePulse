@@ -55,6 +55,26 @@ groups:
         for: 10m
         labels: { severity: critical }
         annotations: { summary: "TubePulse host authority is not ready/current" }
+      - alert: TubePulseLocalBlobIntegrityFailure
+        expr: tubepulse_monitoring_capability{capability="localKvIntegrity"} == 1 and (tubepulse_host_local_blob_integrity_healthy == 0 or tubepulse_host_local_blob_integrity_issues > 0)
+        for: 1m
+        labels: { severity: critical }
+        annotations: { summary: "TubePulse Home local KV byte integrity is not proven" }
+      - alert: TubePulseHomeFeedFailure
+        expr: tubepulse_monitoring_capability{capability="homeFeedHealth"} == 1 and (tubepulse_host_feed_healthy == 0 or tubepulse_host_feed_consecutive_failures > 0)
+        for: 1m
+        labels: { severity: critical }
+        annotations: { summary: "TubePulse Home feed is returning server errors" }
+      - alert: TubePulseVisibilityBarrierSuppression
+        expr: tubepulse_monitoring_capability{capability="notificationVisibility"} == 1 and (tubepulse_notifications_barrier_healthy == 0 or tubepulse_notifications_suppressed > 0)
+        for: 1m
+        labels: { severity: critical }
+        annotations: { summary: "TubePulse notification visibility barrier is suppressing delivery" }
+      - alert: TubePulseDurableIntentOverdue
+        expr: tubepulse_monitoring_capability{capability="durableNotificationIntent"} == 1 and tubepulse_notifications_durable_backlog > 0
+        for: 1m
+        labels: { severity: critical }
+        annotations: { summary: "TubePulse has overdue durable notification intents" }
       - alert: TubePulseSchedulerStale
         expr: tubepulse_host_scheduler_progress_age_seconds > 900
         for: 5m

@@ -260,6 +260,80 @@ class MemoryKv {
   async delete(key) { this.values.delete(key); }
 }
 
+test('a pending notification outranks recovery backlog until canonical publication completes', async (t) => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tubepulse-pending-revalidation-'));
+  t.after(() => fs.rm(dataDir, { recursive: true, force: true }));
+  const now = Date.parse('2026-11-24T20:15:00Z');
+  const channels = Array.from({ length: 6 }, (_, index) => `UC${String(index).padStart(22, '0')}`);
+  const pendingChannel = channels.at(-1);
+  const stateFile = createHomeSchedulerStateFile(dataDir, 'active');
+  const state = await stateFile.read();
+  state.youtubeDataApi = normalizeYoutubeDataApiState(null, now);
+  for (const [index, channelId] of channels.entries()) {
+    state.youtubeDataApi.channels[channelId] = {
+      uploadsPlaylistId: `UU${channelId.slice(2)}`,
+      videoCount: 10,
+      lastReconciledAt: new Date(now - (index + 1) * 60_000).toISOString(),
+      ...(index < 5 ? { recoveryRevalidationAt: new Date(now - 60_000).toISOString() } : {}),
+    };
+  }
+  await stateFile.write(state);
+  const kv = new MemoryKv({
+    'channels:active': channels,
+    ...Object.fromEntries(channels.map((channelId) => [
+      `channel:${channelId}:known:videos`,
+      { ids: ['knownvideo01'], highWatermarkAt: '2026-11-24T19:00:00Z', highWatermarkIds: ['knownvideo01'] },
+    ])),
+  });
+  const playlistCalls = [];
+  const api = {
+    async listChannels(ids) {
+      return { items: ids.map((id) => ({
+        id, statistics: { videoCount: '10' },
+        contentDetails: { relatedPlaylists: { uploads: `UU${id.slice(2)}` } },
+      })) };
+    },
+    async listPlaylistItems(playlistId) { playlistCalls.push(playlistId); return { items: [] }; },
+    async listVideoDetails() { return { items: [] }; },
+    async batchGetStats() { return { items: [] }; },
+  };
+  const runner = new HomeSchedulerRunner({
+    config: {
+      mode: 'active', videoSourceMode: 'youtube-api', dataDir,
+      sync: { configured: false, concurrency: 1 },
+      workerBindings: { YOUTUBE_API_KEY: 'test', TUBEPULSE_NOTIFICATION_MODE: 'shadow' },
+      youtubeSafetyReconcileHours: 6, youtubeMaxReconciliationsPerCycle: 5,
+      youtubeMaxMigrationReconciliationsPerCycle: 100, youtubeMaxPlaylistPages: 3,
+      youtubeDailyQuotaUnits: 10_000, youtubeQuotaReserveUnits: 1_000,
+      youtubeStatisticsDailyQuotaUnits: 10_000, youtubeStatisticsReserveUnits: 1_000,
+      channelTimeoutMs: 1000,
+    },
+    stateFile, youtubeDataApiClient: api, now: () => now,
+    notificationCoordinator: { async pendingChannelIds() { return [pendingChannel]; } },
+  });
+
+  const result = await runner.runYoutubeDataApiCycle({ TUBEPULSE_KV: kv }, kv, now);
+  assert.equal(result.reconciledCount, 5);
+  assert.ok(playlistCalls.includes(`UU${pendingChannel.slice(2)}`), 'pending channel must not wait behind recovery backlog');
+  assert.ok(result.revalidatedChannelIds.includes(pendingChannel));
+  let persisted = await stateFile.read();
+  assert.ok(persisted.youtubeDataApi.channels[pendingChannel].notificationRevalidationAt,
+    'the retry marker survives source processing until canonical publication succeeds');
+
+  playlistCalls.length = 0;
+  const retry = await runner.runYoutubeDataApiCycle({ TUBEPULSE_KV: kv }, kv, now);
+  assert.ok(playlistCalls.includes(`UU${pendingChannel.slice(2)}`),
+    'a rejected publication leaves the pending channel eligible for the next source cycle');
+  assert.ok(retry.revalidatedChannelIds.includes(pendingChannel));
+  persisted = await stateFile.read();
+  assert.ok(persisted.youtubeDataApi.channels[pendingChannel].notificationRevalidationAt,
+    'the retry marker remains durable across repeated source processing');
+
+  await runner.completeCanonicalRevalidation(retry.revalidatedChannelIds);
+  persisted = await stateFile.read();
+  assert.equal(persisted.youtubeDataApi.channels[pendingChannel].notificationRevalidationAt, undefined);
+});
+
 test('comment-only statistics advance no canonical KV write or publication delta', async (t) => {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tubepulse-comment-only-'));
   t.after(() => fs.rm(dataDir, { recursive: true, force: true }));
@@ -592,6 +666,8 @@ test('canonical recovery revalidates a changed recent feed despite an unchanged 
   assert.equal(result.reconciledCount, 1);
   assert.equal(playlistCalls, 1);
   assert.equal((await kv.get(`channel:${channelId}:recent`, 'json'))[0].videoId, 'newvideo0001');
+  assert.deepEqual(result.revalidatedChannelIds, [channelId]);
+  await runner.completeCanonicalRevalidation(result.revalidatedChannelIds);
   const repaired = await stateFile.read();
   assert.equal(repaired.youtubeDataApi.channels[channelId].recoveryRevalidationAt, undefined);
 });

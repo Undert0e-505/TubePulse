@@ -264,11 +264,20 @@ export async function collectAggregateMonitoring({
   const progressAt = progressAtMs === null ? null : new Date(progressAtMs).toISOString();
   const schedulerErrorAt = timestamp(scheduler.lastError?.at);
   const schedulerProgressAt = timestamp(progressAt);
+  const localIntegrity = localStatus?.localIntegrity || {};
+  const feedHealth = localStatus?.feedHealth || {};
+  const capabilities = localStatus?.capabilities || {};
 
   const payload = {
     schemaVersion: 2,
     collectedAt: new Date(nowMs).toISOString(),
     privacy: 'aggregate-only',
+    capabilities: {
+      localKvIntegrity: capabilities.localKvIntegrity === true,
+      homeFeedHealth: capabilities.homeFeedHealth === true,
+      notificationVisibility: capabilities.notificationVisibility === true,
+      durableNotificationIntent: capabilities.durableNotificationIntent === true,
+    },
     installs: {
       registered: validProfiles.length,
       new: { h24: within(created, 1), d7: within(created, 7), d30: within(created, 30) },
@@ -297,6 +306,10 @@ export async function collectAggregateMonitoring({
     },
     host: {
       ready: localStatus?.status === 'ready',
+      startupRecoveryStatus: String(localStatus?.startupRecovery?.status || 'not-managed'),
+      startupRecoveryPhase: String(localStatus?.startupRecovery?.phase || 'none'),
+      startupRecoveryHistoricalFailure: localStatus?.startupRecovery?.historicalOutcome === 'failed',
+      startupRecoverySuperseded: localStatus?.startupRecovery?.status === 'superseded',
       current: localStatus?.authority?.replication?.status === 'current',
       mode: String(localStatus?.mode || 'unknown'),
       schedulerActive: scheduler.mode === 'active',
@@ -308,6 +321,16 @@ export async function collectAggregateMonitoring({
       // until newer successful scheduler progress supersedes it.
       lastErrorPresent: Boolean(scheduler.lastError)
         && (schedulerProgressAt === null || schedulerErrorAt === null || schedulerErrorAt >= schedulerProgressAt),
+      localIntegrityHealthy: localIntegrity.status === 'passed'
+        && finite(localIntegrity.activeIssues) === 0,
+      localIntegrityActiveIssues: finite(localIntegrity.activeIssues),
+      localIntegrityFailuresTotal: finite(localIntegrity.failures),
+      localIntegrityRecoveriesTotal: finite(localIntegrity.recoveries),
+      localIntegrityScanAgeSeconds: ageSeconds(localIntegrity.scannedAt, nowMs),
+      homeFeedRequestsTotal: finite(feedHealth.requests),
+      homeFeed5xxTotal: finite(feedHealth.failures5xx),
+      homeFeedConsecutiveFailures: finite(feedHealth.consecutiveFailures),
+      homeFeedHealthy: finite(feedHealth.consecutiveFailures) === 0,
     },
     youtube: {
       sourceMode: String(youtube.sourceMode || localStatus?.configuration?.videoSourceMode || 'unknown'),

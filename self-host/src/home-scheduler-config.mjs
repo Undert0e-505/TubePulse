@@ -29,6 +29,12 @@ function positiveInteger(value, fallback, name) {
   return parsed;
 }
 
+function boundedPositiveInteger(value, fallback, name, maximum) {
+  const parsed = positiveInteger(value, fallback, name);
+  if (parsed > maximum) throw new Error(`${name} must not exceed ${maximum}`);
+  return parsed;
+}
+
 function nonNegativeInteger(value, fallback, name) {
   const parsed = Number(value ?? fallback);
   if (!Number.isInteger(parsed) || parsed < 0) throw new Error(`${name} must be a non-negative integer`);
@@ -292,10 +298,11 @@ export function readHomeSchedulerConfig(env = process.env, options = {}) {
     leaseTtlMs: positiveInteger(env.TUBEPULSE_HOME_SCHEDULER_LEASE_TTL_SECONDS, 180, 'TUBEPULSE_HOME_SCHEDULER_LEASE_TTL_SECONDS') * 1000,
     postsCadenceMinutes,
     postsConcurrency: positiveInteger(env.TUBEPULSE_HOME_SCHEDULER_POSTS_CONCURRENCY, 4, 'TUBEPULSE_HOME_SCHEDULER_POSTS_CONCURRENCY'),
-    postsMaxResponseBytes: positiveInteger(
+    postsMaxResponseBytes: boundedPositiveInteger(
       env.TUBEPULSE_HOME_SCHEDULER_POSTS_MAX_RESPONSE_BYTES,
-      2 * 1024 * 1024,
+      10 * 1024 * 1024,
       'TUBEPULSE_HOME_SCHEDULER_POSTS_MAX_RESPONSE_BYTES',
+      12 * 1024 * 1024,
     ),
     youtubeDailyQuotaUnits: positiveInteger(env.TUBEPULSE_YOUTUBE_DAILY_QUOTA_UNITS, 10_000, 'TUBEPULSE_YOUTUBE_DAILY_QUOTA_UNITS'),
     youtubeQuotaReserveUnits: nonNegativeInteger(

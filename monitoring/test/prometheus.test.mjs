@@ -15,7 +15,24 @@ test('Prometheus exposition contains aggregate labels and excludes identifiers',
     snapshot: {
       intervalStart: '2026-10-06T11:00:00Z', collection: { hostSuccess: true, cloudflareSuccess: true },
       host: {
-        host: { ready: true, current: true }, installs: { registered: 2, appVersions: [{ version: '4.0.0', count: 2 }] },
+        capabilities: {
+          localKvIntegrity: true,
+          homeFeedHealth: true,
+          notificationVisibility: true,
+          durableNotificationIntent: true,
+        },
+        host: {
+          ready: true, current: true,
+          localIntegrityHealthy: true, localIntegrityActiveIssues: 0,
+          homeFeedHealthy: true, homeFeedConsecutiveFailures: 0,
+          startupRecoveryHistoricalFailure: true,
+          startupRecoverySuperseded: true,
+          localIntegrityHealthy: true,
+          localIntegrityActiveIssues: 0,
+          homeFeedHealthy: true,
+          homeFeedConsecutiveFailures: 0,
+        },
+        installs: { registered: 2, appVersions: [{ version: '4.0.0', count: 2 }] },
         subscriptions: {
           activeChannels: 3,
           configuredMemberships: 4,
@@ -71,6 +88,12 @@ test('Prometheus exposition contains aggregate labels and excludes identifiers',
     },
   });
   assert.match(metrics, /tubepulse_collector_collection_success 1/);
+  assert.match(metrics, /tubepulse_host_ready 1/);
+  assert.match(metrics, /tubepulse_host_startup_recovery_historical_failure 1/);
+  assert.match(metrics, /tubepulse_host_startup_recovery_superseded 1/);
+  assert.match(metrics, /tubepulse_monitoring_capability\{capability="localKvIntegrity"\} 1/);
+  assert.match(metrics, /tubepulse_host_local_blob_integrity_healthy 1/);
+  assert.match(metrics, /tubepulse_host_feed_healthy 1/);
   assert.match(metrics, /tubepulse_installs_app_version\{version="4\.0\.0"\} 2/);
   assert.match(metrics, /tubepulse_subscriptions_configured_memberships 4/);
   assert.match(metrics, /tubepulse_subscriptions_indexed_memberships 4/);
@@ -127,6 +150,36 @@ test('Prometheus exposition contains aggregate labels and excludes identifiers',
   assert.match(metrics, /tubepulse_live_watch_in_window_watchers 1/);
   assert.match(metrics, /tubepulse_live_watch_degraded 0/);
   assert.doesNotMatch(metrics, /deviceId|channelId|fcmToken|UC[A-Za-z0-9_-]{20}/);
+});
+
+test('unsupported Home integrity and feed evidence stays unknown rather than becoming failure zero', () => {
+  const metrics = prometheusText({
+    collector: { lastCollectionSuccess: true, errorsTotal: 0, limits: {} },
+    snapshot: { host: { host: { ready: true }, youtube: { general: {}, statistics: {} }, notifications: {} } },
+  });
+  assert.match(metrics, /tubepulse_monitoring_capability\{capability="localKvIntegrity"\} 0/);
+  assert.match(metrics, /tubepulse_monitoring_capability\{capability="homeFeedHealth"\} 0/);
+  assert.doesNotMatch(metrics, /tubepulse_host_local_blob_integrity_healthy /);
+  assert.doesNotMatch(metrics, /tubepulse_host_local_blob_integrity_issues /);
+  assert.doesNotMatch(metrics, /tubepulse_host_feed_healthy /);
+  assert.doesNotMatch(metrics, /tubepulse_host_feed_consecutive_failures /);
+  assert.match(metrics, /tubepulse_host_ready 1/);
+});
+
+test('supported integrity or feed failure makes evidenced host readiness false', () => {
+  const metrics = prometheusText({
+    collector: { lastCollectionSuccess: true, errorsTotal: 0, limits: {} },
+    snapshot: { host: {
+      capabilities: { localKvIntegrity: true, homeFeedHealth: true },
+      host: {
+        ready: true, localIntegrityHealthy: true, localIntegrityActiveIssues: 0,
+        homeFeedHealthy: false, homeFeedConsecutiveFailures: 1,
+      },
+      youtube: { general: {}, statistics: {} }, notifications: {},
+    } },
+  });
+  assert.match(metrics, /tubepulse_host_ready 0/);
+  assert.match(metrics, /tubepulse_host_feed_healthy 0/);
 });
 
 test('live-watch metrics fail safe to zero during older-host or restart windows', () => {

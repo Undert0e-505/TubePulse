@@ -36,6 +36,40 @@ test('fresh current active authority reports a privacy-safe healthy state', () =
   assert.equal(JSON.stringify(status).includes('scheduler'), false);
 });
 
+test('managed startup is degraded while stabilising and healthy only after the gate passes', () => {
+  const startedAt = new Date(NOW - 30_000).toISOString();
+  const starting = classifyPublicServiceStatus(localStatus({
+    status: 'starting',
+    startupRecovery: { status: 'in-progress', phase: 'signed-stability-check', startedAt },
+  }), { nowMs: NOW });
+  assert.equal(starting.status, 'degraded');
+  assert.equal(starting.since, startedAt);
+  assert.equal(classifyPublicServiceStatus(localStatus({
+    startupRecovery: { status: 'passed', phase: 'ready', startedAt },
+  }), { nowMs: NOW }).status, 'healthy');
+  assert.equal(classifyPublicServiceStatus(localStatus({
+    status: 'startup-failed', startupRecovery: { status: 'failed', phase: 'stability-timeout', startedAt },
+  }), { nowMs: NOW }).status, 'outage');
+});
+
+test('startup outage since comes from the failed run and a superseded run leaves no stale incident', () => {
+  const startedAt = new Date(NOW - 5 * 60_000).toISOString();
+  const finishedAt = new Date(NOW - 2 * 60_000).toISOString();
+  const failed = classifyPublicServiceStatus(localStatus({
+    status: 'startup-failed',
+    authority: { replication: { status: 'current', changedAt: new Date(NOW - 4 * 60 * 60_000).toISOString() } },
+    startupRecovery: { status: 'failed', phase: 'stability-timeout', startedAt, finishedAt },
+  }), { nowMs: NOW });
+  assert.equal(failed.status, 'outage');
+  assert.equal(failed.since, finishedAt, 'failureAt is authoritative over unrelated replication timestamps');
+
+  const superseded = classifyPublicServiceStatus(localStatus({
+    startupRecovery: { status: 'superseded', phase: 'stability-timeout', startedAt, finishedAt, supersededAt: new Date(NOW - 30_000).toISOString() },
+  }), { nowMs: NOW });
+  assert.equal(superseded.status, 'healthy');
+  assert.equal(superseded.since, null);
+});
+
 test('scheduler progress ages through degraded before outage at wallboard thresholds', () => {
   const withAge = (minutes) => localStatus({
     scheduler: { youtubeDataApi: { lastGoodAt: new Date(NOW - minutes * 60_000).toISOString() } },

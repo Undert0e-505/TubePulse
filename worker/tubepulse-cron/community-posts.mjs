@@ -5,13 +5,79 @@ const DEFAULT_CLIENT_VERSION = '2.20240101';
 const DEFAULT_LANGUAGE = 'en';
 const DEFAULT_REGION = 'GB';
 const DEFAULT_TIMEOUT_MS = 15000;
-const DEFAULT_MAX_RESPONSE_BYTES = 1024 * 1024;
+export const DEFAULT_MAX_RESPONSE_BYTES = 10 * 1024 * 1024;
 const MS_PER_MINUTE = 60 * 1000;
 const MS_PER_HOUR = 60 * MS_PER_MINUTE;
 const MS_PER_DAY = 24 * MS_PER_HOUR;
 const MS_PER_WEEK = 7 * MS_PER_DAY;
 const MS_PER_MONTH = 30 * MS_PER_DAY;
 const MS_PER_YEAR = 365 * MS_PER_DAY;
+
+export class CommunityPostResponseTooLargeError extends Error {
+  constructor({ limitBytes, observedBytes = null, declaredBytes = null } = {}) {
+    const measured = Number.isFinite(observedBytes) ? `${observedBytes} bytes`
+      : Number.isFinite(declaredBytes) ? `${declaredBytes} declared bytes`
+      : 'an oversized body';
+    super(`InnerTube response too large: ${measured} exceeds ${limitBytes} bytes`);
+    this.name = 'CommunityPostResponseTooLargeError';
+    this.code = 'COMMUNITY_POST_RESPONSE_TOO_LARGE';
+    this.deterministic = true;
+    this.limitBytes = limitBytes;
+    this.observedBytes = observedBytes;
+    this.declaredBytes = declaredBytes;
+  }
+}
+
+async function cancelBody(body) {
+  try { await body?.cancel?.(); } catch {}
+}
+
+export async function readCommunityPostResponseText(response, maxResponseBytes) {
+  if (!Number.isSafeInteger(maxResponseBytes) || maxResponseBytes <= 0) {
+    throw new Error('maxResponseBytes must be a positive safe integer');
+  }
+  const declaredBytes = Number(response?.headers?.get?.('Content-Length'));
+  if (Number.isFinite(declaredBytes) && declaredBytes > maxResponseBytes) {
+    await cancelBody(response.body);
+    throw new CommunityPostResponseTooLargeError({ limitBytes: maxResponseBytes, declaredBytes });
+  }
+
+  const reader = response?.body?.getReader?.();
+  if (!reader) {
+    const text = await response.text();
+    const observedBytes = new TextEncoder().encode(text).byteLength;
+    if (observedBytes > maxResponseBytes) {
+      await cancelBody(response.body);
+      throw new CommunityPostResponseTooLargeError({ limitBytes: maxResponseBytes, observedBytes });
+    }
+    return text;
+  }
+
+  const chunks = [];
+  let observedBytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+      observedBytes += chunk.byteLength;
+      if (observedBytes > maxResponseBytes) {
+        await reader.cancel('community-post-response-limit');
+        throw new CommunityPostResponseTooLargeError({ limitBytes: maxResponseBytes, observedBytes });
+      }
+      chunks.push(chunk);
+    }
+  } finally {
+    try { reader.releaseLock?.(); } catch {}
+  }
+  const joined = new Uint8Array(observedBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    joined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(joined);
+}
 
 export function isCommunityPostsEnabled(env = {}) {
   const value = String(env.TUBEPULSE_ENABLE_COMMUNITY_POSTS || '').trim().toLowerCase();
@@ -258,10 +324,7 @@ export async function fetchLatestCommunityPostInnerTube(channelId, options = {})
       throw new Error(`InnerTube browse failed: HTTP ${response.status}`);
     }
 
-    const text = await response.text();
-    if (text.length > maxResponseBytes) {
-      throw new Error(`InnerTube response too large: ${text.length} bytes`);
-    }
+    const text = await readCommunityPostResponseText(response, maxResponseBytes);
 
     let data;
     try {

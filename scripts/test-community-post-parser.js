@@ -25,6 +25,8 @@ function loadFixture(name) {
     parseCommunityPostChannelAllowlist,
     isCommunityPostChannelAllowed,
     isCommunityPostEligible,
+    readCommunityPostResponseText,
+    CommunityPostResponseTooLargeError,
   } = await import('../worker/tubepulse-cron/community-posts.mjs');
 
   assert.deepEqual(
@@ -184,6 +186,70 @@ function loadFixture(name) {
     now: parserNow,
   });
   assert.equal(fetched.id, 'post:UgkxKC5OZpD2HEJCY6PzDBxuoYNnwXdUQRJ9');
+
+  const bytes = (size, value = 120) => new Uint8Array(size).fill(value);
+  const streamResponse = (chunks, headers = {}) => new Response(new ReadableStream({
+    pull(controller) {
+      if (chunks.length === 0) return controller.close();
+      controller.enqueue(chunks.shift());
+    },
+  }), { headers });
+  assert.equal((await readCommunityPostResponseText(
+    streamResponse([bytes(1024 * 1024), bytes(1024 * 1024)]),
+    2 * 1024 * 1024,
+  )).length, 2 * 1024 * 1024, 'the former 2 MiB boundary remains readable');
+  assert.equal((await readCommunityPostResponseText(
+    streamResponse([bytes(7_900_000)]),
+    10 * 1024 * 1024,
+  )).length, 7_900_000, 'the largest observed production response fits');
+  assert.equal((await readCommunityPostResponseText(
+    streamResponse([bytes((10 * 1024 * 1024) - 1)]),
+    10 * 1024 * 1024,
+  )).length, (10 * 1024 * 1024) - 1, 'the configured hard boundary is byte accurate');
+
+  let cancelled = false;
+  const overLimitBody = new ReadableStream({
+    start(controller) { controller.enqueue(bytes(6)); controller.enqueue(bytes(6)); },
+    cancel() { cancelled = true; },
+  });
+  await assert.rejects(
+    () => readCommunityPostResponseText(new Response(overLimitBody), 10),
+    (error) => error instanceof CommunityPostResponseTooLargeError
+      && error.code === 'COMMUNITY_POST_RESPONSE_TOO_LARGE',
+  );
+  assert.equal(cancelled, true, 'chunked over-limit bodies are cancelled immediately');
+
+  let declaredCancelled = false;
+  await assert.rejects(
+    () => readCommunityPostResponseText({
+      headers: { get: () => '10485761' },
+      body: { cancel: async () => { declaredCancelled = true; } },
+    }, 10 * 1024 * 1024),
+    CommunityPostResponseTooLargeError,
+  );
+  assert.equal(declaredCancelled, true, 'declared oversized bodies are rejected before reading');
+
+  await assert.rejects(
+    () => readCommunityPostResponseText({
+      headers: { get: () => '1' },
+      body: streamResponse([bytes(11)]).body,
+    }, 10),
+    CommunityPostResponseTooLargeError,
+    'a lying Content-Length cannot bypass the streamed byte limit',
+  );
+
+  const malformed = await fetchLatestCommunityPostInnerTube('UCtestChannel', {
+    fetch: async () => new Response('{not-json'),
+    logger: { warn() {} },
+  });
+  assert.equal(malformed, null, 'malformed JSON remains a non-content result');
+
+  await assert.rejects(() => fetchLatestCommunityPostInnerTube('UCtestChannel', {
+    timeoutMs: 5,
+    fetch: async (_url, request) => await new Promise((_resolve, reject) => {
+      request.signal.addEventListener('abort', () => reject(request.signal.reason));
+    }),
+  }), /abort|timeout/i, 'the request timeout still aborts a stalled response');
 
   console.log('community post parser checks passed');
 })().catch((error) => {

@@ -22,10 +22,11 @@ class MemoryNamespace {
 }
 
 class FakeRuntime {
-  constructor(namespace, { realApi = false } = {}) { this.namespace = namespace; this.started = false; this.realApi = realApi; }
+  constructor(namespace, { realApi = false } = {}) { this.namespace = namespace; this.started = false; this.realApi = realApi; this.throwFeed = false; }
   async start() { this.started = true; return this; }
   async getLocalNamespace() { return this.namespace; }
   async dispatchFetch(url, init) {
+    if (this.throwFeed) throw new Error('synthetic feed failure');
     if (this.realApi) {
       return await appWorker.fetch(new Request(url, init), {
         TUBEPULSE_KV: this.namespace,
@@ -110,6 +111,12 @@ test('unified service exposes only status and signed authority ingress over the 
   assert.equal(response.status, 200);
   const monitoring = await response.json();
   assert.equal(monitoring.privacy, 'aggregate-only');
+  assert.deepEqual(monitoring.capabilities, {
+    localKvIntegrity: true,
+    homeFeedHealth: true,
+    notificationVisibility: true,
+    durableNotificationIntent: true,
+  });
   assert.equal(Object.hasOwn(monitoring, 'deviceId'), false);
   response = await fetch(`${base}/_tubepulse/monitoring`, { method: 'POST' });
   assert.equal(response.status, 405);
@@ -146,6 +153,22 @@ test('unified service exposes only status and signed authority ingress over the 
   });
   assert.equal(response.status, 200);
   assert.equal((await response.json()).authorization, 'present');
+  service.runtime.throwFeed = true;
+  const failingReadHeaders = signAuthorityRequest({
+    secret: SECRET,
+    operation: 'authority-feed',
+    method: 'GET',
+    target: '/_tubepulse/authority/feed',
+    authorization: 'Bearer synthetic-device',
+    body: '',
+  });
+  response = await fetch(`${base}/_tubepulse/authority/feed`, {
+    headers: { ...failingReadHeaders, Authorization: 'Bearer synthetic-device' },
+  });
+  assert.equal(response.status, 500);
+  response = await fetch(`${base}/_tubepulse/status`);
+  assert.equal((await response.json()).feedHealth.consecutiveFailures, 1);
+  service.runtime.throwFeed = false;
   const leaseId = 'service-api-lease-00001';
   let request = signed('/_tubepulse/authority/preflight', 'authority-preflight', {
     leaseId, method: 'POST', path: '/settings',

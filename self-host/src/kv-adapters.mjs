@@ -53,8 +53,9 @@ export async function snapshotAdapter(adapter, { concurrency = 4, exclude = () =
 }
 
 export class LocalKvAdapter {
-  constructor(namespace) {
+  constructor(namespace, { durableMirror = null } = {}) {
     this.namespace = namespace;
+    this.durableMirror = durableMirror;
   }
 
   async listKeys() {
@@ -77,11 +78,19 @@ export class LocalKvAdapter {
     const putOptions = Number.isFinite(expiration) && expiration > Math.floor(Date.now() / 1000)
       ? { expiration }
       : undefined;
+    await this.durableMirror?.put(key, value, putOptions || {});
     await this.namespace.put(key, value, putOptions);
+    if (await this.namespace.get(key, 'text') !== String(value)) {
+      throw new Error('Local KV durable write verification failed');
+    }
   }
 
   async delete(key) {
+    await this.durableMirror?.delete(key);
     await this.namespace.delete(key);
+    if (await this.namespace.get(key, 'text') !== null) {
+      throw new Error('Local KV durable delete verification failed');
+    }
   }
 }
 

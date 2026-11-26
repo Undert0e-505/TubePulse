@@ -11,6 +11,17 @@ export function prometheusText({ snapshot, collector, nowMs = Date.now() }) {
   const metric = (name, value, metricLabels) => lines.push(`${name}${labels(metricLabels)} ${number(value)}`);
   const host = snapshot?.host || {};
   const cloudflare = snapshot?.cloudflare || {};
+  const capabilities = host.capabilities || {};
+  const inferredCapabilities = {
+    notificationVisibility: host.notifications?.barrierHealthy !== undefined
+      && host.notifications?.suppressed !== undefined,
+    durableNotificationIntent: host.notifications?.durableBacklog !== undefined,
+  };
+  const capability = (name) => capabilities[name] === true
+    || (capabilities[name] === undefined && inferredCapabilities[name] === true);
+  const optionalMetric = (enabled, name, value, metricLabels) => {
+    if (enabled) metric(name, value, metricLabels);
+  };
   metric('tubepulse_collector_up', 1);
   metric('tubepulse_collector_collection_success', bool(collector.lastCollectionSuccess));
   metric('tubepulse_collector_errors_total', collector.errorsTotal);
@@ -19,7 +30,16 @@ export function prometheusText({ snapshot, collector, nowMs = Date.now() }) {
   metric('tubepulse_collector_snapshot_interval_timestamp_seconds', snapshot?.intervalStart ? Date.parse(snapshot.intervalStart) / 1000 : 0);
   metric('tubepulse_collector_host_collection_success', bool(snapshot?.collection?.hostSuccess));
   metric('tubepulse_collector_cloudflare_collection_success', bool(snapshot?.collection?.cloudflareSuccess));
-  metric('tubepulse_host_ready', bool(host.host?.ready));
+  const evidencedHostReady = Boolean(host.host?.ready)
+    && (!capability('localKvIntegrity') || (
+      host.host?.localIntegrityHealthy === true && number(host.host?.localIntegrityActiveIssues) === 0
+    ))
+    && (!capability('homeFeedHealth') || (
+      host.host?.homeFeedHealthy === true && number(host.host?.homeFeedConsecutiveFailures) === 0
+    ));
+  metric('tubepulse_host_ready', bool(evidencedHostReady));
+  metric('tubepulse_host_startup_recovery_historical_failure', bool(host.host?.startupRecoveryHistoricalFailure));
+  metric('tubepulse_host_startup_recovery_superseded', bool(host.host?.startupRecoverySuperseded));
   metric('tubepulse_host_authority_current', bool(host.host?.current));
   metric('tubepulse_host_scheduler_active', bool(host.host?.schedulerActive));
   metric('tubepulse_host_scheduler_lease_held', bool(host.host?.schedulerLeaseHeld));
@@ -28,6 +48,18 @@ export function prometheusText({ snapshot, collector, nowMs = Date.now() }) {
   metric('tubepulse_host_scheduler_progress_age_seconds', host.host?.schedulerProgressAgeSeconds ?? 0);
   metric('tubepulse_host_current_sweep', bool(host.host?.currentSweep));
   metric('tubepulse_host_last_error_present', bool(host.host?.lastErrorPresent));
+  for (const name of ['localKvIntegrity', 'homeFeedHealth', 'notificationVisibility', 'durableNotificationIntent']) {
+    metric('tubepulse_monitoring_capability', bool(capability(name)), { capability: name });
+  }
+  optionalMetric(capability('localKvIntegrity'), 'tubepulse_host_local_blob_integrity_healthy', bool(host.host?.localIntegrityHealthy));
+  optionalMetric(capability('localKvIntegrity'), 'tubepulse_host_local_blob_integrity_issues', host.host?.localIntegrityActiveIssues);
+  optionalMetric(capability('localKvIntegrity'), 'tubepulse_host_local_blob_integrity_failures_total', host.host?.localIntegrityFailuresTotal);
+  optionalMetric(capability('localKvIntegrity'), 'tubepulse_host_local_blob_integrity_recoveries_total', host.host?.localIntegrityRecoveriesTotal);
+  optionalMetric(capability('localKvIntegrity'), 'tubepulse_host_local_blob_integrity_scan_age_seconds', host.host?.localIntegrityScanAgeSeconds ?? 0);
+  optionalMetric(capability('homeFeedHealth'), 'tubepulse_host_feed_requests_total', host.host?.homeFeedRequestsTotal);
+  optionalMetric(capability('homeFeedHealth'), 'tubepulse_host_feed_5xx_total', host.host?.homeFeed5xxTotal);
+  optionalMetric(capability('homeFeedHealth'), 'tubepulse_host_feed_consecutive_failures', host.host?.homeFeedConsecutiveFailures);
+  optionalMetric(capability('homeFeedHealth'), 'tubepulse_host_feed_healthy', bool(host.host?.homeFeedHealthy));
   metric('tubepulse_installs_total', host.installs?.registered);
   metric('tubepulse_installs_push_capable', host.installs?.pushCapable);
   for (const [window, count] of Object.entries(host.installs?.new || {})) metric('tubepulse_installs_new', count, { window });

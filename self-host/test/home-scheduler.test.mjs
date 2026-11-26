@@ -14,6 +14,8 @@ import {
   createHomeSchedulerStateFile,
   mutationKeyFamily,
   mutationReason,
+  normalizeCommunityPostSweepState,
+  startupPostCatchUpDecision,
 } from '../src/home-scheduler.mjs';
 import {
   addToNagActive,
@@ -1178,6 +1180,103 @@ test('post sweep applies bounded retry and the local response-size ceiling', asy
   assert.deepEqual([...new Set(observedLimits)], [2 * 1024 * 1024]);
 });
 
+test('deterministic oversized post responses are not retried within one sweep', async (t) => {
+  const dataDir = await temporaryDirectory(t);
+  const { entries } = canonicalChannels(1);
+  let attempts = 0;
+  const runner = new HomeSchedulerRunner({
+    config: config(dataDir, { retryCount: 3 }), runtime: new FakeRuntime(), remote: new MemoryAdapter(entries),
+    rssPoller: async () => {},
+    postPoller: async () => {
+      attempts++;
+      const error = new Error('synthetic bounded response limit');
+      error.code = 'COMMUNITY_POST_RESPONSE_TOO_LARGE';
+      error.deterministic = true;
+      throw error;
+    },
+    auxRunner: async () => {},
+  });
+  await runner.start();
+  t.after(() => runner.close());
+  const result = await runner.runTick(Date.UTC(2026, 9, 4, 12, 0), { forcePosts: true });
+  assert.equal(attempts, 1);
+  assert.equal(result.minuteJobs.posts.outcome, 'partial');
+  assert.equal(result.minuteJobs.posts.retryCount, 0);
+  assert.equal(result.minuteJobs.posts.oversizeCount, 1);
+  assert.deepEqual(result.minuteJobs.posts.failureCategories, { 'post-response-too-large': 1 });
+});
+
+test('startup post catch-up decisions cover overdue, recent and interrupted persistent state', () => {
+  const now = Date.UTC(2026, 10, 21, 4, 0);
+  assert.equal(startupPostCatchUpDecision({}, now, 60).due, true);
+  assert.equal(startupPostCatchUpDecision({
+    communityPosts: { lastSuccessAt: new Date(now - 30 * 60_000).toISOString() },
+  }, now, 60).due, false);
+  assert.equal(startupPostCatchUpDecision({
+    communityPosts: { lastSuccessAt: new Date(now - 61 * 60_000).toISOString() },
+  }, now, 60).reason, 'cadence-overdue');
+  assert.equal(startupPostCatchUpDecision({
+    communityPosts: { currentClaim: { status: 'running' } },
+  }, now, 60).reason, 'interrupted-claim');
+  assert.equal(normalizeCommunityPostSweepState(null, {
+    scheduledAt: new Date(now - 20 * 60_000).toISOString(), posts: { outcome: 'ok' },
+  }).lastSuccessAt, new Date(now - 20 * 60_000).toISOString());
+});
+
+test('startup catch-up is persistent, settles publication, and deduplicates the nearby aligned sweep', async (t) => {
+  const dataDir = await temporaryDirectory(t);
+  const { entries } = canonicalChannels(3);
+  let now = Date.UTC(2026, 10, 21, 3, 50);
+  let polls = 0;
+  const runner = new HomeSchedulerRunner({
+    config: config(dataDir), runtime: new FakeRuntime(), remote: new MemoryAdapter(entries), now: () => now,
+    rssPoller: async () => {}, postPoller: async () => { polls++; }, auxRunner: async () => {},
+  });
+  await runner.start();
+  t.after(() => runner.close());
+  const catchUp = await runner.runStartupPostCatchUpIfDue();
+  assert.equal(catchUp.minuteJobs.posts.reason, 'startup-catch-up');
+  assert.equal(catchUp.minuteJobs.posts.successCount, 3);
+  assert.equal(catchUp.minuteJobs.posts.settlement.outcome, 'settled');
+  let state = await runner.stateFile.read();
+  assert.equal(state.communityPosts.currentClaim, null);
+  assert.equal(state.communityPosts.lastAttempt.reason, 'startup-catch-up');
+  assert.equal(state.communityPosts.lastSuccessAt, state.communityPosts.lastAttempt.finishedAt);
+
+  now = Date.UTC(2026, 10, 21, 4, 0);
+  const aligned = await runner.runTick(now);
+  assert.equal(aligned.minuteJobs.posts.outcome, 'deduplicated');
+  assert.equal(polls, 3, 'the nearby aligned boundary must not repoll the catch-up fleet');
+
+  now = Date.UTC(2026, 10, 21, 4, 51);
+  const due = await runner.runStartupPostCatchUpIfDue();
+  assert.equal(due.minuteJobs.posts.reason, 'startup-catch-up');
+  assert.equal(polls, 6);
+});
+
+test('startup catch-up recovers an interrupted persistent claim under the scheduler lock', async (t) => {
+  const dataDir = await temporaryDirectory(t);
+  const { entries } = canonicalChannels(2);
+  const stateFile = createHomeSchedulerStateFile(dataDir, 'shadow');
+  const state = await stateFile.read();
+  state.communityPosts = {
+    lastAttempt: null, lastSuccessAt: null, interruptedClaims: 0,
+    currentClaim: { id: 'prior', status: 'running', reason: 'startup-catch-up', claimedAt: '2026-11-21T03:00:00Z' },
+  };
+  await stateFile.write(state);
+  const runner = new HomeSchedulerRunner({
+    config: config(dataDir), runtime: new FakeRuntime(), remote: new MemoryAdapter(entries), stateFile,
+    rssPoller: async () => {}, postPoller: async () => {}, auxRunner: async () => {},
+  });
+  await runner.start();
+  t.after(() => runner.close());
+  const result = await runner.runStartupPostCatchUpIfDue();
+  assert.equal(result.minuteJobs.posts.outcome, 'ok');
+  const settled = await stateFile.read();
+  assert.equal(settled.communityPosts.interruptedClaims, 1);
+  assert.equal(settled.communityPosts.currentClaim, null);
+});
+
 test('predicted write accounting separates metric-only churn and redacts key identities', async () => {
   const namespace = new MemoryNamespace({
     'channel:UCprivate:recent': JSON.stringify([{ videoId: 'a', views: '10', likes: '1', viewsLastCheckedHour: 1 }]),
@@ -1369,6 +1468,46 @@ test('eligible post comparison with same-hour observation churn publishes zero w
     );
     assert.equal(result.outcome, 'unchanged');
     assert.equal(writes, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('catch-up post watermarking emits one eligible intent and never duplicates it', async () => {
+  const channelId = 'UC0000000000000000000000';
+  const deviceId = 'device-one';
+  const oldId = 'Ug-old';
+  const newId = 'Ug-new';
+  const namespace = new MemoryNamespace({
+    [`channel:${channelId}:firstPollAt:posts`]: JSON.stringify('2026-10-01T00:00:00Z'),
+    [`channel:${channelId}:recent:posts`]: JSON.stringify([{ id: `post:${oldId}`, activityId: oldId, postId: oldId }]),
+    [`channel:${channelId}:known:posts`]: JSON.stringify([`post:${oldId}`]),
+    [`channel:${channelId}:subscribers`]: JSON.stringify([deviceId]),
+    [`device:${deviceId}:profile`]: JSON.stringify({ fcmToken: 'token', notificationCapability: 'remote-v1' }),
+    [`device:${deviceId}:settings`]: JSON.stringify({ includeCommunityPosts: true }),
+    [`device:${deviceId}:state:${channelId}`]: JSON.stringify({ unwatched: [], nagCount: 0 }),
+  });
+  const payload = { contents: [{ backstagePostThreadRenderer: { post: { backstagePostRenderer: {
+    postId: newId,
+    publishedTimeText: { simpleText: '1 hour ago' },
+    contentText: { simpleText: 'new post' },
+  } } } }] };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => Response.json(payload);
+  const intents = [];
+  const env = {
+    TUBEPULSE_KV: namespace,
+    TUBEPULSE_NOTIFICATION_MODE: 'shadow',
+    TUBEPULSE_NOTIFICATION_DEFERRED: true,
+    TUBEPULSE_SHADOW_NOTIFICATION_OBSERVER: async (intent) => intents.push(intent),
+    FIREBASE_SERVICE_ACCOUNT: '{"project_id":"test"}',
+  };
+  try {
+    assert.equal((await pollSingleCommunityChannel(env, { waitUntil() {} }, channelId, false)).outcome, 'new-content');
+    assert.equal(intents.length, 1);
+    assert.deepEqual(intents[0].contentIds, [`post:${newId}`]);
+    assert.equal((await pollSingleCommunityChannel(env, { waitUntil() {} }, channelId, false)).outcome, 'unchanged');
+    assert.equal(intents.length, 1, 'known post watermark must suppress the second catch-up observation');
   } finally {
     globalThis.fetch = originalFetch;
   }

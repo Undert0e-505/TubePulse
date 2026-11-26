@@ -178,3 +178,15 @@ test('five-minute post cadence requires a separate explicit quota latch', () => 
   });
   assert.equal(config.postsCadenceMinutes, 5);
 });
+
+test('community response memory is bounded by a conservative configurable ceiling', () => {
+  const defaults = readHomeSchedulerConfig(readEnv);
+  assert.equal(defaults.postsMaxResponseBytes, 10 * 1024 * 1024);
+  const twelve = readHomeSchedulerConfig({
+    ...readEnv, TUBEPULSE_HOME_SCHEDULER_POSTS_MAX_RESPONSE_BYTES: String(12 * 1024 * 1024),
+  });
+  assert.equal(twelve.postsMaxResponseBytes, 12 * 1024 * 1024);
+  assert.throws(() => readHomeSchedulerConfig({
+    ...readEnv, TUBEPULSE_HOME_SCHEDULER_POSTS_MAX_RESPONSE_BYTES: String((12 * 1024 * 1024) + 1),
+  }), /must not exceed/);
+});

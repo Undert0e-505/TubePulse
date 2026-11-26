@@ -50,6 +50,21 @@ test('Prometheus rules record and alert on the separate Durable Objects write bu
   assert.match(read('monitoring', 'compose.yaml'), /TUBEPULSE_DO_REQUEST_SAFE_TARGET:-90000/);
 });
 
+test('new health alerts are capability gated so older compatible Home versions remain unknown', () => {
+  const rules = read('monitoring', 'prometheus', 'rules.yml');
+  for (const [alert, capability] of [
+    ['TubePulseLocalBlobIntegrityFailure', 'localKvIntegrity'],
+    ['TubePulseHomeFeedFailure', 'homeFeedHealth'],
+    ['TubePulseVisibilityBarrierSuppression', 'notificationVisibility'],
+    ['TubePulseDurableIntentOverdue', 'durableNotificationIntent'],
+  ]) {
+    const block = rules.match(new RegExp(`- alert: ${alert}([\\s\\S]*?)(?=\\n\\s*- alert:|$)`))?.[1] || '';
+    assert.match(block, new RegExp(`tubepulse_monitoring_capability\\{capability="${capability}"\\} == 1`));
+  }
+  const hostReady = rules.match(/- alert: TubePulseHostNotReady([\s\S]*?)(?=\n\s*- alert:)/)?.[1] || '';
+  assert.doesNotMatch(hostReady, /local_blob_integrity|host_feed/);
+});
+
 test('wallboard is a readable one-screen calm health overview', () => {
   const dashboard = JSON.parse(read('monitoring', 'grafana', 'dashboards', 'tubepulse-operations.json'));
   const diagnostics = JSON.parse(read('monitoring', 'grafana', 'dashboards', 'tubepulse-diagnostics.json'));
@@ -365,6 +380,7 @@ test('wallboard is a readable one-screen calm health overview', () => {
   assert.ok(chart.series[0].data.some(([time, value]) => time === Date.parse('2026-10-10T17:30:30Z') && value === 17));
   assert.doesNotMatch(JSON.stringify(notificationSends.targets), /tubepulse_notifications_(sent|failed)\"/);
   assert.match(JSON.stringify(byTitle.get('Attention').targets), /tubepulse_notifications_durable_backlog/);
+  assert.match(JSON.stringify(byTitle.get('Attention').targets), /LocalBlobIntegrityFailure\|HomeFeedFailure/);
 
   const invalidTokens = byTitle.get('Invalid tokens · 24h');
   assert.equal(invalidTokens.type, 'volkovlabs-echarts-panel');
@@ -604,7 +620,7 @@ test('production supervisor starts monitoring asynchronously and best-effort', (
   assert.ok(successGuard >= 0 && successGuard < invocation, 'monitoring startup must remain in the successful authority path');
   assert.match(
     source.slice(invocation - 200, invocation + 100),
-    /Write-SupervisorLog[^\n]+\$evaluation\.Message\s+Start-MonitoringBestEffort\s+exit 0/,
+    /Write-SupervisorLog[^\n]+\$evaluation\.Message\s+Complete-RecoveryTimeline[^\n]+\s+Start-MonitoringBestEffort\s+exit 0/,
   );
 });
 
@@ -616,4 +632,13 @@ test('tracked launchers never contain a token value or secret argument', () => {
   ].join('\n');
   assert.doesNotMatch(source, /Bearer\s+[A-Za-z0-9._-]+|api[_-]?token\s*=|authority[_-]?secret\s*=/i);
   assert.match(source, /cloudflare-read-token\.txt/);
+});
+
+test('monitoring launcher resolves the promoted Compose path before constructing Docker arguments', () => {
+  const source = read('monitoring', 'windows', 'Start-TubePulseMonitoring.ps1');
+  const resolved = source.indexOf('$composePath = [IO.Path]::GetFullPath([string]$verification.composeFile)');
+  const constructed = source.indexOf("$composeArguments = @('compose')");
+  assert.ok(resolved >= 0, 'promoted Compose path resolution is missing');
+  assert.ok(constructed > resolved, 'Docker arguments captured the null pre-verification Compose path');
+  assert.match(source.slice(constructed), /\$composeArguments \+= @\('-f', \$composePath\)/);
 });

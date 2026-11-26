@@ -16,6 +16,10 @@ services:
       TUBEPULSE_SNAPSHOT_DIR: /data/snapshots
       TUBEPULSE_COLLECTOR_STATE_FILE: /data/collector/state.json
       TUBEPULSE_SNAPSHOT_RETENTION_DAYS: ${TUBEPULSE_MONITORING_SNAPSHOT_RETENTION_DAYS:-1095}
+      # A large aligned cycle can still be publishing after the :30 sample
+      # offset. Keep polling long enough to capture the settled cycle, while the
+      # collector's single-flight guard prevents overlapping samples.
+      TUBEPULSE_SCHEDULER_SETTLEMENT_TIMEOUT_MS: ${TUBEPULSE_SCHEDULER_SETTLEMENT_TIMEOUT_MS:-90000}
       TUBEPULSE_D1_ROWS_WRITTEN_GUARDRAIL: ${TUBEPULSE_D1_ROWS_WRITTEN_GUARDRAIL:-100000}
       TUBEPULSE_D1_ROWS_READ_GUARDRAIL: ${TUBEPULSE_D1_ROWS_READ_GUARDRAIL:-5000000}
       TUBEPULSE_DO_ROWS_WRITTEN_GUARDRAIL: ${TUBEPULSE_DO_ROWS_WRITTEN_GUARDRAIL:-100000}

@@ -12,7 +12,9 @@ Set-StrictMode -Version Latest
 
 $monitoringDirectory = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $monitoringDirectory '..'))
-$composePath = [IO.Path]::GetFullPath((Join-Path $monitoringDirectory 'compose.yaml'))
+$deploymentTool = [IO.Path]::GetFullPath((Join-Path $repoRoot 'scripts\manage-production-deployment.mjs'))
+$deploymentManifest = [IO.Path]::GetFullPath((Join-Path $repoRoot 'logs\deployments\production\current.json'))
+$composePath = $null
 $localEnvPath = [IO.Path]::GetFullPath((Join-Path $monitoringDirectory '.env.local'))
 $logsDirectory = [IO.Path]::GetFullPath((Join-Path $repoRoot 'logs'))
 $tokenPath = [IO.Path]::GetFullPath((Join-Path $repoRoot 'self-host\secrets\cloudflare-read-token.txt'))
@@ -40,10 +42,9 @@ function Assert-ChildPath([string]$Parent, [string]$Child) {
     }
 }
 
-foreach ($path in @($monitoringDirectory, $composePath, $localEnvPath, $logsDirectory, $tokenPath)) {
+foreach ($path in @($monitoringDirectory, $deploymentTool, $deploymentManifest, $localEnvPath, $logsDirectory, $tokenPath)) {
     Assert-ChildPath -Parent $repoRoot -Child $path
 }
-if (-not (Test-Path -LiteralPath $composePath -PathType Leaf)) { throw 'Monitoring Compose file is missing.' }
 
 $grafanaBindAddress = '127.0.0.1'
 if (Test-Path -LiteralPath $localEnvPath -PathType Leaf) {
@@ -53,16 +54,11 @@ if (Test-Path -LiteralPath $localEnvPath -PathType Leaf) {
 if ($grafanaBindAddress -notin @('127.0.0.1', '0.0.0.0')) {
     throw 'Grafana bind address must be 127.0.0.1 or 0.0.0.0.'
 }
-$composeArguments = @('compose')
-if (Test-Path -LiteralPath $localEnvPath -PathType Leaf) {
-    $composeArguments += @('--env-file', $localEnvPath)
-}
-$composeArguments += @('-f', $composePath)
-
 if ($DryRun) {
     [pscustomobject]@{
         DryRun = $true
-        ComposeFile = $composePath
+        DeploymentManifest = $deploymentManifest
+        DeploymentManifestPresent = (Test-Path -LiteralPath $deploymentManifest -PathType Leaf)
         LogsDirectory = $logsDirectory
         TokenPresent = (Test-Path -LiteralPath $tokenPath -PathType Leaf)
         DashboardUrl = $dashboardUrl
@@ -72,6 +68,22 @@ if ($DryRun) {
     } | ConvertTo-Json -Compress
     exit 0
 }
+
+if (-not (Test-Path -LiteralPath $deploymentTool -PathType Leaf)) { throw 'Managed deployment verifier is missing.' }
+if (-not (Test-Path -LiteralPath $deploymentManifest -PathType Leaf)) {
+    throw 'Promoted deployment manifest is missing; monitoring startup refuses mutable workspace configuration.'
+}
+$verificationText = @(& node $deploymentTool verify --component monitoring --manifest $deploymentManifest 2>&1)
+if ($LASTEXITCODE -ne 0) { throw ('Promoted monitoring deployment is invalid: ' + ($verificationText -join ' ')) }
+$verification = ($verificationText -join "`n") | ConvertFrom-Json
+$composePath = [IO.Path]::GetFullPath([string]$verification.composeFile)
+Assert-ChildPath -Parent $repoRoot -Child $composePath
+if (-not (Test-Path -LiteralPath $composePath -PathType Leaf)) { throw 'Promoted monitoring Compose file is missing.' }
+$composeArguments = @('compose')
+if (Test-Path -LiteralPath $localEnvPath -PathType Leaf) {
+    $composeArguments += @('--env-file', $localEnvPath)
+}
+$composeArguments += @('-f', $composePath)
 
 if (-not (Test-Path -LiteralPath $tokenPath -PathType Leaf)) {
     throw 'The ignored Account Analytics Read token file is missing.'
@@ -90,7 +102,9 @@ try {
 } catch {
     throw 'Docker engine is not ready.'
 }
-Invoke-Native -Arguments ($composeArguments + @('up', '-d', '--build'))
+Invoke-Native -Arguments ($composeArguments + @('up', '-d', '--no-build', '--pull', 'never'))
+& node $deploymentTool verify-running --component monitoring --manifest $deploymentManifest | Write-Host
+if ($LASTEXITCODE -ne 0) { throw 'Running monitoring containers do not match the promoted deployment manifest.' }
 
 $shouldOpen = $OpenDashboard -and -not $NoOpen
 if ($shouldOpen) {

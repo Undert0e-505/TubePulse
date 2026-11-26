@@ -193,6 +193,16 @@ export class HomeAuthorityGate {
     });
   }
 
+  async recoverOrphanedProcessLease(reason = 'process-restarted-with-local-lease') {
+    return await this.mutex.run(async () => {
+      const state = await this.stateFile.read();
+      if (!state.lease) return this.publicState(state);
+      state.lease = null;
+      await this.markStaleInState(state, reason);
+      return this.publicState(state);
+    });
+  }
+
   async reconcile({ manifestHash, recordCount }) {
     return await this.mutex.run(async () => {
       const state = await this.stateFile.read();

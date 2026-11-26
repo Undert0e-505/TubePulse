@@ -8,7 +8,10 @@ import {
   HomeAuthorityGate,
   HomeAuthorityIngress,
 } from './home-authority.mjs';
-import { ensureHomeAuthorityCurrent } from './home-authority-reconcile.mjs';
+import {
+  ensureHomeAuthorityCurrent,
+  verifyAndRecoverHomeAuthority,
+} from './home-authority-reconcile.mjs';
 import {
   createHomeSchedulerSyncStateFile,
   FileLease,
@@ -19,6 +22,15 @@ import { LocalKvAdapter } from './kv-adapters.mjs';
 import { TubePulseRuntime } from './runtime.mjs';
 import { collectAggregateMonitoring } from './aggregate-monitoring.mjs';
 import { classifyPublicServiceStatus } from './public-service-status.mjs';
+import {
+  readStartupRecoveryStatus,
+  supersedeFailedStartupRecovery,
+} from './startup-recovery-status.mjs';
+import {
+  createLocalKvIntegrityStateFile,
+  publicLocalKvIntegrity,
+} from './local-kv-integrity.mjs';
+import { DurableKvMirror } from './kv-durable-mirror.mjs';
 
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
 const HOP_BY_HOP_HEADERS = new Set([
@@ -105,6 +117,46 @@ export class UnifiedHomeAuthorityService {
     this.client = options.client || null;
     this.server = null;
     this.ready = false;
+    this.feedHealth = {
+      requests: 0,
+      failures5xx: 0,
+      consecutiveFailures: 0,
+      lastStatus: null,
+      lastSuccessAt: null,
+      lastFailureAt: null,
+    };
+  }
+
+  recordFeedResponse(status) {
+    const observedAt = new Date().toISOString();
+    this.feedHealth.requests++;
+    this.feedHealth.lastStatus = Number(status);
+    if (Number(status) >= 500) {
+      this.feedHealth.failures5xx++;
+      this.feedHealth.consecutiveFailures++;
+      this.feedHealth.lastFailureAt = observedAt;
+    } else if (Number(status) >= 200 && Number(status) < 400) {
+      this.feedHealth.consecutiveFailures = 0;
+      this.feedHealth.lastSuccessAt = observedAt;
+    }
+  }
+
+  async publicIntegrity() {
+    return publicLocalKvIntegrity(await this.integrityStateFile.read());
+  }
+
+  async liveStartupRecovery(authority, scheduler, remoteStatus = undefined) {
+    let startupRecovery = await readStartupRecoveryStatus(this.config.dataDir);
+    let remote = remoteStatus;
+    if (startupRecovery.status === 'failed') {
+      if (remote === undefined) remote = await this.client.status().catch(() => null);
+      startupRecovery = await supersedeFailedStartupRecovery(this.config.dataDir, {
+        authority,
+        scheduler,
+        remoteStatus: remote,
+      });
+    }
+    return { startupRecovery, remoteStatus: remote };
   }
 
   async start() {
@@ -119,7 +171,8 @@ export class UnifiedHomeAuthorityService {
       }
       await this.runtime.start();
       const namespace = await this.runtime.getLocalNamespace();
-      const local = new LocalKvAdapter(namespace);
+      this.durableMirror ||= new DurableKvMirror(this.config.dataDir);
+      const local = new LocalKvAdapter(namespace, { durableMirror: this.durableMirror });
       this.localAdapter = local;
       this.gate ||= new HomeAuthorityGate({
         adapter: local,
@@ -133,20 +186,45 @@ export class UnifiedHomeAuthorityService {
         timeoutMs: this.config.authority.timeoutMs,
       });
       const syncStateFile = createHomeSchedulerSyncStateFile(this.config.dataDir);
+      this.integrityStateFile ||= createLocalKvIntegrityStateFile(this.config.dataDir);
       const ensureCurrent = async () => await ensureHomeAuthorityCurrent({
         local,
         client: this.client,
         gate: this.gate,
         syncStateFile,
       });
-      if (this.config.mode === 'active' && !this.runner) startupRecovery = await ensureCurrent();
+      if (this.config.mode === 'active' && !this.runner) {
+        const gateAtProcessStart = await this.gate.status();
+        if (gateAtProcessStart.lease) {
+          await this.gate.recoverOrphanedLease('process-restarted-with-local-lease');
+        }
+        const integrity = await verifyAndRecoverHomeAuthority({
+          local,
+          client: this.client,
+          gate: this.gate,
+          syncStateFile,
+          integrityStateFile: this.integrityStateFile,
+          dataDir: this.config.dataDir,
+        durableMirror: this.durableMirror,
+        });
+        startupRecovery = { reconciled: integrity.repaired, result: integrity };
+      }
       this.ingress = new HomeAuthorityIngress({
         secret: this.config.authority.secret,
         gate: this.gate,
-        feedHandler: async (request) => await this.runtime.dispatchFetch('http://tubepulse.local/feed', {
-          method: 'GET',
-          headers: { Authorization: request.headers.get('Authorization') || '' },
-        }),
+        feedHandler: async (request) => {
+          try {
+            const result = await this.runtime.dispatchFetch('http://tubepulse.local/feed', {
+              method: 'GET',
+              headers: { Authorization: request.headers.get('Authorization') || '' },
+            });
+            this.recordFeedResponse(result.status);
+            return result;
+          } catch (error) {
+            this.recordFeedResponse(500);
+            throw error;
+          }
+        },
         mutationHandler: async ({ method, path, body, headers, authorization }) => {
           const buffered = new BufferedKvNamespace(namespace);
           const context = new CapturingExecutionContext();
@@ -184,6 +262,7 @@ export class UnifiedHomeAuthorityService {
         authorityGate: this.gate,
         authorityClient: this.client,
         recoverAuthority: ensureCurrent,
+        durableMirror: this.durableMirror,
       });
       await this.runner.start();
       runnerStarted = true;
@@ -203,6 +282,18 @@ export class UnifiedHomeAuthorityService {
         this.server.listen(this.port, this.host, resolve);
       });
       this.ready = true;
+      if (this.config.mode === 'active') {
+        const scheduledAt = Date.now();
+        const catchUp = this.runner.runStartupPostCatchUpIfDue()
+          .catch((error) => this.runner.handleScheduledTickError(error, scheduledAt))
+          .catch((error) => {
+            console.error(`TubePulse startup post catch-up error handler failed: ${String(error?.message || error).slice(0, 300)}`);
+          });
+        this.runner.activeTick = catchUp;
+        void catchUp.finally(() => {
+          if (this.runner.activeTick === catchUp) this.runner.activeTick = null;
+        });
+      }
       return this;
     } catch (error) {
       this.ready = false;
@@ -243,11 +334,22 @@ export class UnifiedHomeAuthorityService {
     if (parsed.pathname === '/service-status') {
       if (request.method !== 'GET') return await sendResponse(response, Response.json({ error: 'Method not allowed' }, { status: 405 }));
       const [authority, scheduler] = await Promise.all([this.gate.status(), this.runner.status()]);
+      const { startupRecovery } = await this.liveStartupRecovery(authority, scheduler);
+      const startupPassed = ['passed', 'superseded', 'not-managed'].includes(startupRecovery.status);
       const status = classifyPublicServiceStatus({
-        status: this.ready ? 'ready' : 'starting',
+        status: this.ready && startupPassed ? 'ready' : startupRecovery.status === 'failed' ? 'startup-failed' : 'starting',
         mode: this.config.mode,
         authority,
         scheduler: publicHomeSchedulerState(scheduler),
+        startupRecovery,
+        localIntegrity: await this.publicIntegrity(),
+        feedHealth: { ...this.feedHealth },
+        capabilities: {
+          localKvIntegrity: true,
+          homeFeedHealth: true,
+          notificationVisibility: true,
+          durableNotificationIntent: true,
+        },
         configuration: {
           notificationsEnabled: this.config.notificationsEnabled,
           alignedVideoNotificationsEnabled: this.config.alignedVideoNotificationsEnabled,
@@ -264,12 +366,17 @@ export class UnifiedHomeAuthorityService {
     if (parsed.pathname === '/_tubepulse/status') {
       if (request.method !== 'GET') return await sendResponse(response, Response.json({ error: 'Method not allowed' }, { status: 405 }));
       const [authority, scheduler] = await Promise.all([this.gate.status(), this.runner.status()]);
+      const { startupRecovery } = await this.liveStartupRecovery(authority, scheduler);
+      const startupPassed = ['passed', 'superseded', 'not-managed'].includes(startupRecovery.status);
       return await sendResponse(response, Response.json({
-        status: this.ready ? 'ready' : 'starting',
+        status: this.ready && startupPassed ? 'ready' : startupRecovery.status === 'failed' ? 'startup-failed' : 'starting',
         service: 'unified-home-authority',
         mode: this.config.mode,
         authority,
         scheduler: publicHomeSchedulerState(scheduler),
+        startupRecovery,
+        localIntegrity: await this.publicIntegrity(),
+        feedHealth: { ...this.feedHealth },
         configuration: {
           videoCadenceMinutes: 5,
           videoSourceMode: this.config.videoSourceMode,
@@ -291,11 +398,22 @@ export class UnifiedHomeAuthorityService {
         this.runner.status(),
         this.client.status().then((value) => ({ value })).catch(() => ({ value: null })),
       ]);
+      const { startupRecovery } = await this.liveStartupRecovery(authority, scheduler, remoteResult.value);
+      const startupPassed = ['passed', 'superseded', 'not-managed'].includes(startupRecovery.status);
       const localStatus = {
-        status: this.ready ? 'ready' : 'starting',
+        status: this.ready && startupPassed ? 'ready' : startupRecovery.status === 'failed' ? 'startup-failed' : 'starting',
         mode: this.config.mode,
         authority,
         scheduler: publicHomeSchedulerState(scheduler),
+        startupRecovery,
+        localIntegrity: await this.publicIntegrity(),
+        feedHealth: { ...this.feedHealth },
+        capabilities: {
+          localKvIntegrity: true,
+          homeFeedHealth: true,
+          notificationVisibility: true,
+          durableNotificationIntent: true,
+        },
         configuration: {
           videoSourceMode: this.config.videoSourceMode,
           preciseLiveWatchEnabled: this.config.preciseLiveWatchEnabled,

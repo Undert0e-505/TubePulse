@@ -93,6 +93,12 @@ function freshSchedulerState(mode = 'shadow') {
     currentSweep: null,
     lastSweep: null,
     lastMinuteJobs: null,
+    communityPosts: {
+      lastAttempt: null,
+      lastSuccessAt: null,
+      currentClaim: null,
+      interruptedClaims: 0,
+    },
     lastNotificationDelivery: null,
     lastContention: null,
     deferredVideoSweep: null,
@@ -151,6 +157,35 @@ export function publicHomeSchedulerState(state) {
 
 export function nextFiveMinuteBoundary(now = Date.now()) {
   return Math.floor(now / FIVE_MINUTES_MS) * FIVE_MINUTES_MS + FIVE_MINUTES_MS;
+}
+
+export function normalizeCommunityPostSweepState(value, legacyMinuteJobs = null) {
+  const source = value && typeof value === 'object' ? value : {};
+  const legacySuccess = legacyMinuteJobs?.posts?.outcome === 'ok'
+    ? legacyMinuteJobs.posts.finishedAt || legacyMinuteJobs.scheduledAt || null
+    : null;
+  return {
+    lastAttempt: source.lastAttempt || null,
+    lastSuccessAt: source.lastSuccessAt || legacySuccess,
+    currentClaim: source.currentClaim || null,
+    interruptedClaims: Math.max(0, Number(source.interruptedClaims || 0)),
+  };
+}
+
+export function startupPostCatchUpDecision(state, nowMs, cadenceMinutes) {
+  const posts = normalizeCommunityPostSweepState(state?.communityPosts, state?.lastMinuteJobs);
+  const cadenceMs = cadenceMinutes * MINUTE_MS;
+  const lastSuccessAt = Date.parse(posts.lastSuccessAt || '');
+  const lastAttemptAt = Date.parse(posts.lastAttempt?.finishedAt || '');
+  if (posts.currentClaim?.status === 'running') {
+    return { due: true, reason: 'interrupted-claim', posts };
+  }
+  if (Number.isFinite(lastAttemptAt) && nowMs - lastAttemptAt < FIVE_MINUTES_MS) {
+    return { due: false, reason: 'recent-attempt', posts };
+  }
+  if (!Number.isFinite(lastSuccessAt)) return { due: true, reason: 'no-success-marker', posts };
+  if (nowMs - lastSuccessAt >= cadenceMs) return { due: true, reason: 'cadence-overdue', posts };
+  return { due: false, reason: 'within-cadence', posts };
 }
 
 export class FileLease {
@@ -865,6 +900,7 @@ export class HomeSchedulerRunner {
     authorityGate = null,
     authorityClient = null,
     recoverAuthority = null,
+    durableMirror = null,
     localLeaseRetryMs = LOCAL_AUTHORITY_LEASE_RETRY_MS,
     localLeaseRetryIntervalMs = LOCAL_AUTHORITY_LEASE_RETRY_INTERVAL_MS,
   }) {
@@ -890,6 +926,7 @@ export class HomeSchedulerRunner {
     this.authorityGate = authorityGate;
     this.authorityClient = authorityClient;
     this.recoverAuthority = recoverAuthority;
+    this.durableMirror = durableMirror;
     this.localLeaseRetryMs = localLeaseRetryMs;
     this.localLeaseRetryIntervalMs = localLeaseRetryIntervalMs;
     this.publication = null;
@@ -898,6 +935,7 @@ export class HomeSchedulerRunner {
     this.preciseLiveTimer = null;
     this.activePreciseLiveTick = null;
     this.activeTick = null;
+    this.activeCycle = null;
     this.stopped = false;
     this.remoteConfirmationDueAt = null;
     this.kvMutationMutex = new KeyedMutex();
@@ -910,7 +948,9 @@ export class HomeSchedulerRunner {
     let authorityStatus = null;
     try {
       await this.runtime.start();
-      const local = new LocalKvAdapter(await this.runtime.getLocalNamespace());
+      const local = new LocalKvAdapter(await this.runtime.getLocalNamespace(), {
+        durableMirror: this.durableMirror,
+      });
       this.localAdapter = local;
       if (this.config.mode === 'shadow') {
         this.publication = new ShadowPublicationStrategy({
@@ -1177,6 +1217,39 @@ export class HomeSchedulerRunner {
     state.youtubeDataApi = health;
     await this.stateFile.write(state);
     return channelIds;
+  }
+
+  async schedulePendingNotificationRevalidation(state, health) {
+    if (this.config.mode !== 'active'
+      || typeof this.notificationCoordinator?.pendingChannelIds !== 'function') return [];
+    const channelIds = [...new Set(await this.notificationCoordinator.pendingChannelIds())]
+      .map(String).filter(Boolean).sort();
+    if (channelIds.length === 0) return [];
+    const markedAt = iso(this.now());
+    for (const channelId of channelIds) {
+      health.channels[channelId] = {
+        ...(health.channels[channelId] || {}),
+        notificationRevalidationAt: markedAt,
+      };
+    }
+    state.youtubeDataApi = health;
+    await this.stateFile.write(state);
+    return channelIds;
+  }
+
+  async completeCanonicalRevalidation(channelIds) {
+    const selected = new Set((channelIds || []).map(String).filter(Boolean));
+    if (selected.size === 0) return;
+    const state = await this.stateFile.read();
+    const health = normalizeYoutubeDataApiState(state.youtubeDataApi, this.now());
+    for (const channelId of selected) {
+      const channel = health.channels[channelId];
+      if (!channel) continue;
+      delete channel.recoveryRevalidationAt;
+      delete channel.notificationRevalidationAt;
+    }
+    state.youtubeDataApi = health;
+    await this.stateFile.write(state);
   }
 
   postQuota(channelCount) {
@@ -1536,6 +1609,7 @@ export class HomeSchedulerRunner {
 
     let state = await this.stateFile.read();
     let health = normalizeYoutubeDataApiState(state.youtubeDataApi, this.now());
+    await this.schedulePendingNotificationRevalidation(state, health);
     const returned = new Map(detectorItems.map((item) => [item.id, item]));
     const candidates = [];
     const safetyMs = Number(this.config.youtubeSafetyReconcileHours || 6) * 60 * 60 * 1000;
@@ -1551,6 +1625,7 @@ export class HomeSchedulerRunner {
       const lastReconciled = Date.parse(previous.lastReconciledAt || '');
       const safetyDue = !Number.isFinite(lastReconciled) || this.now() - lastReconciled >= safetyMs;
       const recoveryDue = Boolean(previous.recoveryRevalidationAt);
+      const notificationRecoveryDue = Boolean(previous.notificationRevalidationAt);
       health.channels[channelId] = {
         ...previous,
         uploadsPlaylistId,
@@ -1567,20 +1642,26 @@ export class HomeSchedulerRunner {
           paginationBoundReached: false,
         } : {}),
       };
-      if (confirmedEmpty) delete health.channels[channelId].recoveryRevalidationAt;
+      if (confirmedEmpty) {
+        delete health.channels[channelId].recoveryRevalidationAt;
+        delete health.channels[channelId].notificationRevalidationAt;
+      }
       // A valid zero-video channel has no uploads to enumerate. Some such
       // channels return 404 for their otherwise valid uploads playlist, so
       // record an empty successful baseline without spending another quota
       // unit. A later 0 -> 1 detector change still enters reconciliation and
       // discovers the first upload normally.
-      if (!confirmedEmpty && uploadsPlaylistId && (recoveryDue || baselineMissing || changed || safetyDue)) {
+      if (!confirmedEmpty && uploadsPlaylistId
+        && (notificationRecoveryDue || recoveryDue || baselineMissing || changed || safetyDue)) {
         candidates.push({
-          channelId, recoveryDue, baselineMissing, changed, safetyDue, uploadsPlaylistId, lastReconciled,
+          channelId, notificationRecoveryDue, recoveryDue, baselineMissing, changed, safetyDue,
+          uploadsPlaylistId, lastReconciled,
         });
       }
     }
     candidates.sort((left, right) => (
-      Number(right.recoveryDue) - Number(left.recoveryDue)
+      Number(right.notificationRecoveryDue) - Number(left.notificationRecoveryDue)
+      || Number(right.recoveryDue) - Number(left.recoveryDue)
       || Number(right.changed) - Number(left.changed)
       || Number(right.baselineMissing) - Number(left.baselineMissing)
       || (Number.isFinite(left.lastReconciled) ? left.lastReconciled : 0)
@@ -1623,10 +1704,16 @@ export class HomeSchedulerRunner {
           lastPageCount: result.pageCount,
           paginationBoundReached: result.truncatedWithoutOverlap,
         };
-        delete health.channels[candidate.channelId].recoveryRevalidationAt;
         state.youtubeDataApi = health;
         await this.stateFile.write(state);
-        reconcileResults.push({ channelId: candidate.channelId, outcome: 'ok', pageCount: result.pageCount, processed: processed?.outcome });
+        reconcileResults.push({
+          channelId: candidate.channelId,
+          outcome: 'ok',
+          pageCount: result.pageCount,
+          processed: processed?.outcome,
+          revalidation: candidate.notificationRecoveryDue ? 'pending-notification'
+            : candidate.recoveryDue ? 'canonical-recovery' : null,
+        });
       } catch (error) {
         await this.recordYoutubeApiFailure('general', error);
         reconcileResults.push({
@@ -1708,6 +1795,9 @@ export class HomeSchedulerRunner {
       reconciliationDeferredCount: Math.max(0, candidates.length - selected.length),
       reconcileResults, statisticsVideoCount: allStatistics.size, statisticsRequests, statsMethod: health.statsMethod,
       pendingVideoAvailability,
+      revalidatedChannelIds: reconcileResults
+        .filter((entry) => entry.outcome === 'ok' && entry.revalidation)
+        .map((entry) => entry.channelId),
     };
   }
 
@@ -2156,6 +2246,7 @@ export class HomeSchedulerRunner {
 
   async pollPostWithRetry(env, ctx, channelId) {
     const errors = [];
+    let deterministicOversize = false;
     for (let attempt = 0; attempt <= this.config.retryCount; attempt++) {
       try {
         await withTimeout(
@@ -2175,12 +2266,74 @@ export class HomeSchedulerRunner {
         return { channelId, outcome: 'ok', attempts: attempt + 1 };
       } catch (error) {
         errors.push(error?.message || String(error));
+        if (error?.code === 'COMMUNITY_POST_RESPONSE_TOO_LARGE' || error?.deterministic === true) {
+          deterministicOversize = true;
+          break;
+        }
         if (attempt < this.config.retryCount) {
           await this.sleep(this.config.retryBackoffMs * (2 ** attempt));
         }
       }
     }
-    return { channelId, outcome: 'error', attempts: errors.length, errorCategory: 'post-poll-failed' };
+    return {
+      channelId,
+      outcome: 'error',
+      attempts: errors.length,
+      errorCategory: deterministicOversize ? 'post-response-too-large' : 'post-poll-failed',
+    };
+  }
+
+  async claimCommunityPostSweep(scheduledTime, reason) {
+    const state = await this.stateFile.read();
+    const posts = normalizeCommunityPostSweepState(state.communityPosts, state.lastMinuteJobs);
+    const priorClaim = posts.currentClaim;
+    if (priorClaim?.status === 'running') posts.interruptedClaims++;
+    const claim = {
+      id: crypto.randomUUID(),
+      status: 'running',
+      reason,
+      scheduledAt: iso(scheduledTime),
+      claimedAt: iso(this.now()),
+      ...(priorClaim?.status === 'running' ? { recoveredClaim: true } : {}),
+    };
+    posts.currentClaim = claim;
+    state.communityPosts = posts;
+    await this.stateFile.write(state);
+    return claim;
+  }
+
+  async recordCommunityPostPolling(claim, result) {
+    const state = await this.stateFile.read();
+    const posts = normalizeCommunityPostSweepState(state.communityPosts, state.lastMinuteJobs);
+    if (posts.currentClaim?.id !== claim.id) throw new Error('Community post sweep claim changed before polling settled');
+    posts.currentClaim = { ...posts.currentClaim, pollingFinishedAt: result.finishedAt };
+    posts.lastAttempt = { ...result, settlement: { outcome: 'pending' } };
+    state.communityPosts = posts;
+    await this.stateFile.write(state);
+  }
+
+  async settleCommunityPostSweep(claimId, result, publication, notificationPublication, notificationDelivery) {
+    const state = await this.stateFile.read();
+    const posts = normalizeCommunityPostSweepState(state.communityPosts, state.lastMinuteJobs);
+    if (posts.currentClaim?.id !== claimId) throw new Error('Community post sweep claim changed before publication settled');
+    const settlement = {
+      outcome: publication?.pending === 0 && publication?.conflicts === 0
+        && notificationPublication?.pending === 0 && notificationPublication?.conflicts === 0
+        && ['passed', 'not-needed', 'not-required', 'shadow'].includes(notificationDelivery?.barrier)
+        ? 'settled'
+        : 'unsettled',
+      settledAt: iso(this.now()),
+      canonicalWrites: Number(publication?.appliedWrites || 0),
+      pending: Number(publication?.pending || 0) + Number(notificationPublication?.pending || 0),
+      conflicts: Number(publication?.conflicts || 0) + Number(notificationPublication?.conflicts || 0),
+      notificationBarrier: notificationDelivery?.barrier || 'unknown',
+    };
+    posts.lastAttempt = { ...result, settlement };
+    if (result.outcome === 'ok' && settlement.outcome === 'settled') posts.lastSuccessAt = result.finishedAt;
+    posts.currentClaim = null;
+    state.communityPosts = posts;
+    await this.stateFile.write(state);
+    return settlement;
   }
 
   async runRssSweep(env, target, scheduledTime) {
@@ -2245,9 +2398,10 @@ export class HomeSchedulerRunner {
     };
   }
 
-  async runMinuteJobs(env, target, scheduledTime, { forcePosts = false } = {}) {
+  async runMinuteJobs(env, target, scheduledTime, { forcePosts = false, postReason = null } = {}) {
     const ctx = new WaitUntilContext();
     const result = { scheduledAt: iso(scheduledTime), posts: { outcome: 'disabled' }, aux: { outcome: 'pending' } };
+    let postClaim = null;
     if (isCommunityPostsEnabled(env)) {
       const active = await getKV(target, key.channelsActive()) || [];
       const allowlist = parseCommunityPostChannelAllowlist(env);
@@ -2261,21 +2415,46 @@ export class HomeSchedulerRunner {
       } else if (this.config.mode === 'active' && !quota.withinBudget) {
         result.posts = { outcome: 'quota-blocked', cadenceMinutes: this.config.postsCadenceMinutes, channelCount: eligible.length, quota };
       } else {
+        const reason = postReason || 'aligned';
+        const postState = await this.stateFile.read();
+        const decision = startupPostCatchUpDecision(postState, scheduledTime, this.config.postsCadenceMinutes);
+        if (reason === 'aligned' && !decision.due) {
+          result.posts = {
+            outcome: 'deduplicated', reason, dedupeReason: decision.reason,
+            cadenceMinutes: this.config.postsCadenceMinutes, channelCount: eligible.length, quota,
+          };
+        } else {
+        postClaim = await this.claimCommunityPostSweep(scheduledTime, reason);
+        const startedAt = iso(this.now());
         const postResults = await mapLimit(eligible, this.config.postsConcurrency, async (channelId) => {
           return await this.pollPostWithRetry(env, ctx, channelId);
         });
+        const finishedAt = iso(this.now());
         result.posts = {
           outcome: postResults.some((entry) => entry.outcome === 'error') ? 'partial' : 'ok',
+          reason,
+          claimId: postClaim.id,
+          scheduledAt: iso(scheduledTime),
+          startedAt,
+          finishedAt,
+          durationMs: Math.max(0, Date.parse(finishedAt) - Date.parse(startedAt)),
           cadenceMinutes: this.config.postsCadenceMinutes,
           channelCount: eligible.length,
           coveredCount: postResults.length,
           successCount: postResults.filter((entry) => entry.outcome === 'ok').length,
           failureCount: postResults.filter((entry) => entry.outcome === 'error').length,
           retryCount: postResults.reduce((sum, entry) => sum + Math.max(0, entry.attempts - 1), 0),
-          failures: postResults.filter((entry) => entry.outcome === 'error'),
+          oversizeCount: postResults.filter((entry) => entry.errorCategory === 'post-response-too-large').length,
+          failureCategories: postResults.filter((entry) => entry.outcome === 'error').reduce((summary, entry) => {
+            const category = entry.errorCategory || 'unknown';
+            summary[category] = (summary[category] || 0) + 1;
+            return summary;
+          }, {}),
           concurrency: this.config.postsConcurrency,
           quota,
         };
+        await this.recordCommunityPostPolling(postClaim, result.posts);
+        }
       }
     }
     try {
@@ -2285,13 +2464,14 @@ export class HomeSchedulerRunner {
       result.aux = { outcome: 'error', errorCategory: 'aux-run-failed' };
     }
     await ctx.flush();
-    return result;
+    return { ...result, postClaimId: postClaim?.id || null };
   }
 
   async runTick(scheduledTime = this.now(), {
     forceSweep = false,
     forcePosts = forceSweep,
     preciseLiveOnly = false,
+    postReason = null,
   } = {}) {
     if (this.config.mode === 'standby') return { outcome: 'standby' };
     if (this.running) {
@@ -2302,6 +2482,12 @@ export class HomeSchedulerRunner {
       return { outcome: 'overlap-skipped' };
     }
     this.running = true;
+    this.activeCycle = {
+      kind: preciseLiveOnly ? 'precise-live' : forcePosts ? 'startup-catch-up' : 'minute',
+      scheduledAt: iso(scheduledTime),
+      startedAt: iso(this.now()),
+      aligned: !preciseLiveOnly && Math.floor(scheduledTime / MINUTE_MS) % 5 === 0,
+    };
     const journal = new MutationJournal();
     const notifications = { total: 0, byKind: {} };
     const notificationQueue = [];
@@ -2359,7 +2545,10 @@ export class HomeSchedulerRunner {
       }
       const minuteJobs = preciseLiveOnly
         ? null
-        : await this.runMinuteJobs(env, target, scheduledTime, { forcePosts: effectiveForcePosts });
+        : await this.runMinuteJobs(env, target, scheduledTime, {
+          forcePosts: effectiveForcePosts,
+          postReason: effectiveForcePosts ? (postReason || 'startup-catch-up') : 'aligned',
+        });
       if (minuteJobs) minuteJobs.alignedVideoNotifications = alignedNotifications;
       let publication;
       let notificationPublication = null;
@@ -2375,6 +2564,7 @@ export class HomeSchedulerRunner {
           ? await this.notificationCoordinator.suppress(notificationQueue, 'canonical-backup-deferred')
           : await this.notificationCoordinator.flush(notificationQueue, env);
         notificationPublication = await this.publication.finish(journal, { final: true });
+        await this.completeCanonicalRevalidation(sweep?.revalidatedChannelIds);
       } else {
         notificationDelivery = {
           queued: notifications.total,
@@ -2385,6 +2575,16 @@ export class HomeSchedulerRunner {
         };
         publication = await this.publication.finish(journal);
       }
+      if (minuteJobs?.postClaimId) {
+        minuteJobs.posts.settlement = await this.settleCommunityPostSweep(
+          minuteJobs.postClaimId,
+          minuteJobs.posts,
+          publication,
+          notificationPublication || { pending: 0, conflicts: 0, appliedWrites: 0 },
+          notificationDelivery,
+        );
+      }
+      delete minuteJobs?.postClaimId;
       const mutationSummary = journal.summary();
       const state = await this.stateFile.read();
       state.overlapSkips = Math.max(Number(state.overlapSkips || 0), this.overlapSkips);
@@ -2422,6 +2622,7 @@ export class HomeSchedulerRunner {
       if (this.config.mode === 'active') await this.publication?.abort('scheduler-tick-failed').catch(() => {});
       throw error;
     } finally {
+      this.activeCycle = null;
       this.running = false;
     }
   }
@@ -2493,7 +2694,9 @@ export class HomeSchedulerRunner {
       await this.stateFile.write(state);
       return false;
     }
-    const target = new WorkerKvFacade(new LocalKvAdapter(await this.runtime.getLocalNamespace()));
+    const target = new WorkerKvFacade(new LocalKvAdapter(await this.runtime.getLocalNamespace(), {
+      durableMirror: this.durableMirror,
+    }));
     const events = await getKV(target, key.upcomingEvents()) || [];
     return planPreciseLiveWatch(events, watch, scheduledTime).due.length > 0;
   }
@@ -2539,6 +2742,21 @@ export class HomeSchedulerRunner {
     }, Math.max(1, runAt - now));
   }
 
+  async runStartupPostCatchUpIfDue() {
+    if (this.config.mode === 'standby' || !isCommunityPostsEnabled(this.config.workerBindings)) {
+      return { outcome: 'disabled' };
+    }
+    const state = await this.stateFile.read();
+    const now = this.now();
+    const decision = startupPostCatchUpDecision(state, now, this.config.postsCadenceMinutes);
+    if (!decision.due) return { outcome: 'not-due', reason: decision.reason };
+    const scheduledTime = Math.floor(now / MINUTE_MS) * MINUTE_MS;
+    return await this.runTick(scheduledTime, {
+      forcePosts: true,
+      postReason: 'startup-catch-up',
+    });
+  }
+
   async run() {
     this.armNextMinute();
     this.armNextPreciseLiveWatch();
@@ -2546,6 +2764,7 @@ export class HomeSchedulerRunner {
 
   async status() {
     const state = await this.stateFile.read();
+    state.activeCycle = this.activeCycle ? { ...this.activeCycle } : null;
     if (typeof this.notificationCoordinator?.intentStore?.summary === 'function') {
       state.notificationIntents = await this.notificationCoordinator.intentStore.summary();
     }

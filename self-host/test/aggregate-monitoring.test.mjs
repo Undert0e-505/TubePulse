@@ -40,6 +40,7 @@ test('aggregate monitoring counts profiles and subscriptions without exposing re
     },
     localStatus: {
       status: 'ready', mode: 'active', authority: { replication: { status: 'current' } },
+      startupRecovery: { status: 'superseded', phase: 'stability-timeout', historicalOutcome: 'failed' },
       scheduler: {
         mode: 'active', lease: { state: 'held' }, lastMinuteJobs: { scheduledAt: now - 10_000 },
         lastSweep: {
@@ -94,6 +95,9 @@ test('aggregate monitoring counts profiles and subscriptions without exposing re
   assert.equal(payload.installs.new.h24, 1);
   assert.equal(payload.installs.active.h24, 1);
   assert.equal(payload.installs.pushCapable, 1);
+  assert.equal(payload.host.ready, true);
+  assert.equal(payload.host.startupRecoveryHistoricalFailure, true);
+  assert.equal(payload.host.startupRecoverySuperseded, true);
   assert.deepEqual(payload.installs.appVersions, [
     { version: '3.5.2', count: 1 }, { version: '4.0.0', count: 1 },
   ]);

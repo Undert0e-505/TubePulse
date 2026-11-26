@@ -80,7 +80,23 @@ export function classifyPublicServiceStatus(localStatus, { nowMs = Date.now() } 
   const scheduler = localStatus?.scheduler || {};
   const authority = localStatus?.authority || {};
   const configuration = localStatus?.configuration || {};
+  const startupRecovery = localStatus?.startupRecovery || {};
+  const localIntegrity = localStatus?.localIntegrity || {};
+  const feedHealth = localStatus?.feedHealth || {};
   const progressAt = latestSchedulerProgressTimestamp(scheduler);
+
+  if (['in-progress', 'unknown'].includes(startupRecovery.status)) {
+    const sinceAt = timestamp(startupRecovery.startedAt) ?? timestamp(scheduler?.startedAt) ?? nowMs;
+    return response('degraded', observedAt, new Date(Math.min(nowMs, sinceAt)).toISOString());
+  }
+
+  if (startupRecovery.status === 'failed') {
+    // A managed startup incident is dated by that run, never by an older
+    // authority replication transition. Prefer the terminal failure time;
+    // startedAt is the fallback for legacy/incomplete timeline entries.
+    const sinceAt = timestamp(startupRecovery.finishedAt) ?? timestamp(startupRecovery.startedAt) ?? nowMs;
+    return response('outage', observedAt, new Date(Math.min(nowMs, sinceAt)).toISOString());
+  }
 
   const capabilityUnavailable = localStatus?.status !== 'ready'
     || localStatus?.mode !== 'active'
@@ -89,8 +105,14 @@ export function classifyPublicServiceStatus(localStatus, { nowMs = Date.now() } 
     || scheduler?.lease?.state !== 'held'
     || configuration.notificationsEnabled !== true
     || configuration.alignedVideoNotificationsEnabled !== true;
-  if (capabilityUnavailable) {
-    const sinceAt = timestamp(authority?.replication?.changedAt)
+  const localDataUnavailable = localIntegrity.status === 'failed'
+    || Number(localIntegrity.activeIssues || 0) > 0
+    || Number(feedHealth.consecutiveFailures || 0) > 0;
+  if (capabilityUnavailable || localDataUnavailable) {
+    const sinceAt = (localDataUnavailable
+      ? timestamp(feedHealth.lastFailureAt) ?? timestamp(localIntegrity.scannedAt)
+      : timestamp(authority?.replication?.changedAt))
+      ?? timestamp(authority?.replication?.changedAt)
       ?? timestamp(scheduler?.startedAt)
       ?? nowMs;
     return response('outage', observedAt, new Date(Math.min(nowMs, sinceAt)).toISOString());

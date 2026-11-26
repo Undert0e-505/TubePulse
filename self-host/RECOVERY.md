@@ -25,18 +25,22 @@ The tracked Windows mechanism consists of:
 - `windows/Install-HomeAuthorityStartupTask.ps1`: an optional elevated installer for an at-logon Scheduled Task;
 - Docker Compose `restart: unless-stopped`, the authority health check, persistent `data-authority`, and reconnecting `cloudflared`.
 
-The supervisor resolves repository paths from its own location, takes an exclusive non-destructive lock, starts Docker Desktop with `--minimized` only when `docker info` is unavailable, waits with exponential backoff, and runs the existing authority Compose stack with absolute Compose/environment paths. It rotates one bounded local log generation and never logs secrets or raw status payloads.
+The supervisor resolves repository paths from its own location, takes an exclusive non-destructive lock, starts Docker Desktop with `--minimized` only when `docker info` is unavailable, waits with exponential backoff, then verifies the pinned deployment image and runs its immutable authority Compose stack with absolute Compose/environment paths. Image verification deliberately happens after Docker is ready so a cold boot cannot fail before Docker Desktop is started. It rotates one bounded local log generation and never logs secrets or raw status payloads.
+
+The Compose file is the immutable Home artifact named by `logs/deployments/production/current.json`, not `compose.authority.yaml` from the working tree. The supervisor validates bundle and image hashes, uses `--no-build --pull never`, and checks the running Home image ID. A missing or altered bundle, unavailable image, or running mismatch fails closed. Promotion and rollback are documented in [`../DEPLOYMENT.md`](../DEPLOYMENT.md).
 
 It verifies more than HTTP success:
 
 - Docker engine availability;
 - authority container running/health state;
 - local service identity and `ready` status;
-- local authority current state and no local transaction;
+- local authority current state and no foreign or unresolved local transaction;
 - signed coordinator status through `home-authority-cli.mjs status`;
-- selected/ready D1 backend, remote current state, no transaction, and no pending backup keys;
+- selected/ready D1 backend, remote current state, no foreign or unresolved transaction, and no pending backup keys;
 - active scheduler mode, a held scheduler lease, and recent aligned-cycle/minute progress (with a startup grace window).
-- once per Windows boot, a tunnel-sidecar restart only after those authority checks pass, followed by bounded proof that the connector registered.
+- once per Windows boot, a tunnel-sidecar restart only after those authority checks pass;
+- two signed local/remote current-and-idle checks 60 seconds apart after that restart, plus a safe post-restart coordinator acquire/release and scheduler progress. A scheduler-owned lease/transaction for an actively progressing aligned cycle is recorded as pending until it settles; foreign, expired or stuck ownership still fails.
+- a logged deadline derived from the configured worst-case scheduler-cycle allowance (300 seconds by default), the 60-second stability interval and a 30-second margin. It is not reset by progress and cannot create a restart loop.
 
 The Compose health check itself proves only HTTP success plus service identity. Docker can report healthy while authority is stale or scheduler progress is stuck. The supervisor never clears pending state or activates stale authority. It performs at most one bounded container restart for a proven liveness-health failure; readiness, coordinator, progress, or WAN failures are retried/reported without destructive restart loops.
 
@@ -44,9 +48,15 @@ Docker daemon restart policy can resume the authority and tunnel concurrently wi
 Compose dependency ordering. The supervisor records the current OS boot identity in ignored
 `data-authority/startup-cloudflared-boot.json`. After the host and signed coordinator are current and
 the scheduler is progressing, it restarts only `cloudflared` once for that boot, waits for a
-registered connector, and rechecks authority readiness. Re-running the supervisor in the same boot
-does not repeat the restart. Connector registration cannot by itself prove an authenticated public
+registered connector, then runs the stability gate above. Re-running the supervisor in the same boot
+does not repeat the restart after the gate has passed. The 60-second separation crosses the 46-second
+post-declaration failure observed during the 2026-11-21 power recovery. If the aligned scheduler cycle
+owns the coordinator during a sample, the gate preserves any earlier idle observation, waits for the
+publication to settle, and reacquires its post-restart coordinator proof. The derived deadline still
+bounds a genuinely stuck cycle, network loss or unresolved state. Connector registration cannot by itself prove an authenticated public
 feed traverses the host; the notification visibility barrier remains the end-to-end route check.
+
+Each managed run persists a privacy-safe aggregate timeline in `data-authority/startup-recovery-timeline.json`: startup/Docker/Home/tunnel/gate phases, reconciliation direction and counts, post-restart proof times, and final outcome. History is retained for seven days and bounded to 20 runs. It never stores identifiers, payloads, tokens or raw status. Public status is degraded—not outage—while this bounded gate is actively progressing, and is healthy only after it passes. A failed/expired gate exits nonzero and remains in audit history. If service later proves a completed clean post-failure cycle, fresh signed local/remote current-idle agreement, matching record counts, fresh source, clear notification barrier, zero queues/backlog/failures, no pending backup and settled publication, it records `supersededAt`, a fixed reason and aggregate proof. That explicit proof clears only the old failure's effect on live readiness; it does not rewrite the failed outcome. A startup-driven outage uses the run's terminal failure time as `since`, falling back to its begin time for legacy evidence. Supersession removes that stale incident time.
 
 ### Install, inspect, or remove per-user startup
 
@@ -82,7 +92,7 @@ The Scheduled Task installer remains an optional administrator-controlled altern
 |---|---|---:|
 | Authority process/container exits | Docker restarts it with the persistent bind mount; lease/transaction safeguards still apply. | At most 5 minutes |
 | Docker is stopped at sign-in | Hidden per-user Startup launcher starts Docker Desktop minimized, waits for `docker info`, then applies Compose idempotently. | At most 10 minutes after sign-in |
-| Reboot or power restoration | Same at-logon flow; an unclean lease must expire naturally. Once authority/coordinator readiness is proven, the supervisor performs the once-per-boot tunnel restart so VPC routing is established against the ready origin. | At most 10 minutes after sign-in/network |
+| Reboot or power restoration | Same at-logon flow; an unclean lease must expire naturally. Once authority/coordinator readiness is proven, the supervisor performs the once-per-boot tunnel restart, 60-second two-check stability gate and post-restart coordinator/scheduler proof. | At most 10 minutes after sign-in/network |
 | Sleep/hibernation | Docker/containers normally resume; cloudflared reconnects. A later task retry or manual dry status can reassert Compose without overlap. | At most 10 minutes after usable network |
 | Internet/Cloudflare outage | Containers remain intact; cloudflared and Home retry/back off. Supervisor classifies dependency failure and does not restart repeatedly. | At most 10 minutes after dependency return |
 | Container HTTP health is genuinely unhealthy | Supervisor may perform one bounded restart, then alerts/fails if liveness does not return. | At most 5 minutes when dependencies are healthy |
@@ -95,11 +105,13 @@ Every host JSON state write is serialized, written to a same-directory temporary
 
 If startup still reports `StateFileCorruptionError`, stop only `home-authority`, preserve the primary, `.bak`, `.tmp`, `.swap`, and `.corrupt-*` files, then follow the signed coordinator-status and D1 reconciliation sequence below. Never delete the scheduler or notification state merely to make the container start. D1 can reconstruct canonical keys, but not local YouTube quota reservations or an ambiguous claimed notification. After any recovery, require one completed aligned cycle, zero pending/overdue notification intents, and a Home-backed feed before declaring service restored. Durable known-content watermarks suppress historical uploads; never compensate by replaying a guessed backlog.
 
+Before active Home becomes ready, startup leases a fresh signed exact D1 snapshot and scans actual canonical reads plus every physical Miniflare blob. Empty, NUL, malformed, truncated, missing, and hash-divergent evidence is copied only into a timestamped forensic incident directory, never accepted as a durability generation. Home is marked stale and repaired only when the remote snapshot is current, idle, complete, and hash-verified; a second full scan must pass before activation. Remote unavailability, pending/divergent canonical state, or a failed rescan leaves Home closed. Canonical application writes are also recorded in a flushed atomic side mirror instead of wrapping Miniflare storage internals. Normal individual mirror writes flush the file and parent directory before completion. Whole-snapshot startup reconciliation flushes every atomic file first and performs one final directory sync for the completed batch; interruption before that final sync fails startup and the next exact canonical bootstrap resumes from complete old/new envelopes.
+
 An exact D1 restore may contain an older channel feed than the host-only detector state. The reconcile result now identifies changed channel recent/known keys and schedules those channels, plus any channel named by a durable pending intent, for bounded high-priority uploads-playlist revalidation. The marker survives restart and clears only after success. Do not bypass the public-feed visibility barrier or delete the pending intent: the repaired feed must become canonical first, after which the existing intent is delivered once through its normal durable claim. If YouTube itself has deleted, privatized, or replaced the intent's source video, active aligned cycles resolve it only after `videos.list` confirms the same missing source set twice at least four minutes apart. A single miss or API failure preserves the intent. Operators should use this automatic path; manual suppression is an incident-only last resort after a byte-for-byte state backup and independent proof that the exact source ID is permanently unavailable.
 
 A short `Home authority lease busy` at a minute boundary can be an ordinary signed app mutation, not corruption. The scheduler retries local acquisition within a bounded window. If the API lease is still valid after that window it records a contention skip, leaves Home current, performs no snapshot reconciliation, and persists any missed aligned sweep for the next safe minute. Do not manually clear the API lease. An expired lease or genuinely stale authority still fails closed into the normal integrity recovery path. Retained `scheduler.lastError` is incident history; current health is determined against the newest completed sweep, minute job, notification terminal observation, or YouTube success.
 
-The current host has the per-user Startup shortcut installed. A real power-loss recovery proved Docker, authority, monitoring, and the tunnel process restarted, but also exposed that daemon-level concurrent container restart could leave public VPC reads on D1 fallback despite registered tunnel connections. Restarting only the tunnel after authority readiness restored host routing without replacing the authority container or touching state. The checked-in once-per-boot sequencing fix has passed a safe same-boot idempotence test; the next controlled reboot/power recovery must confirm it end to end.
+The current host has the per-user Startup shortcut installed. The 2026-11-21 power-loss recovery proved Docker, authority, monitoring, and the tunnel process restarted automatically, but exposed two gaps: the original supervisor recorded success before a delayed stale/reconcile transition 46 seconds later, and the hourly post job could wait until the next boundary after a long outage. The strengthened gate and startup post catch-up close those gaps. After authority readiness, an overdue post pass receives one persistent `startup-catch-up` claim; its aggregate settled result records coverage and failures, and a nearby aligned pass deduplicates against it. Known-post watermarks, first-poll seeding, per-installation post settings and the normal publication/notification barrier remain unchanged, so recovery neither replays history nor bypasses opt-outs. A controlled future reboot remains the end-to-end confirmation for the Windows launcher itself.
 
 ## Total-loss recovery: what survives remotely
 

@@ -8,6 +8,8 @@ import {
 } from '../src/collector.mjs';
 
 test('collector config treats Durable Objects rows written as a separate daily guardrail', () => {
+  assert.equal(loadConfig({}).schedulerSettlementTimeoutMs, 90_000);
+  assert.equal(loadConfig({ TUBEPULSE_SCHEDULER_SETTLEMENT_TIMEOUT_MS: '45000' }).schedulerSettlementTimeoutMs, 45_000);
   assert.equal(loadConfig({}).limits.durableObjectRowsWritten, 100_000);
   assert.equal(loadConfig({ TUBEPULSE_DO_ROWS_WRITTEN_GUARDRAIL: '75000' }).limits.durableObjectRowsWritten, 75_000);
   assert.equal(loadConfig({}).limits.durableObjectRequests, 100_000);
@@ -101,6 +103,29 @@ test('scheduler settlement recognizes completed, failed and lease-busy cycles', 
   assert.deepEqual(await run({ currentSweep: null, lastSweep: { outcome: 'not-due', scheduledAt: '2026-10-10T20:09:00Z' }, lastError: {
     at: '2026-10-10T20:10:00.065Z', scheduledAt: '2026-10-10T20:10:00Z', message: 'Home authority lease busy',
   } }), { status: 'skipped', outcome: 'lease-busy', waitedMs: 0, polls: 1 });
+});
+
+test('scheduler settlement waits for the explicit in-memory cycle even without a persisted currentSweep', async () => {
+  const boundaryMs = Date.parse('2026-10-10T20:10:00Z');
+  let nowMs = boundaryMs + 30_000;
+  let calls = 0;
+  const result = await waitForSchedulerSettlement({
+    statusUrl: 'http://host.test/status', boundaryMs, timeoutMs: 2_000, pollMs: 1_000,
+    now: () => nowMs,
+    sleep: async (delay) => { nowMs += delay; },
+    fetchImpl: async () => {
+      calls++;
+      return jsonResponse({ scheduler: calls === 1 ? {
+        currentSweep: null,
+        activeCycle: { kind: 'minute', scheduledAt: new Date(boundaryMs).toISOString(), startedAt: new Date(boundaryMs).toISOString() },
+        lastSweep: { outcome: 'not-due', scheduledAt: new Date(boundaryMs - 60_000).toISOString() },
+      } : {
+        currentSweep: null, activeCycle: null,
+        lastSweep: { outcome: 'ok', scheduledAt: new Date(boundaryMs).toISOString(), finishedAt: new Date(boundaryMs + 31_000).toISOString() },
+      } });
+    },
+  });
+  assert.deepEqual(result, { status: 'complete', outcome: 'ok', waitedMs: 1_000, polls: 2 });
 });
 
 test('collector waits for an active aligned cycle and samples its completed counter alone', async (t) => {

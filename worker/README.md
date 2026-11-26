@@ -292,7 +292,9 @@ shape and `clearAll` remain for released clients.
 
 **Allowlist:** `TUBEPULSE_COMMUNITY_POST_CHANNEL_ALLOWLIST` (worker env var, optional). When blank/missing, all channels in `channels:active` are polled. When set to a comma-separated list of channel IDs, only those active channels are polled.
 
-**Polling:** Hourly via InnerTube `youtubei/v1/browse` (not YouTube Data API — 0 quota cost).
+**Polling:** Normally hourly via InnerTube `youtubei/v1/browse` (not YouTube Data API — 0 quota cost). Active Home also runs one immediate bounded `startup-catch-up` when the last successful pass is older than the configured cadence. A persisted claim/last-attempt/last-success record plus the scheduler lock deduplicates a nearby aligned pass and recovers an interrupted claim.
+
+**Response bound:** Home streams the response into a counted buffer. The default ceiling is 10 MiB and configuration is capped at 12 MiB. A declared oversize is rejected before reading; chunked or false-length responses are cancelled once the actual byte count crosses the ceiling. Size-limit failures are deterministic and are not retried again in the same sweep. Content is never logged. At the production concurrency of four, raw response buffering is bounded to 40 MiB by default; the conservative byte/string/object model is approximately 200 MiB (240 MiB at the maximum).
 
 **State keys:**
 - `channel:{id}:recent:posts` — display cache (latest post only)

@@ -13,6 +13,7 @@ import { reconcileHomeAuthority } from './home-authority-reconcile.mjs';
 import { readHomeSchedulerConfig } from './home-scheduler-config.mjs';
 import { createHomeSchedulerSyncStateFile, FileLease } from './home-scheduler.mjs';
 import { LocalKvAdapter } from './kv-adapters.mjs';
+import { DurableKvMirror } from './kv-durable-mirror.mjs';
 import { TubePulseRuntime } from './runtime.mjs';
 import { createUnifiedHomeAuthorityService } from './home-authority-service.mjs';
 
@@ -68,7 +69,9 @@ async function reconcile(config) {
   });
   try {
     await runtime.start();
-    const local = new LocalKvAdapter(await runtime.getLocalNamespace());
+    const local = new LocalKvAdapter(await runtime.getLocalNamespace(), {
+      durableMirror: new DurableKvMirror(config.dataDir),
+    });
     const gate = new HomeAuthorityGate({
       adapter: local,
       stateFile: createHomeAuthorityStateFile(config.dataDir),
@@ -105,6 +108,49 @@ async function status(config) {
   }));
 }
 
+async function verifyCoordinator(config, notBeforeText) {
+  const notBefore = Date.parse(String(notBeforeText || ''));
+  if (!Number.isFinite(notBefore)) throw new Error('verify-coordinator requires the tunnel restart timestamp');
+  const client = new AuthorityClient({
+    baseUrl: config.authority.apiUrl,
+    secret: config.authority.secret,
+    timeoutMs: config.authority.timeoutMs,
+  });
+  const startedAt = Date.now();
+  if (startedAt < notBefore) throw new Error('Coordinator proof began before the tunnel restart');
+  const before = await client.status();
+  if (before?.replication?.status !== 'current' || before?.transaction || before?.lease
+    || Number(before?.pendingBackupKeys || 0) !== 0
+    || before?.backend?.selected !== 'd1' || before?.backend?.ready !== true) {
+    throw new Error('Coordinator is not idle and current before verification');
+  }
+  let leaseId = null;
+  let acquiredAt = null;
+  try {
+    const acquired = await client.acquirePublication({ ttlMs: 15_000, retryWindowMs: 10_000 });
+    leaseId = acquired.leaseId;
+    acquiredAt = Date.now();
+  } finally {
+    if (leaseId) await client.releasePublication(leaseId);
+  }
+  const releasedAt = Date.now();
+  const after = await client.status();
+  if (after?.replication?.status !== 'current' || after?.transaction || after?.lease
+    || Number(after?.pendingBackupKeys || 0) !== 0
+    || after?.backend?.selected !== 'd1' || after?.backend?.ready !== true) {
+    throw new Error('Coordinator did not return to an idle current state after verification');
+  }
+  console.log(JSON.stringify({
+    ok: true,
+    startedAt: new Date(startedAt).toISOString(),
+    acquiredAt: new Date(acquiredAt).toISOString(),
+    releasedAt: new Date(releasedAt).toISOString(),
+    replication: 'current',
+    recordCount: Number(after.replication?.recordCount || 0),
+    pendingBackupKeys: 0,
+  }));
+}
+
 async function drainPending(config) {
   const client = new AuthorityClient({
     baseUrl: config.authority.apiUrl,
@@ -138,7 +184,9 @@ async function migrateD1(config) {
   });
   try {
     await runtime.start();
-    const local = new LocalKvAdapter(await runtime.getLocalNamespace());
+    const local = new LocalKvAdapter(await runtime.getLocalNamespace(), {
+      durableMirror: new DurableKvMirror(config.dataDir),
+    });
     const gate = new HomeAuthorityGate({
       adapter: local,
       stateFile: createHomeAuthorityStateFile(config.dataDir),
@@ -204,11 +252,12 @@ async function main() {
   const [command = 'run', argument, flag] = process.argv.slice(2);
   const config = readHomeSchedulerConfig();
   if (command === 'status') return await status(config);
+  if (command === 'verify-coordinator') return await verifyCoordinator(config, argument);
   if (command === 'drain-pending') return await drainPending(config);
   if (command === 'reconcile') return await reconcile(config);
   if (command === 'migrate-d1') return await migrateD1(config);
   if (command === 'purge-devices') return await purgeDevices(config, argument, flag === '--apply');
-  if (command !== 'run') throw new Error('Usage: node src/home-authority-cli.mjs run|status|drain-pending|reconcile|migrate-d1|purge-devices <plan.json> [--apply]');
+  if (command !== 'run') throw new Error('Usage: node src/home-authority-cli.mjs run|status|verify-coordinator <tunnel-restarted-at>|drain-pending|reconcile|migrate-d1|purge-devices <plan.json> [--apply]');
   installServiceShutdownHandlers();
   serviceStartup = createUnifiedHomeAuthorityService(config);
   liveService = await serviceStartup;

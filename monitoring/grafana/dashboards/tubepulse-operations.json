@@ -376,6 +376,13 @@
           "refId": "O",
           "instant": true,
           "range": false
+        },
+        {
+          "expr": "max(ALERTS{alertstate=\"firing\",alertname=~\"TubePulse(LocalBlobIntegrityFailure|HomeFeedFailure|VisibilityBarrierSuppression|DurableIntentOverdue)\"}) > 0",
+          "legendFormat": "Integrity/feed delivery",
+          "refId": "Q",
+          "instant": true,
+          "range": false
         }
       ],
       "fieldConfig": {

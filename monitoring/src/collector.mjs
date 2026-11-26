@@ -8,6 +8,7 @@ import { appendSnapshotOnce, pruneSnapshots, readJson, writeJsonAtomic } from '.
 
 const FIVE_MINUTES_MS = 5 * 60 * 1000;
 const COLLECTION_OFFSET_MS = 30 * 1000;
+const SCHEDULER_SETTLEMENT_TIMEOUT_MS = 90 * 1000;
 
 function counterDelta(current, previous) {
   const next = Number(current);
@@ -59,7 +60,11 @@ export function loadConfig(env = process.env) {
     stateFile: env.TUBEPULSE_COLLECTOR_STATE_FILE || '/data/collector/state.json',
     cadenceMs: integer(env.TUBEPULSE_MONITORING_CADENCE_MS, FIVE_MINUTES_MS, 60_000),
     collectionOffsetMs: integer(env.TUBEPULSE_MONITORING_OFFSET_MS, COLLECTION_OFFSET_MS, 0),
-    schedulerSettlementTimeoutMs: integer(env.TUBEPULSE_SCHEDULER_SETTLEMENT_TIMEOUT_MS, 20_000, 0),
+    schedulerSettlementTimeoutMs: integer(
+      env.TUBEPULSE_SCHEDULER_SETTLEMENT_TIMEOUT_MS,
+      SCHEDULER_SETTLEMENT_TIMEOUT_MS,
+      0,
+    ),
     schedulerSettlementPollMs: integer(env.TUBEPULSE_SCHEDULER_SETTLEMENT_POLL_MS, 1_000, 100),
     analyticsDelayMs: integer(env.TUBEPULSE_CLOUDFLARE_DELAY_MS, 10 * 60 * 1000, 0),
     retentionDays: integer(env.TUBEPULSE_SNAPSHOT_RETENTION_DAYS, 1095, 32),
@@ -168,7 +173,9 @@ export async function waitForSchedulerSettlement({
         failure: safeFailure(error),
       };
     }
-    if (!status?.scheduler?.currentSweep) {
+    const scheduler = status?.scheduler || {};
+    const boundaryCycleActive = cycleMatchesBoundary(scheduler.activeCycle, boundaryMs, cadenceMs);
+    if (!scheduler.currentSweep && !boundaryCycleActive) {
       const terminal = terminalCycle(status, boundaryMs, cadenceMs);
       return { ...terminal, waitedMs: Math.max(0, now() - startedAt), polls };
     }
