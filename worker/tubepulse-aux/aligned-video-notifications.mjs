@@ -6,11 +6,15 @@ import {
   getKV,
   isDndActive,
   key,
-  putKV,
   sendFCMPush,
   videoNotificationTag,
-  withKvMutationLock,
 } from '../tubepulse-cron/shared.mjs';
+import {
+  advanceNagLedgerCursor,
+  nagCursorForChannel,
+  pruneNagLedgerChannels,
+  readNagLedger,
+} from '../tubepulse-cron/nag-ledger.mjs';
 
 const FIVE_MINUTES_MS = 5 * 60 * 1000;
 const APP_VISIBLE_VIDEO_LIMIT = 3;
@@ -109,6 +113,7 @@ export async function runAlignedVideoNotifications(env, ctx, scheduledTime, {
   let queued = 0;
   let accessToken = null;
   let projectId = null;
+  const ledgers = new Map();
 
   for (const entry of [...new Set(entries)].sort()) {
     if (candidatePairs && !candidatePairs.has(entry)) continue;
@@ -117,8 +122,13 @@ export async function runAlignedVideoNotifications(env, ctx, scheduledTime, {
     const deviceId = entry.slice(0, separator);
     const channelId = entry.slice(separator + 1);
     const state = await getKV(kv, key.deviceState(deviceId, channelId));
-    if (!Array.isArray(state?.unwatched) || state.unwatched.length === 0) continue;
+    if (!Array.isArray(state?.unwatched) || state.unwatched.length === 0) {
+      await pruneNagLedgerChannels(kv, deviceId, [channelId]);
+      continue;
+    }
     checked++;
+    if (!ledgers.has(deviceId)) ledgers.set(deviceId, await readNagLedger(kv, deviceId));
+    const nagCursor = nagCursorForChannel(ledgers.get(deviceId), channelId, state);
 
     const [profile, settings, override, meta, recent] = await Promise.all([
       getKV(kv, key.deviceProfile(deviceId)),
@@ -141,7 +151,7 @@ export async function runAlignedVideoNotifications(env, ctx, scheduledTime, {
     const decision = alignedNotificationDecision({
       scheduledTime,
       activationAt,
-      state,
+      state: { ...state, ...nagCursor },
       videos,
       effective,
       newlyDetected,
@@ -170,20 +180,14 @@ export async function runAlignedVideoNotifications(env, ctx, scheduledTime, {
           notificationCapability: profile.notificationCapability || null,
           payload,
           contentIds,
-          dedupeVersion: decision.kind === 'nag' ? `${decision.raster}:${state.lastNagAt || 0}` : undefined,
+          dedupeVersion: decision.kind === 'nag' ? `${decision.raster}:${nagCursor.lastNagAt || 0}` : undefined,
           watermarkAt: decision.raster,
           requireUnwatched: true,
           onResult: async (result) => {
             if (result?.sent) {
-              await withKvMutationLock(env, key.deviceState(deviceId, channelId), async () => {
-                const current = await getKV(kv, key.deviceState(deviceId, channelId)) || state;
-                await putKV(kv, key.deviceState(deviceId, channelId), {
-                  ...current,
-                  lastNagAt: decision.raster,
-                  ...(decision.kind === 'nag'
-                    ? { nagCount: Number(current.nagCount || 0) + 1 }
-                    : {}),
-                });
+              await advanceNagLedgerCursor(env, deviceId, channelId, {
+                lastNagAt: decision.raster,
+                incrementNagCount: decision.kind === 'nag',
               });
             } else if (result?.deadToken) {
               await cleanupDeadDevice(deviceId, env, 'fcm_unregistered');
@@ -193,9 +197,10 @@ export async function runAlignedVideoNotifications(env, ctx, scheduledTime, {
       });
       queued++;
     } else if (delivery.sent) {
-      state.lastNagAt = decision.raster;
-      if (decision.kind === 'nag') state.nagCount = Number(state.nagCount || 0) + 1;
-      await putKV(kv, key.deviceState(deviceId, channelId), state);
+      await advanceNagLedgerCursor(env, deviceId, channelId, {
+        lastNagAt: decision.raster,
+        incrementNagCount: decision.kind === 'nag',
+      });
       queued++;
     } else if (delivery.deadToken) {
       ctx.waitUntil(cleanupDeadDevice(deviceId, env, 'fcm_unregistered'));

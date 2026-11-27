@@ -47,8 +47,8 @@ test('aggregate monitoring counts profiles and subscriptions without exposing re
           outcome: 'ok',
           mutations: {
             localMutations: 5, uniqueKeys: 4,
-            byFamily: { 'channel-recent-videos': 3, 'device-state': 2, privateIdentifier: 99 },
-            byReason: { 'metrics-only': 3, 'notification-state': 2, privateReason: 99 },
+            byFamily: { 'channel-recent-videos': 3, 'device-state': 2, 'nag-ledger': 1, privateIdentifier: 99 },
+            byReason: { 'metrics-only': 3, 'notification-state': 2, 'packed-nag-ledger': 1, privateReason: 99 },
           },
         },
         lastNotificationDelivery: {
@@ -148,7 +148,9 @@ test('aggregate monitoring counts profiles and subscriptions without exposing re
   assert.equal(payload.authority.publicationProjection.rows, 16);
   assert.equal(payload.authority.publicationProjection.exhaustionRisk, false);
   assert.equal(payload.authority.publicationMutations.byFamily['channel-recent-videos'], 3);
+  assert.equal(payload.authority.publicationMutations.byFamily['nag-ledger'], 1);
   assert.equal(payload.authority.publicationMutations.byReason['metrics-only'], 3);
+  assert.equal(payload.authority.publicationMutations.byReason['packed-nag-ledger'], 1);
   assert.equal(Object.hasOwn(payload.authority.publicationMutations.byFamily, 'privateIdentifier'), false);
   assert.equal(Object.hasOwn(payload.authority.publicationMutations.byReason, 'privateReason'), false);
   assert.equal(payload.authority.requestTelemetry.total, 50);

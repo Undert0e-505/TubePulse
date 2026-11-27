@@ -158,6 +158,7 @@ test('aligned owner emits exactly one current top-three intent and success advan
     'nag:active': [`${deviceId}|${channelId}`],
     [`device:${deviceId}:profile`]: { fcmToken: 'token', notificationCapability: 'local-v1' },
     [`device:${deviceId}:settings`]: { mode: 'relentless', nagInterval: 5 },
+    [`device:${deviceId}:channels`]: [channelId],
     [`device:${deviceId}:override:${channelId}`]: { notificationMode: 'relentless', nagInterval: 5 },
     [stateKey]: { unwatched: ['A', 'B', 'C', 'D'], lastNagAt: at('12:10'), nagCount: 12 },
     [`channel:${channelId}:meta`]: { name: 'Channel' },
@@ -183,9 +184,13 @@ test('aligned owner emits exactly one current top-three intent and success advan
   assert.equal(JSON.parse(kv.values.get(stateKey)).lastNagAt, at('12:10'));
   await intents[0].onResult({ sent: true, deadToken: false });
   const state = JSON.parse(kv.values.get(stateKey));
-  assert.equal(state.lastNagAt, at('12:15'));
+  assert.equal(state.lastNagAt, at('12:10'), 'legacy cursor is no longer advanced');
   assert.equal(state.nagCount, 12, 'new content is not counted as a reminder');
   assert.deepEqual(state.unwatched, ['A', 'B', 'C', 'D']);
+  assert.deepEqual(JSON.parse(kv.values.get(`device:${deviceId}:nag-ledger`)), {
+    schemaVersion: 1,
+    channels: { [channelId]: { lastNagAt: at('12:15'), nagCount: 12 } },
+  });
 });
 
 test('a precise live transition evaluates only its candidate device/channel pairs', async () => {

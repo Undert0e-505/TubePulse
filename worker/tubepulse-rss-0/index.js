@@ -11,6 +11,7 @@ import {
   updateKnownVideosAfterPoll, mergeRssUploadsIntoRecentVideos,
   effectiveNotificationSettings, videoNotificationTag,
 } from '../tubepulse-cron/shared.mjs';
+import { advanceNagLedgerCursor } from '../tubepulse-cron/nag-ledger.mjs';
 
 const RSS_MAX_SHARDS = 3;
 
@@ -256,10 +257,7 @@ export async function processChannelUploads(env, ctx, channelId, source, options
             requireUnwatched: true,
             onResult: async (result) => {
               if (result?.sent) {
-                await withKvMutationLock(env, key.deviceState(deviceId, channelId), async () => {
-                  const current = await getKV(kv, key.deviceState(deviceId, channelId)) || state;
-                  await putKV(kv, key.deviceState(deviceId, channelId), { ...current, lastNagAt: now });
-                });
+                await advanceNagLedgerCursor(env, deviceId, channelId, { lastNagAt: now });
               } else if (result?.deadToken) {
                 await cleanupDeadDevice(deviceId, env, 'fcm_unregistered');
               }
@@ -269,8 +267,7 @@ export async function processChannelUploads(env, ctx, channelId, source, options
       }
       if (pushResult.deadToken) deadDevices.push(deviceId);
       if (pushResult.sent) {
-        state.lastNagAt = now;
-        await putKV(kv, key.deviceState(deviceId, channelId), state);
+        await advanceNagLedgerCursor(env, deviceId, channelId, { lastNagAt: now });
       }
     }
   }

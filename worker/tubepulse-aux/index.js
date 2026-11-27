@@ -14,9 +14,14 @@ import {
   key, getKV, putKV, isDndActive, getNagIntervalMs,
   getCachedFcmAccessToken, sendFCMPush, cleanupDeadDevice,
   removeFromNagActive,
-  withKvMutationLock,
   effectiveNotificationSettings, videoNotificationTag,
 } from '../tubepulse-cron/shared.mjs';
+import {
+  advanceNagLedgerCursor,
+  nagCursorForChannel,
+  pruneNagLedgerChannels,
+  readNagLedger,
+} from '../tubepulse-cron/nag-ledger.mjs';
 
 const NAG_BATCH_SIZE = 5;
 const TICK_MS = 5 * 60 * 1000;
@@ -158,6 +163,7 @@ async function runNag(env, ctx, now) {
 
   let accessToken = null;
   let projectId = null;
+  const ledgers = new Map();
 
   for (const entry of batch) {
     const parts = entry.split('|');
@@ -172,11 +178,14 @@ async function runNag(env, ctx, now) {
     const state = await getKV(env.TUBEPULSE_KV, key.deviceState(deviceId, channelId));
     if (!state?.unwatched || state.unwatched.length === 0) {
       // Nothing unwatched — remove from index
+      await pruneNagLedgerChannels(env.TUBEPULSE_KV, deviceId, [channelId]);
       await removeFromNagActive(env, deviceId, channelId);
       continue;
     }
 
     checked++;
+    if (!ledgers.has(deviceId)) ledgers.set(deviceId, await readNagLedger(env.TUBEPULSE_KV, deviceId));
+    const nagCursor = nagCursorForChannel(ledgers.get(deviceId), channelId, state);
 
     const [profile, settings, override] = await Promise.all([
       getKV(env.TUBEPULSE_KV, key.deviceProfile(deviceId)),
@@ -194,8 +203,8 @@ async function runNag(env, ctx, now) {
     if (dndActive && !effective.dndBypass) continue;
 
     // Tick-aligned interval check
-    const intervalMs = getNagIntervalMs(effective, state);
-    const lastNagAt = state.lastNagAt || 0;
+    const intervalMs = getNagIntervalMs(effective, nagCursor);
+    const lastNagAt = nagCursor.lastNagAt || 0;
     const lastNagTick = lastNagAt > 0 ? Math.floor(lastNagAt / TICK_MS) * TICK_MS : 0;
     if (lastNagTick > 0 && (now - lastNagTick) < intervalMs) continue;
 
@@ -305,17 +314,13 @@ async function runNag(env, ctx, now) {
             notificationCapability: profile.notificationCapability || null,
             payload: notifPayload,
             contentIds: [...selectedContentIds],
-            dedupeVersion: `${state.lastNagAt || 0}:${state.nagCount || 0}`,
+            dedupeVersion: `${nagCursor.lastNagAt || 0}:${nagCursor.nagCount || 0}`,
             requireUnwatched: true,
             onResult: async (delivery) => {
               if (delivery?.sent) {
-                await withKvMutationLock(env, key.deviceState(deviceId, channelId), async () => {
-                  const current = await getKV(env.TUBEPULSE_KV, key.deviceState(deviceId, channelId)) || state;
-                  await putKV(env.TUBEPULSE_KV, key.deviceState(deviceId, channelId), {
-                    ...current,
-                    lastNagAt: now,
-                    nagCount: (current.nagCount || 0) + 1,
-                  });
+                await advanceNagLedgerCursor(env, deviceId, channelId, {
+                  lastNagAt: now,
+                  incrementNagCount: true,
                 });
               } else if (delivery?.deadToken) {
                 await cleanupDeadDevice(deviceId, env, 'fcm_unregistered');
@@ -326,9 +331,10 @@ async function runNag(env, ctx, now) {
       }
       if (result.sent) {
         fired++;
-        state.lastNagAt = now;
-        state.nagCount = (state.nagCount || 0) + 1;
-        await putKV(env.TUBEPULSE_KV, key.deviceState(deviceId, channelId), state);
+        await advanceNagLedgerCursor(env, deviceId, channelId, {
+          lastNagAt: now,
+          incrementNagCount: true,
+        });
       } else if (result.deadToken) {
         deadTokens.push(deviceId);
       }

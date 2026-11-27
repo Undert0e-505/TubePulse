@@ -7,9 +7,10 @@ import { pollSingleRssChannel, processChannelUploads } from '../../worker/tubepu
 import { runAuxTick } from '../../worker/tubepulse-aux/index.js';
 import { runAlignedVideoNotifications } from '../../worker/tubepulse-aux/aligned-video-notifications.mjs';
 import {
-  cleanupDeadChannel, cleanupDeadDevice, getKV, key, mergeRssUploadsIntoRecentVideos, putKV, putKVIfChanged,
-  removeFromNagActive, stableJson,
+  cleanupDeadChannel, cleanupDeadDevice, drainDeadDeviceCleanupQueue, getKV, key,
+  mergeRssUploadsIntoRecentVideos, putKV, putKVIfChanged, removeFromNagActive, stableJson,
 } from '../../worker/tubepulse-cron/shared.mjs';
+import { applyNagLedgerAdvances, nagLedgerKey, pruneNagLedgerChannels } from '../../worker/tubepulse-cron/nag-ledger.mjs';
 import { isSyncExcluded } from './exclusions.mjs';
 import { JsonStateFile } from './file-state.mjs';
 import {
@@ -415,6 +416,7 @@ export function mutationKeyFamily(name) {
   if (/^channel:[^:]+:subscribers$/.test(name)) return 'channel-subscribers';
   if (typeof name === 'string' && name.startsWith('device:')) {
     const payload = name.slice('device:'.length);
+    if (payload.endsWith(':nag-ledger') && payload.length > ':nag-ledger'.length) return 'nag-ledger';
     const stateMarker = payload.lastIndexOf(':state:');
     if (stateMarker > 0 && stateMarker + ':state:'.length < payload.length) return 'device-state';
     if (payload.length > 0 && payload.includes(':')) return 'device-record';
@@ -451,6 +453,7 @@ export function mutationReason(name, previousValue, nextValue, operation = 'put'
   if (family === 'device-state' || family === 'nag-active' || family === 'upcoming-events' || family === 'prewarn-sent') {
     return 'notification-state';
   }
+  if (family === 'nag-ledger') return 'packed-nag-ledger';
   if (family === 'fcm-token-cache') return 'token-cache';
   if (family === 'channel-meta') return 'channel-metadata';
   if (family === 'channel-post-first-poll') return 'first-run-suppression';
@@ -1049,6 +1052,7 @@ export class HomeSchedulerRunner {
     notificationQueue = [],
     pendingNotifications = new Set(),
     alignedVideoDirty = new Set(),
+    nagLedgerAdvances = new Map(),
   ) {
     return {
       ...this.config.workerBindings,
@@ -1064,6 +1068,37 @@ export class HomeSchedulerRunner {
       ),
       TUBEPULSE_ALIGNED_VIDEO_DIRTY: (deviceId, channelId) => {
         alignedVideoDirty.add(`${deviceId}|${channelId}`);
+      },
+      TUBEPULSE_NAG_LEDGER_ADVANCE: async (deviceId, channelId, advance) => {
+        const device = String(deviceId);
+        const channel = String(channelId);
+        if (!nagLedgerAdvances.has(device)) nagLedgerAdvances.set(device, new Map());
+        const byChannel = nagLedgerAdvances.get(device);
+        const previous = byChannel.get(channel);
+        const nextAt = Number(advance?.lastNagAt);
+        if (!Number.isFinite(nextAt) || nextAt <= 0) return false;
+        byChannel.set(channel, {
+          channelId: channel,
+          lastNagAt: Math.max(Number(previous?.lastNagAt) || 0, nextAt),
+          incrementNagCount: Boolean(previous?.incrementNagCount || advance?.incrementNagCount),
+        });
+        return true;
+      },
+      TUBEPULSE_NAG_LEDGER_FLUSH: async (deviceId = null) => {
+        const devices = deviceId === null
+          ? [...nagLedgerAdvances.keys()].sort()
+          : [String(deviceId)].filter((device) => nagLedgerAdvances.has(device));
+        let writes = 0;
+        for (const device of devices) {
+          const advances = [...nagLedgerAdvances.get(device).values()]
+            .sort((left, right) => left.channelId.localeCompare(right.channelId));
+          const result = await this.kvMutationMutex.run(nagLedgerKey(device), async () => (
+            await applyNagLedgerAdvances(target, device, advances)
+          ));
+          nagLedgerAdvances.delete(device);
+          if (result.changed) writes++;
+        }
+        return { writes };
       },
       TUBEPULSE_SHADOW_NOTIFICATION_OBSERVER: async (intent) => {
         const { kind, deviceId, channelId } = intent || {};
@@ -1388,7 +1423,10 @@ export class HomeSchedulerRunner {
         unwatched,
         ...(unwatched.length === 0 ? { lastNagAt: null, nagCount: 0 } : {}),
       });
-      if (unwatched.length === 0) await removeFromNagActive(env, deviceId, event.channelId);
+      if (unwatched.length === 0) {
+        await pruneNagLedgerChannels(target, deviceId, [event.channelId]);
+        await removeFromNagActive(env, deviceId, event.channelId);
+      }
     }
   }
 
@@ -2400,7 +2438,13 @@ export class HomeSchedulerRunner {
 
   async runMinuteJobs(env, target, scheduledTime, { forcePosts = false, postReason = null } = {}) {
     const ctx = new WaitUntilContext();
-    const result = { scheduledAt: iso(scheduledTime), posts: { outcome: 'disabled' }, aux: { outcome: 'pending' } };
+    const deadDeviceCleanup = await drainDeadDeviceCleanupQueue(env);
+    const result = {
+      scheduledAt: iso(scheduledTime),
+      deadDeviceCleanup,
+      posts: { outcome: 'disabled' },
+      aux: { outcome: 'pending' },
+    };
     let postClaim = null;
     if (isCommunityPostsEnabled(env)) {
       const active = await getKV(target, key.channelsActive()) || [];
@@ -2493,6 +2537,7 @@ export class HomeSchedulerRunner {
     const notificationQueue = [];
     const pendingNotifications = new Set();
     const alignedVideoDirty = new Set();
+    const nagLedgerAdvances = new Map();
     try {
       const initialState = await this.stateFile.read();
       const deferredSweepDue = !preciseLiveOnly && Boolean(initialState.deferredVideoSweep?.due);
@@ -2514,7 +2559,7 @@ export class HomeSchedulerRunner {
         alignedActivationAt = Date.parse(state.alignedVideoNotifications.activatedAt);
       }
       const env = this.createEnvironment(
-        target, notifications, notificationQueue, pendingNotifications, alignedVideoDirty,
+        target, notifications, notificationQueue, pendingNotifications, alignedVideoDirty, nagLedgerAdvances,
       );
       const sweep = preciseLiveOnly ? null : this.config.videoSourceMode === 'youtube-api'
         ? await this.runYoutubeDataApiCycle(env, target, scheduledTime, { force: effectiveForceSweep })

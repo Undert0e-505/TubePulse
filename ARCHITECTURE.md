@@ -202,11 +202,19 @@ device:{deviceId}:override:{channelId}
         Notification dispatch reads with a fallback to defaults.
 
 device:{deviceId}:state:{channelId}
-  → JSON { unwatched: [videoIds], lastNagAt, nagCount }
+  → JSON { unwatched: [videoIds], lastNagAt?, nagCount? }
   Read on:  Home notification fan-out and /feed
-  Written:  on notification state changes and /seen
+  Written:  on app-visible content changes and /seen
   Note: keyed per (device, channel) to keep individual reads small and
-        avoid hot-key contention on a single device:state blob
+        preserve independent unseen semantics. Legacy cursor fields are
+        read only until lazy migration and are not advanced afterward.
+
+device:{deviceId}:nag-ledger
+  → JSON { schemaVersion: 1, channels: { [channelId]: { lastNagAt, nagCount } } }
+  Read on:  Home reminder decisions
+  Written:  once per installation after successful deliveries in an aligned cycle
+  Note: backend-only, deterministic and bounded; mark-seen, unsubscribe and
+        device cleanup prune entries without changing notification payloads
 ```
 
 #### 5.3.3 Time-bucket keys
@@ -335,7 +343,7 @@ The shards therefore process up to three channels per five-minute tick. For `N` 
 When `TUBEPULSE_HOME_ALIGNED_VIDEO_NOTIFICATIONS_ENABLED=false`, the retained minute aux path reads
 `nag:active` and checks a bounded, time-rotated batch. It rebuilds each due reminder from current
 visible state, keeps reminder attempts transient, and advances `lastNagAt`/`nagCount` only after a
-successful delivery. This path retains its historical five-minute after-twelve backoff and rotating
+successful delivery in the packed installation ledger. This path retains its historical five-minute after-twelve backoff and rotating
 scan delay solely for rollback compatibility.
 
 Current production sets the flag true, so this video-nag path is skipped and aux retains only
@@ -454,7 +462,7 @@ Logic:
 1. Read `device:{deviceId}:state:{channelId}`
 2. Remove only the specified exact IDs (or all if legacy `clearAll: true`)
 3. Write back
-4. If no unwatched content remains, remove the device/channel pair from `nag:active`; otherwise a later transient reminder is rebuilt from current visible state
+4. If no unwatched content remains, prune its packed reminder cursor and remove the device/channel pair from `nag:active`; otherwise a later transient reminder is rebuilt from current visible state
 
 ### 8.5 GET /feed
 
@@ -620,8 +628,8 @@ Defense: persist aggregate accepted/failed counters locally without notification
 ### 10.4 Device deleted from Play Store but FCM token still valid
 
 Symptoms: pushes continue forever to a phantom user.
-Recovery: a permanent invalid-token response (`404`, canonical `UNREGISTERED`, or legacy `NotRegistered`) invokes the standard device cleanup, deleting the device-owned records and removing its subscriber memberships. This can also follow token rotation, so it is not itself proof of an uninstall.
-Defense: include cleanup-on-FCM-error as part of the standard send path. Persist privacy-safe raw-response and token-lifecycle-deduplicated cleanup totals plus short-lived aggregate occurrence buckets for monitoring; these metrics are not service-health faults and expose no device or token identity.
+Recovery: a permanent invalid-token response (`404`, canonical `UNREGISTERED`, or legacy `NotRegistered`) immediately removes the dead profile/token index and creates a durable cleanup plan. Home drains that installation at no more than 20 channels per minute, removing subscriber, state and orphaned-channel records in canonical batches safely below the authority's 1,000-delta limit. A returning registration restores any already-detached indexes and cancels the plan. Token invalidation can also follow rotation, so it is not itself proof of an uninstall.
+Defense: after the first permanent response in a delivery cycle, later intents for the same installation are resolved without another FCM call. Persist privacy-safe raw-response and token-lifecycle-deduplicated cleanup totals plus short-lived aggregate occurrence buckets for monitoring; these metrics are not service-health faults and expose no device or token identity.
 
 ### 10.5 KV throttling
 

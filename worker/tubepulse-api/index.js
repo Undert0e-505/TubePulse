@@ -5,7 +5,15 @@ import {
   normalizeNotificationCapability,
   effectiveNotificationSettings,
   videoNotificationTag,
+  cleanupDeadDevice as queueDeadDeviceCleanup,
+  cancelDeadDeviceCleanup,
 } from '../tubepulse-cron/shared.mjs';
+import {
+  advanceNagLedgerCursor,
+  mergeNagLedgers,
+  nagLedgerKey,
+  pruneNagLedgerChannels,
+} from '../tubepulse-cron/nag-ledger.mjs';
 
 export { TubePulseAuthorityCoordinator };
 
@@ -82,6 +90,7 @@ const key = {
   deviceChannels:   (deviceId)  => `device:${deviceId}:channels`,
   deviceOverride:   (deviceId, channelId) => `device:${deviceId}:override:${channelId}`,
   deviceState:      (deviceId, channelId) => `device:${deviceId}:state:${channelId}`,
+  deviceNagLedger:  (deviceId) => nagLedgerKey(deviceId),
   // FCM-token → deviceId index. Written on every /register that includes
   // a real FCM token, deleted when the device is cleaned up. Used to
   // detect "same install, new deviceId" events (e.g. v3.0.18 UUID-based
@@ -244,82 +253,7 @@ async function cleanupDeadChannel(channelId, env, reason = 'unsubscribe_last') {
  * @returns {Promise<{channelsCleaned: number, devicesDeleted: number}>}
  */
 async function cleanupDeadDevice(deviceId, env, reason = 'fcm_unregistered') {
-  const kv = env.TUBEPULSE_KV;
-
-  // 0. Read the profile so we can clean the FCM-lookup index below.
-  //    This also acts as a no-op guard — if there's no profile, there's
-  //    nothing to clean.
-  const profile = await getKV(kv, key.deviceProfile(deviceId));
-  if (!profile) {
-    // Already cleaned up; nothing to do.
-    return { channelsCleaned: 0, devicesDeleted: 0 };
-  }
-
-  // 1. Find every channel this device was on.
-  const channels = await getKV(kv, key.deviceChannels(deviceId)) || [];
-  let channelsCleaned = 0;
-
-  // 2. For each channel, remove the device from its subscribers list.
-  //    If the list goes empty, the channel is also fully cleaned up.
-  for (const channelId of channels) {
-    const subs = await getKV(kv, key.channelSubs(channelId)) || [];
-    const filtered = subs.filter((id) => id !== deviceId);
-    await putKV(kv, key.channelSubs(channelId), filtered);
-
-    if (filtered.length === 0 && subs.length > 0) {
-      await cleanupDeadChannel(channelId, env, 'last_subscriber_dead');
-      channelsCleaned++;
-    }
-  }
-
-  // 3. Delete the device's own state. We do this last so a failure in
-  //    step 2 leaves the device profile intact and the next push will
-  //    retry the cleanup.
-  let devicesDeleted = 0;
-  const deviceKeys = [
-    key.deviceProfile(deviceId),
-    key.deviceSettings(deviceId),
-    key.deviceChannels(deviceId),
-  ];
-  for (const k of deviceKeys) {
-    await kv.delete(k);
-    devicesDeleted++;
-  }
-
-  // 3a. If we have a profile in memory, also clean up the FCM-lookup
-  //     index so a future /register doesn't try to migrate from a
-  //     dead device. (We may not have the profile here if called from
-  //     migrateDevice, which is fine — the lookup gets rewritten by
-  //     the new device's register call anyway.)
-  if (profile && profile.fcmToken) {
-    await kv.delete(key.fcmLookup(profile.fcmToken));
-  }
-
-  // 4. Delete per-channel state + override. We don't know the channel
-  //    list any more (we just deleted :channels), so iterate the list
-  //    we captured in step 1.
-  for (const channelId of channels) {
-    await kv.delete(key.deviceState(deviceId, channelId));
-    await kv.delete(key.deviceOverride(deviceId, channelId));
-    devicesDeleted += 2;
-  }
-
-  const nagActive = await getKV(kv, key.nagActive()) || [];
-  const remainingNagEntries = nagActive.filter((entry) => !String(entry).startsWith(`${deviceId}|`));
-  if (remainingNagEntries.length !== nagActive.length) await putKV(kv, key.nagActive(), remainingNagEntries);
-  if (typeof kv.list === 'function') {
-    let cursor;
-    do {
-      const page = await kv.list({ prefix: 'upcoming:prewarn:', limit: 1000, ...(cursor ? { cursor } : {}) });
-      for (const entry of page.keys || []) {
-        if (String(entry.name).endsWith(`:${deviceId}`)) await kv.delete(entry.name);
-      }
-      cursor = page.list_complete ? undefined : page.cursor;
-    } while (cursor);
-  }
-
-  console.log(`[Cleanup] device ${deviceId}: reason=${reason} channelsAffected=${channels.length} channelsCleaned=${channelsCleaned} devicesDeleted=${devicesDeleted}`);
-  return { channelsCleaned, devicesDeleted };
+  return await queueDeadDeviceCleanup(deviceId, env, reason);
 }
 
 /**
@@ -405,6 +339,7 @@ async function migrateDevice(oldDeviceId, newDeviceId, env) {
     await putKV(kv, key.deviceSettings(newDeviceId), oldSettings);
     settingsMigrated = true;
   }
+  await mergeNagLedgers(kv, oldDeviceId, newDeviceId);
 
   // 6. Clean up the old device. This deletes the old profile/settings/
   //    channels/state/override and ensures it's not in any subscribers
@@ -896,6 +831,10 @@ async function handleRegister(request, env) {
   try { body = await request.json(); } catch { return errorResponse('Invalid JSON body'); }
 
   const { fcmToken, platform, appVersion } = body;
+  // If this installation returned while a bounded dead-token cleanup was in
+  // progress, restore any subscriber links already detached and cancel the
+  // cleanup before accepting the new registration.
+  await cancelDeadDeviceCleanup(deviceId, env);
   const notificationCapability = normalizeNotificationCapability(body.notificationCapability);
   // fcmToken is optional — the device profile is what subscribes channels and
   // serves /feed. Push delivery is a separate concern, addressed by the
@@ -1161,6 +1100,7 @@ async function handleUnsubscribe(request, env, ctx) {
   // Clean up device state + override for this channel
   await env.TUBEPULSE_KV.delete(key.deviceState(deviceId, channelId));
   await env.TUBEPULSE_KV.delete(key.deviceOverride(deviceId, channelId));
+  await pruneNagLedgerChannels(env.TUBEPULSE_KV, deviceId, [channelId]);
 
   // If last subscriber, unsubscribe from WebSub and remove from active index
   const isLastSubscriber = updatedSubs.length === 0;
@@ -1231,6 +1171,8 @@ async function handleSeen(request, env) {
   }
 
   if (clearedEntries.size) {
+    await pruneNagLedgerChannels(env.TUBEPULSE_KV, deviceId, [...clearedEntries]
+      .map((entry) => entry.slice(`${deviceId}|`.length)));
     const nagActive = await getKV(env.TUBEPULSE_KV, key.nagActive()) || [];
     const filtered = nagActive.filter((entry) => !clearedEntries.has(entry));
     if (filtered.length !== nagActive.length) await putKV(env.TUBEPULSE_KV, key.nagActive(), filtered);
@@ -1784,8 +1726,7 @@ async function handleWebSubPush(request, env, ctx) {
         if (result.sent) {
           // Initialise the reminder clock so neither the active aligned owner
           // nor the flag-off runNag rollback path immediately re-notifies.
-          state.lastNagAt = Date.now();
-          await putKV(env.TUBEPULSE_KV, key.deviceState(deviceId, channelId), state);
+          await advanceNagLedgerCursor(env, deviceId, channelId, { lastNagAt: Date.now() });
         }
 
         if (result.deadToken) {

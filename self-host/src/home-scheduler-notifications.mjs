@@ -8,6 +8,7 @@ import {
   putKV,
   sendFCMPush,
 } from '../../worker/tubepulse-cron/shared.mjs';
+import { advanceNagLedgerCursor } from '../../worker/tubepulse-cron/nag-ledger.mjs';
 import { JsonStateFile } from './file-state.mjs';
 
 function delay(ms) {
@@ -605,22 +606,12 @@ export class ProductionNotificationCoordinator {
       return;
     }
     if (!delivery.sent) return;
-    const stateKey = key.deviceState(intent.deviceId, intent.channelId);
-    const apply = async () => {
-      const current = await getKV(kv, stateKey) || { unwatched: [], lastNagAt: null, nagCount: 0 };
-      await putKV(kv, stateKey, {
-        ...current,
-        lastNagAt: intent.watermarkAt != null && Number.isFinite(Number(intent.watermarkAt))
-          ? Number(intent.watermarkAt)
-          : Date.now(),
-        ...(intent.kind === 'nag' ? { nagCount: Number(current.nagCount || 0) + 1 } : {}),
-      });
-    };
-    if (typeof workerEnv.TUBEPULSE_KV_MUTATION_LOCK === 'function') {
-      await workerEnv.TUBEPULSE_KV_MUTATION_LOCK(stateKey, apply);
-    } else {
-      await apply();
-    }
+    await advanceNagLedgerCursor(workerEnv, intent.deviceId, intent.channelId, {
+      lastNagAt: intent.watermarkAt != null && Number.isFinite(Number(intent.watermarkAt))
+        ? Number(intent.watermarkAt)
+        : Date.now(),
+      incrementNagCount: intent.kind === 'nag',
+    });
   }
 
   async suppress(intents, reason) {
@@ -785,6 +776,14 @@ export class ProductionNotificationCoordinator {
     }
     let recovered = 0;
     let callbackFailures = 0;
+    const callbackAcks = [];
+    const finalizeCallbacks = async (result) => {
+      await workerEnv?.TUBEPULSE_NAG_LEDGER_FLUSH?.();
+      for (const id of [...new Set(callbackAcks)]) {
+        try { await this.intentStore.callbackApplied(id); } catch { callbackFailures++; }
+      }
+      return { ...result, callbackFailures };
+    };
     const pending = [];
     for (const entry of staged) {
       if (entry.record.status === 'pending') {
@@ -802,25 +801,25 @@ export class ProductionNotificationCoordinator {
           await entry.intent.onResult?.(entry.record.delivery === 'dead-token'
             ? { sent: false, deadToken: true, recovered: true }
             : { sent: true, deadToken: false, recovered: true });
-          await this.intentStore.callbackApplied(entry.id);
+          callbackAcks.push(entry.id);
         } catch { callbackFailures++; }
       }
       recovered++;
     }
     if (pending.length === 0) {
-      return {
+      return await finalizeCallbacks({
         queued: queued.length, deduplicated, recovered, sent: 0, failed: 0,
         suppressed: recovered, transientExpired, barrier: 'already-claimed', callbackFailures,
-      };
+      });
     }
 
     const pendingIntents = pending.map(({ intent }) => intent);
     const convergence = await this.convergeGateway();
     if (!convergence.ok) {
-      return {
+      return await finalizeCallbacks({
         queued: queued.length, deduplicated, recovered, sent: 0, failed: 0, suppressed: pending.length,
         transientExpired, barrier: 'failed', reason: convergence.reason, convergenceAttempts: convergence.attempts,
-      };
+      });
     }
     const visibility = await this.verifyProductionFeeds(pendingIntents);
     const visibleIntentIds = new Set(visibility.visibleIntentIds || []);
@@ -833,37 +832,46 @@ export class ProductionNotificationCoordinator {
     const blockedCount = pending.length - deliverable.length - irrelevantIntentIds.size;
     if (deliverable.length === 0) {
       if (blockedCount === 0) {
-        return {
+        return await finalizeCallbacks({
           queued: queued.length, deduplicated, recovered, sent: 0, failed: 0,
           suppressed: recovered + staleResolved, transientExpired, staleResolved,
           barrier: 'passed', reason: 'stale-intent-resolved',
           convergenceAttempts: convergence.attempts, visibilityAttempts: visibility.attempts,
-        };
+        });
       }
-      return {
+      return await finalizeCallbacks({
         queued: queued.length, deduplicated, recovered, sent: 0, failed: 0, suppressed: pending.length,
         transientExpired, barrier: 'failed', reason: visibility.reason, convergenceAttempts: convergence.attempts,
         visibilityAttempts: visibility.attempts, visibilityBlocked: blockedCount,
         visibilityDevices: visibility.invisibleDeviceCount,
         visibilityChannels: visibility.invisibleChannelCount,
-      };
+      });
     }
 
     let accessToken;
     try {
       accessToken = await this.tokenProvider({ ...workerEnv, TUBEPULSE_NOTIFICATION_MODE: 'active' });
     } catch {
-      return {
+      return await finalizeCallbacks({
         queued: queued.length, deduplicated, recovered, sent: 0, failed: 0, suppressed: pending.length,
         transientExpired, barrier: blockedCount > 0 ? 'partial' : 'passed', reason: 'fcm-token-unavailable', convergenceAttempts: convergence.attempts,
         visibilityAttempts: visibility.attempts,
-      };
+      });
     }
 
     let sent = 0;
     let failed = 0;
+    let deadDeviceSuppressed = 0;
+    const deadDevices = new Set();
     for (const entry of deliverable) {
       const intent = entry.intent;
+      if (deadDevices.has(intent.deviceId)) {
+        if (!entry.transient) {
+          await this.intentStore.resolvePending?.([entry.id], 'dead-device-already-detected');
+        }
+        deadDeviceSuppressed++;
+        continue;
+      }
       let result;
       try {
         if (!entry.transient) await this.intentStore.claim(entry.id);
@@ -883,22 +891,26 @@ export class ProductionNotificationCoordinator {
         await this.intentStore.recordTransientOutcome(result || { sent: false, deadToken: false }, intent);
       }
       if (result?.sent) sent++;
-      else failed++;
+      else {
+        failed++;
+        if (result?.deadToken) deadDevices.add(intent.deviceId);
+      }
       try {
         await intent.onResult?.(result || { sent: false, deadToken: false });
-        if (!entry.transient) await this.intentStore.callbackApplied(entry.id);
+        if (!entry.transient) callbackAcks.push(entry.id);
       } catch {
         callbackFailures++;
       }
     }
-    return {
+    return await finalizeCallbacks({
       queued: queued.length,
       deduplicated,
       recovered,
       transientExpired,
       sent,
       failed,
-      suppressed: recovered + staleResolved + blockedCount,
+      suppressed: recovered + staleResolved + blockedCount + deadDeviceSuppressed,
+      deadDeviceSuppressed,
       staleResolved,
       barrier: blockedCount > 0 ? 'partial' : 'passed',
       ...(blockedCount > 0 ? { reason: visibility.reason, visibilityBlocked: blockedCount } : {}),
@@ -907,7 +919,7 @@ export class ProductionNotificationCoordinator {
         visibilityChannels: visibility.invisibleChannelCount,
       } : {}),
       callbackFailures, convergenceAttempts: convergence.attempts, visibilityAttempts: visibility.attempts,
-    };
+    });
   }
 }
 

@@ -10,6 +10,7 @@ import {
   updateKnownVideosAfterPoll, mergeRssUploadsIntoRecentVideos,
   effectiveNotificationSettings, videoNotificationTag,
 } from '../tubepulse-cron/shared.mjs';
+import { advanceNagLedgerCursor } from '../tubepulse-cron/nag-ledger.mjs';
 
 const RSS_MAX_SHARDS = 3;
 
@@ -213,8 +214,7 @@ async function pollSingleRssChannel(env, ctx, channelId) {
       );
       if (pushResult.deadToken) deadDevices.push(deviceId);
       if (pushResult.sent) {
-        state.lastNagAt = now;
-        await putKV(kv, key.deviceState(deviceId, channelId), state);
+        await advanceNagLedgerCursor(env, deviceId, channelId, { lastNagAt: now });
       }
     }
   }

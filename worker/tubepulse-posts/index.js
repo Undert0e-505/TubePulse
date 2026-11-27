@@ -17,8 +17,8 @@ import {
   formatCommunityPostNotificationTitle,
   normalizeKnownCommunityPostIds, addKnownCommunityPostId,
   removeCachedPostIdsFromSubscriberState,
-  withKvMutationLock,
 } from '../tubepulse-cron/shared.mjs';
+import { advanceNagLedgerCursor } from '../tubepulse-cron/nag-ledger.mjs';
 
 const COMMUNITY_POSTS_DEBUG_CHANNEL_ID = 'UCeG5VyNPnGZq-8JzHJbSB6A';
 
@@ -216,10 +216,7 @@ export async function pollSingleCommunityChannel(env, ctx, channelId, debugEnabl
             requireUnwatched: true,
             onResult: async (result) => {
               if (result?.sent) {
-                await withKvMutationLock(env, key.deviceState(deviceId, channelId), async () => {
-                  const current = await getKV(kv, key.deviceState(deviceId, channelId)) || state;
-                  await putKV(kv, key.deviceState(deviceId, channelId), { ...current, lastNagAt: Date.now() });
-                });
+                await advanceNagLedgerCursor(env, deviceId, channelId, { lastNagAt: Date.now() });
               } else if (result?.deadToken) {
                 await cleanupDeadDevice(deviceId, env, 'fcm_unregistered');
               }
@@ -228,8 +225,7 @@ export async function pollSingleCommunityChannel(env, ctx, channelId, debugEnabl
         });
       }
       if (sendResult.sent) {
-        state.lastNagAt = Date.now();
-        await putKV(kv, key.deviceState(deviceId, channelId), state);
+        await advanceNagLedgerCursor(env, deviceId, channelId, { lastNagAt: Date.now() });
       }
       if (sendResult.deadToken) {
         deadDevices.push(deviceId);

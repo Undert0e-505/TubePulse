@@ -27,6 +27,9 @@ test('batch seen removes only exact snapshot IDs and updates nag index once', as
   const kv = new MemoryKv({
     'device:device-1:state:A': { unwatched: ['old-a', 'new-a'], nagCount: 4, lastNagAt: 123 },
     'device:device-1:state:B': { unwatched: ['old-b'], nagCount: 2, lastNagAt: 456 },
+    'device:device-1:nag-ledger': { schemaVersion: 1, channels: {
+      A: { lastNagAt: 123, nagCount: 4 }, B: { lastNagAt: 456, nagCount: 2 },
+    } },
     'nag:active': ['device-1|A', 'device-1|B', 'other|C'],
   });
   const response = await worker.fetch(seenRequest({ channels: [
@@ -45,6 +48,9 @@ test('batch seen removes only exact snapshot IDs and updates nag index once', as
     unwatched: [], nagCount: 0, lastNagAt: null,
   });
   assert.deepEqual(await kv.get('nag:active', 'json'), ['device-1|A', 'other|C']);
+  assert.deepEqual(await kv.get('device:device-1:nag-ledger', 'json'), {
+    schemaVersion: 1, channels: { A: { lastNagAt: 123, nagCount: 4 } },
+  });
 });
 
 test('legacy single-channel contract remains compatible and idempotent', async () => {
@@ -59,4 +65,17 @@ test('legacy single-channel contract remains compatible and idempotent', async (
     assert.deepEqual(await response.json(), { ok: true, unwatchedCount: 1 });
   }
   assert.deepEqual((await kv.get('device:device-1:state:A', 'json')).unwatched, ['v2']);
+});
+
+test('legacy clearAll marks a channel seen and prunes its packed cursor', async () => {
+  const kv = new MemoryKv({
+    'device:device-1:state:A': { unwatched: ['v1'], nagCount: 1, lastNagAt: 10 },
+    'device:device-1:nag-ledger': { schemaVersion: 1, channels: { A: { lastNagAt: 10, nagCount: 1 } } },
+    'nag:active': ['device-1|A'],
+  });
+  const response = await worker.fetch(seenRequest({ channelId: 'A', clearAll: true }),
+    { TUBEPULSE_KV: kv }, { waitUntil() {} });
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { ok: true, unwatchedCount: 0 });
+  assert.deepEqual(await kv.get('device:device-1:nag-ledger', 'json'), { schemaVersion: 1, channels: {} });
 });

@@ -18,6 +18,9 @@ export const key = {
   deviceChannels:     (deviceId)  => `device:${deviceId}:channels`,
   deviceOverride:     (deviceId, channelId) => `device:${deviceId}:override:${channelId}`,
   deviceState:        (deviceId, channelId) => `device:${deviceId}:state:${channelId}`,
+  deviceNagLedger:    (deviceId) => `device:${deviceId}:nag-ledger`,
+  deadDeviceCleanup:  (deviceId) => `cleanup:dead-device:${deviceId}`,
+  deadDeviceCleanupPrefix: () => 'cleanup:dead-device:',
   fcmLookup:          (fcmToken)  => `fcm:lookup:${fcmToken}`,
   upcoming:           (bucket)    => `upcoming:${bucket}`,
   nag:               (bucket)    => `nag:${bucket}`,
@@ -677,47 +680,155 @@ export async function cleanupDeadChannel(channelId, env, reason = 'last_subscrib
 }
 
 export async function cleanupDeadDevice(deviceId, env, reason = 'fcm_unregistered') {
-  const kv = env.TUBEPULSE_KV;
-  const profile = await getKV(kv, key.deviceProfile(deviceId));
-  const channels = await getKV(kv, key.deviceChannels(deviceId)) || [];
-  let channelsCleaned = 0;
+  return await withKvMutationLock(env, key.deadDeviceCleanup(deviceId), async () => {
+    const kv = env.TUBEPULSE_KV;
+    const existing = await getKV(kv, key.deadDeviceCleanup(deviceId));
+    if (existing?.schemaVersion === 1) {
+      return { queued: true, alreadyQueued: true, channelsAffected: existing.remainingChannels?.length || 0 };
+    }
 
+    const profile = await getKV(kv, key.deviceProfile(deviceId));
+    const channels = [...new Set((await getKV(kv, key.deviceChannels(deviceId)) || []).map(String))].sort();
+    if (!profile && channels.length === 0) {
+      return { queued: false, alreadyQueued: false, channelsAffected: 0 };
+    }
+
+    // A dead installation can own hundreds of channel records. Deleting all
+    // of them in the notification callback can exceed the authority's atomic
+    // delta limit and cause recovery to restore the dead token forever. Make
+    // the identity non-deliverable immediately, then let Home drain the
+    // durable plan in bounded canonical batches.
+    await putKV(kv, key.deadDeviceCleanup(deviceId), {
+      schemaVersion: 1,
+      reason,
+      queuedAt: Date.now(),
+      allChannels: channels,
+      remainingChannels: channels,
+    });
+    await kv.delete(key.deviceProfile(deviceId));
+    if (profile?.fcmToken) await kv.delete(key.fcmLookup(profile.fcmToken));
+    await removeFromNagActive(env, deviceId);
+    console.log(`[Cleanup] device ${deviceId}: reason=${reason} queued=true channelsAffected=${channels.length}`);
+    return { queued: true, alreadyQueued: false, channelsAffected: channels.length };
+  });
+}
+
+async function prewarnKeysForDevice(kv, deviceId, limit) {
+  const matches = [];
+  let cursor;
+  do {
+    const page = await kv.list({ prefix: 'upcoming:prewarn:', limit: 1000, ...(cursor ? { cursor } : {}) });
+    for (const entry of page.keys || []) {
+      if (String(entry.name).endsWith(`:${deviceId}`)) {
+        matches.push(entry.name);
+        if (matches.length > limit) return matches;
+      }
+    }
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor);
+  return matches;
+}
+
+async function restoreDeadDeviceCleanup(deviceId, env, plan) {
+  const kv = env.TUBEPULSE_KV;
+  const channels = [...new Set((plan?.allChannels || plan?.remainingChannels || []).map(String))];
+  const active = new Set(await getKV(kv, key.channelsActive()) || []);
+  let activeChanged = false;
   for (const channelId of channels) {
     const subs = await getKV(kv, key.channelSubs(channelId)) || [];
-    const filtered = subs.filter((id) => id !== deviceId);
-    await putKV(kv, key.channelSubs(channelId), filtered);
-    if (filtered.length === 0 && subs.length > 0) {
-      await cleanupDeadChannel(channelId, env, 'last_subscriber_dead');
-      channelsCleaned++;
+    if (!subs.includes(deviceId)) await putKV(kv, key.channelSubs(channelId), [...subs, deviceId]);
+    if (!active.has(channelId)) {
+      active.add(channelId);
+      activeChanged = true;
     }
   }
+  if (activeChanged) await putKV(kv, key.channelsActive(), [...active]);
+}
 
-  let devicesDeleted = 0;
-  for (const k of [key.deviceProfile(deviceId), key.deviceSettings(deviceId), key.deviceChannels(deviceId)]) {
-    await kv.delete(k);
-    devicesDeleted++;
-  }
-  if (profile?.fcmToken) {
-    await kv.delete(key.fcmLookup(profile.fcmToken));
-  }
-  for (const channelId of channels) {
-    await kv.delete(key.deviceState(deviceId, channelId));
-    await kv.delete(key.deviceOverride(deviceId, channelId));
-    devicesDeleted += 2;
-  }
-  // Remove from nag:active
-  await removeFromNagActive(env, deviceId);
-  if (typeof kv.list === 'function') {
-    let cursor;
-    do {
-      const page = await kv.list({ prefix: 'upcoming:prewarn:', limit: 1000, ...(cursor ? { cursor } : {}) });
-      for (const entry of page.keys || []) {
-        if (String(entry.name).endsWith(`:${deviceId}`)) await kv.delete(entry.name);
+export async function cancelDeadDeviceCleanup(deviceId, env) {
+  const planKey = key.deadDeviceCleanup(deviceId);
+  return await withKvMutationLock(env, planKey, async () => {
+    const plan = await getKV(env.TUBEPULSE_KV, planKey);
+    if (!plan) return false;
+    await restoreDeadDeviceCleanup(deviceId, env, plan);
+    await env.TUBEPULSE_KV.delete(planKey);
+    return true;
+  });
+}
+
+export async function drainDeadDeviceCleanupQueue(env, {
+  deviceLimit = 1,
+  channelLimit = 20,
+  prewarnLimit = 50,
+} = {}) {
+  const kv = env.TUBEPULSE_KV;
+  if (typeof kv.list !== 'function') return { processedDevices: 0, processedChannels: 0, completedDevices: 0 };
+  const page = await kv.list({ prefix: key.deadDeviceCleanupPrefix(), limit: Math.max(1, deviceLimit) });
+  let processedDevices = 0;
+  let processedChannels = 0;
+  let completedDevices = 0;
+  let cancelledDevices = 0;
+
+  for (const entry of page.keys || []) {
+    if (processedDevices >= deviceLimit) break;
+    const planKey = String(entry.name);
+    const deviceId = planKey.slice(key.deadDeviceCleanupPrefix().length);
+    if (!deviceId) continue;
+    await withKvMutationLock(env, planKey, async () => {
+      const plan = await getKV(kv, planKey);
+      if (!plan || plan.schemaVersion !== 1 || !Array.isArray(plan.remainingChannels)) {
+        await kv.delete(planKey);
+        return;
       }
-      cursor = page.list_complete ? undefined : page.cursor;
-    } while (cursor);
+      processedDevices++;
+
+      // A fresh registration means the installation is alive again. This is
+      // safe before any chunk has run; /register also cancels the ordinary
+      // case synchronously.
+      if (await getKV(kv, key.deviceProfile(deviceId))) {
+        await restoreDeadDeviceCleanup(deviceId, env, plan);
+        await kv.delete(planKey);
+        cancelledDevices++;
+        return;
+      }
+
+      const chunk = plan.remainingChannels.slice(0, Math.max(1, channelLimit));
+      const remainingChannels = plan.remainingChannels.slice(chunk.length);
+      for (const channelId of chunk) {
+        const subs = await getKV(kv, key.channelSubs(channelId)) || [];
+        const filtered = subs.filter((id) => id !== deviceId);
+        if (filtered.length === 0 && subs.includes(deviceId)) {
+          await cleanupDeadChannel(channelId, env, 'last_subscriber_dead');
+        } else if (filtered.length !== subs.length) {
+          await putKV(kv, key.channelSubs(channelId), filtered);
+        }
+        await kv.delete(key.deviceState(deviceId, channelId));
+        await kv.delete(key.deviceOverride(deviceId, channelId));
+      }
+      processedChannels += chunk.length;
+
+      if (remainingChannels.length > 0) {
+        await putKV(kv, planKey, { ...plan, remainingChannels, updatedAt: Date.now() });
+        return;
+      }
+
+      const prewarnKeys = await prewarnKeysForDevice(kv, deviceId, Math.max(1, prewarnLimit));
+      for (const name of prewarnKeys.slice(0, prewarnLimit)) await kv.delete(name);
+      if (prewarnKeys.length > prewarnLimit) {
+        await putKV(kv, planKey, { ...plan, remainingChannels: [], updatedAt: Date.now() });
+        return;
+      }
+
+      await kv.delete(key.deviceSettings(deviceId));
+      await kv.delete(key.deviceChannels(deviceId));
+      await kv.delete(key.deviceNagLedger(deviceId));
+      await kv.delete(planKey);
+      completedDevices++;
+      console.log(`[Cleanup] device ${deviceId}: completed=true channelsCleaned=${processedChannels}`);
+    });
   }
-  console.log(`[Cleanup] device ${deviceId}: reason=${reason} channelsAffected=${channels.length} channelsCleaned=${channelsCleaned} devicesDeleted=${devicesDeleted}`);
+
+  return { processedDevices, processedChannels, completedDevices, cancelledDevices };
 }
 
 // ─── Nag active index ───────────────────────────────────────────────────

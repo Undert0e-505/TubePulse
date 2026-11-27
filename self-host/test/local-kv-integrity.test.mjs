@@ -83,13 +83,14 @@ test('physical NUL blob fails even when logical records match canonical', async 
   assert.equal(result.status, 'failed');
 });
 
-test('exact D1 repair preserves settings, subscriptions, unseen state, and pending intent', async (t) => {
+test('exact D1 repair preserves settings, subscriptions, unseen state, packed nag cursors, and pending intent', async (t) => {
   const dataDir = await fixture(t);
   const expected = {
     'device:test:profile': '{"appVersion":"4.5.0","fcmToken":"token"}',
     'device:test:settings': '{"nagMinutes":5,"notificationMode":"relentless"}',
     'device:test:channels': '["channel-a"]',
     'device:test:state:channel-a': '{"unwatched":["video-a"],"lastNagAt":100}',
+    'device:test:nag-ledger': '{"schemaVersion":1,"channels":{"channel-a":{"lastNagAt":100,"nagCount":2}}}',
     'channel:channel-a:subscribers': '["test"]',
   };
   const canonical = snapshot(expected);

@@ -1325,8 +1325,42 @@ test('mutation classification supports colon-containing device IDs', () => {
   assert.equal(mutationKeyFamily('device:android:synthetic:profile'), 'device-record');
   assert.equal(mutationKeyFamily('device:android:synthetic:channels'), 'device-record');
   assert.equal(mutationKeyFamily('device:android:synthetic:state:UCsynthetic'), 'device-state');
+  assert.equal(mutationKeyFamily('device:android:synthetic:nag-ledger'), 'nag-ledger');
   assert.equal(mutationKeyFamily('device:android:synthetic:override:UCsynthetic'), 'device-record');
   assert.equal(mutationReason('device:android:synthetic:state:UCsynthetic', '{}', '{"unwatched":[]}'), 'notification-state');
+  assert.equal(mutationReason('device:android:synthetic:nag-ledger', '{}', '{"schemaVersion":1}'), 'packed-nag-ledger');
+});
+
+test('packed nag advances flush once per installation regardless of channel count', async () => {
+  const namespace = new MemoryNamespace({
+    'device:one:channels': JSON.stringify(['A', 'B']),
+    'device:one:state:A': JSON.stringify({ unwatched: ['a'], lastNagAt: 100, nagCount: 1 }),
+    'device:one:state:B': JSON.stringify({ unwatched: ['b'], lastNagAt: 200, nagCount: 2 }),
+    'device:two:channels': JSON.stringify(['C']),
+    'device:two:state:C': JSON.stringify({ unwatched: ['c'], lastNagAt: null, nagCount: 0 }),
+  });
+  const writes = [];
+  const target = {
+    get: (...args) => namespace.get(...args),
+    put: async (name, value) => { writes.push(name); await namespace.put(name, value); },
+    delete: (...args) => namespace.delete(...args),
+    list: (...args) => namespace.list(...args),
+  };
+  const fakeRunner = {
+    config: { mode: 'active', workerBindings: {}, alignedVideoNotificationsEnabled: true },
+    kvMutationMutex: { run: async (_name, operation) => await operation() },
+  };
+  const env = HomeSchedulerRunner.prototype.createEnvironment.call(
+    fakeRunner, target, { total: 0, byKind: {} }, [], new Set(), new Set(), new Map(),
+  );
+  await env.TUBEPULSE_NAG_LEDGER_ADVANCE('one', 'A', { lastNagAt: 500, incrementNagCount: true });
+  await env.TUBEPULSE_NAG_LEDGER_ADVANCE('one', 'B', { lastNagAt: 500, incrementNagCount: true });
+  await env.TUBEPULSE_NAG_LEDGER_ADVANCE('two', 'C', { lastNagAt: 500, incrementNagCount: false });
+  assert.deepEqual(await env.TUBEPULSE_NAG_LEDGER_FLUSH(), { writes: 2 });
+  assert.deepEqual(writes.sort(), ['device:one:nag-ledger', 'device:two:nag-ledger']);
+  assert.deepEqual(JSON.parse(namespace.values.get('device:one:nag-ledger')).channels, {
+    A: { lastNagAt: 500, nagCount: 2 }, B: { lastNagAt: 500, nagCount: 3 },
+  });
 });
 
 test('community post cache ignores only rotating YouTube thumbnail delivery parameters', () => {

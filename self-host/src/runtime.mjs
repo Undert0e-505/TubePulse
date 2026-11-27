@@ -32,6 +32,7 @@ export class TubePulseRuntime {
       }
       if (worker.scheduled || worker.name === 'api') {
         modulePaths.push(path.join(workerRoot, 'tubepulse-cron', 'shared.mjs'));
+        modulePaths.push(path.join(workerRoot, 'tubepulse-cron', 'nag-ledger.mjs'));
       }
       if (worker.name === 'posts') modulePaths.push(path.join(workerRoot, 'tubepulse-posts', 'community-posts.mjs'));
       return {

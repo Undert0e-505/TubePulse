@@ -350,6 +350,7 @@ test('a persisted visible video intent is retried once after restart and restore
   const store = new DurableNotificationIntentStore(directory);
   await store.stage([intent()]);
   const values = new Map([
+    ['device:synthetic-device:channels', JSON.stringify(['UC-synthetic'])],
     ['device:synthetic-device:state:UC-synthetic', JSON.stringify({
       unwatched: ['video-new'], lastNagAt: null, nagCount: 0,
     })],
@@ -384,7 +385,9 @@ test('a persisted visible video intent is retried once after restart and restore
   const first = await coordinator.flush([], workerEnv);
   assert.equal(first.sent, 1);
   assert.equal(sends, 1);
-  assert.equal(JSON.parse(values.get('device:synthetic-device:state:UC-synthetic')).lastNagAt > 0, true);
+  assert.equal(JSON.parse(values.get('device:synthetic-device:state:UC-synthetic')).lastNagAt, null);
+  assert.equal(JSON.parse(values.get('device:synthetic-device:nag-ledger'))
+    .channels['UC-synthetic'].lastNagAt > 0, true);
 
   const second = await coordinator.flush([], workerEnv);
   assert.equal(second.sent, 0);
@@ -733,6 +736,44 @@ test('dead-token cleanup callback recovers after failure without recounting the 
   assert.equal(summary.callbackPending, 0);
   assert.equal(summary.permanentInvalidTokenResponsesTotal, 1);
   assert.equal(summary.uniqueDeadTokenCleanupsTotal, 1);
+});
+
+test('one permanent token failure suppresses later intents for the same installation in that cycle', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'tubepulse-dead-token-cycle-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  let sends = 0;
+  let callbacks = 0;
+  const coordinator = new ProductionNotificationCoordinator({
+    ...barrierConfig, gatewayConvergenceRequired: false,
+  }, {
+    intentStore: new DurableNotificationIntentStore(directory),
+    fetchImpl: async () => jsonResponse({
+      channels: [
+        { channelId: 'channel-one', videos: [{ videoId: 'video-one', unwatched: true }], posts: [] },
+        { channelId: 'channel-two', videos: [{ videoId: 'video-two', unwatched: true }], posts: [] },
+      ],
+    }),
+    tokenProvider: async () => 'token',
+    sender: async () => {
+      sends++;
+      return { sent: false, deadToken: true, permanentInvalidTokenClass: 'unregistered' };
+    },
+  });
+  const onResult = async () => { callbacks++; };
+  const result = await coordinator.flush([
+    intent({ channelId: 'channel-one', contentIds: ['video-one'], onResult }),
+    intent({ channelId: 'channel-two', contentIds: ['video-two'], onResult }),
+  ], {});
+
+  assert.equal(sends, 1);
+  assert.equal(callbacks, 1);
+  assert.equal(result.failed, 1);
+  assert.equal(result.deadDeviceSuppressed, 1);
+  assert.equal(result.suppressed, 1);
+  const summary = await coordinator.intentStore.summary();
+  assert.equal(summary.fcmFailedTotal, 1);
+  assert.equal(summary.permanentInvalidTokenResponsesTotal, 1);
+  assert.equal(summary.callbackPending, 0);
 });
 
 test('permanent invalid-token responses count raw attempts and unique token lifecycles durably', async (t) => {

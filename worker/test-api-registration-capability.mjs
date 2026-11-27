@@ -72,6 +72,28 @@ test('released clients without a capability remain explicitly legacy', async () 
   assert.equal(profile.notificationCapability, null);
 });
 
+test('register cancels a pending dead-token cleanup and restores detached memberships', async () => {
+  const kv = new MemoryKV();
+  const channelId = 'UC0000000000000000000000';
+  kv.entries.set('cleanup:dead-device:secure:test-device', JSON.stringify({
+    schemaVersion: 1,
+    allChannels: [channelId],
+    remainingChannels: [],
+  }));
+  kv.entries.set('device:secure:test-device:channels', JSON.stringify([channelId]));
+  kv.entries.set(`channel:${channelId}:subscribers`, JSON.stringify([]));
+  kv.entries.set('channels:active', JSON.stringify([]));
+
+  const response = await appWorker.fetch(registration({
+    fcmToken: 'new-live-token', platform: 'android', appVersion: '4.5.0',
+  }), { TUBEPULSE_KV: kv }, {});
+
+  assert.equal(response.status, 200);
+  assert.equal(await kv.get('cleanup:dead-device:secure:test-device', 'json'), null);
+  assert.deepEqual(await kv.get(`channel:${channelId}:subscribers`, 'json'), ['secure:test-device']);
+  assert.deepEqual(await kv.get('channels:active', 'json'), [channelId]);
+});
+
 test('activity touch refreshes only a stale existing profile and preserves every other field', async () => {
   const kv = new MemoryKV();
   const now = 10 * LAST_SEEN_REFRESH_INTERVAL_MS;

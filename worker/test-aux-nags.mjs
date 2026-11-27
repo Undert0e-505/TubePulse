@@ -119,6 +119,7 @@ test('host nag is transient, visibility-gated, and advances its watermark exactl
     'nag:active': json([`${deviceId}|${channelId}`]),
     [`device:${deviceId}:profile`]: json({ fcmToken: 'fcm-one' }),
     [`device:${deviceId}:settings`]: json({ mode: 'chill', includeCommunityPosts: true }),
+    [`device:${deviceId}:channels`]: json([channelId]),
     [stateKey]: json({ unwatched, lastNagAt: null, nagCount: 0 }),
     [`channel:${channelId}:meta`]: json({ name: 'Current channel' }),
     [`channel:${channelId}:recent`]: json([
@@ -187,8 +188,12 @@ test('host nag is transient, visibility-gated, and advances its watermark exactl
   assert.equal(delivery.transientExpired, 0);
   assert.equal((await coordinator.intentStore.summary()).pending, 0);
   const updated = JSON.parse(kv.values.get(stateKey));
-  assert.equal(updated.lastNagAt, now);
-  assert.equal(updated.nagCount, 1);
+  assert.equal(updated.lastNagAt, null);
+  assert.equal(updated.nagCount, 0);
   assert.deepEqual(updated.unwatched, unwatched);
-  assert.equal(kv.writes.filter((name) => name === stateKey).length, 1);
+  assert.equal(kv.writes.filter((name) => name === stateKey).length, 0);
+  assert.deepEqual(JSON.parse(kv.values.get(`device:${deviceId}:nag-ledger`)), {
+    schemaVersion: 1,
+    channels: { [channelId]: { lastNagAt: now, nagCount: 1 } },
+  });
 });

@@ -197,7 +197,9 @@ Home keeps the current working copy in its persistent local store. D1 generation
 | `device:{deviceId}:settings` | JSON | `{ mode, nagInterval, dndEnabled, dndStart, dndEnd, dndTimezone, dndBypass, tapAction, includeCommunityPosts (v3.1), prewarnMinutes (v3.1), ... }` | API (settings) | Home (FCM fan-out filter) |
 | `device:{deviceId}:channels` | JSON array | `[channelId, ...]` | API (subscribe, unsubscribe) | API (feed filter) |
 | `device:{deviceId}:override:{channelId}` | JSON | per-channel notification override. Accepts `mode?` or `notificationMode?`, plus `nagInterval?`, inherited/per-channel DND fields, `dndBypass?`, `muted?`, `includeCommunityPosts?` (**v3.1**, tri-state null/true/false), and `prewarnMinutes?` (**v3.1**, tri-state null/number) | API (channel-override) | Home (FCM fan-out filter) |
-| `device:{deviceId}:state:{channelId}` | JSON | `{ unwatched: [...], lastNagAt, nagCount }` — `unwatched` holds plain videoIds and `post:{activityId}` for community posts (**v3.1** shares the array via `post:` namespace). `lastNagAt` is a timestamp updated after each successful nag push. `nagCount` tracks the number of reminder nags sent (not counting the initial new-video push). Both are reset to `null`/`0` by `/seen` when `unwatched` becomes empty, so the next unread item starts a fresh nag cadence. | Host (new video, nag fire) | Host (nag fire, seen cleanup) |
+| `device:{deviceId}:state:{channelId}` | JSON | `{ unwatched: [...], lastNagAt?, nagCount? }` — `unwatched` holds plain videoIds and `post:{activityId}` for community posts (**v3.1** shares the array via `post:` namespace). Legacy cursor fields remain readable for lazy migration and rollback compatibility but are no longer advanced after migration. | Host (new content), API (`/seen`) | Host and API feed/action paths |
+| `device:{deviceId}:nag-ledger` | JSON | Bounded schema-versioned map of channel IDs to `{ lastNagAt, nagCount }`, deterministically ordered. It contains backend reminder cadence only, never content IDs, tokens, titles, or settings. | Home after successful FCM delivery; API cleanup/pruning | Home aligned and rollback reminder decisions |
+| `cleanup:dead-device:{deviceId}` | JSON | Durable bounded-cleanup plan with channel IDs and privacy-safe lifecycle metadata. | Permanent FCM failure | Home minute job; deleted when cleanup completes or a returning registration cancels it |
 | `upcoming:events:list` | JSON array | `[{ channelId, videoId, scheduledFor, addedAt }, ...]` — currently-scheduled public live events; `scheduledFor` is re-anchored when YouTube reports a reschedule (**v3.1**, replaces the pre-v3.1 `upcoming:{bucket}` scheme) | Home video detector / precise watcher | Home aux (prewarn) / precise watcher |
 | `upcoming:prewarn:{videoId}:{deviceId}` | number | `prewarnMinutes` value at send-time, sentinel for "prewarn sent for this (event, device)" (**v3.1**) | Home aux (prewarn fire) | Home aux (prewarn fire) |
 | `upcoming:{bucket}` | JSON array | pre-v3.1 scheduled-livestream entries | (legacy writes only) | Home aux (`runUpcomingCron` drain-only) |
@@ -210,7 +212,7 @@ Home keeps the current working copy in its persistent local store. D1 generation
 
 **`fcm:lookup:*` is the deviceId-migration index.** When the same FCM token registers with a new `deviceId` (e.g. a v3.0.18 UUID-based install upgrades to v3.0.19's Android-ID-based install), the server uses this index to find the old device and migrate its state. See §11.1.
 
-**Key lifecycle (cleanup):** channel and device keys are cleaned by two helpers, `cleanupDeadChannel()` and `cleanupDeadDevice()` — see §11. When the last subscriber leaves, the channel is removed from `channels:active`, polling stops, and display/subscriber/post caches plus `channel:{id}:known:videos` are deleted. A later re-add starts a fresh lifecycle and silently seeds the then-current uploads rather than replaying everything since the old watermark. Device keys (`profile`/`settings`/`channels`/`state:*`/`override:*`) are deleted only when the FCM token is reported dead. The API cleanup path deletes `fcm:lookup:*`; remaining cleanup differences are documented in [CONTRACTS.md](CONTRACTS.md).
+**Key lifecycle (cleanup):** channel and device keys are cleaned by `cleanupDeadChannel()` and the bounded `cleanupDeadDevice()` plan — see §11. When the last subscriber leaves, the channel is removed from `channels:active`, polling stops, and display/subscriber/post caches plus `channel:{id}:known:videos` are deleted. A later re-add starts a fresh lifecycle and silently seeds the then-current uploads rather than replaying everything since the old watermark. A permanent FCM failure removes the dead profile/token index immediately, then Home deletes at most 20 owned channels per minute until settings/channels/state/overrides/nag state are gone. This keeps every canonical batch below the authority limit.
 
 ---
 
@@ -229,7 +231,7 @@ After discovery and canonical state updates, Home scans every indexed `nag:activ
 | Relentless | 120 min | Exactly 120 minutes |
 | Chill | any | 4 hours |
 
-All intervals are five-minute raster multiples with no former rotating-scan jitter. `nagCount` counts only successfully delivered reminders; `lastNagAt` advances only after successful delivery and is raster-stamped. Both remain in the established state schema for rollback compatibility and reset when `/seen` empties `unwatched`. Failed sends remain eligible for safe recalculation. Resubscription silently seeds the current baseline and never manufactures history.
+All intervals are five-minute raster multiples with no former rotating-scan jitter. `nagCount` counts only successfully delivered reminders; `lastNagAt` advances only after successful delivery and is raster-stamped. Those cursors live in one packed installation ledger, so one installation produces at most one canonical cursor mutation per aligned cycle even when many channels notify. A missing ledger lazily seeds all current unseen channel cursors from the legacy state fields on the first successful delivery, without moving the raster. `/seen`, unsubscribe, terminal-content removal and dead-device cleanup prune the corresponding entries. Failed sends remain eligible for safe recalculation. Resubscription silently seeds the current baseline and never manufactures history.
 
 Every future single or batch video notification for one channel uses `tubepulse-channel-{channelId}`. It therefore replaces that channel's previous surface without colliding with another channel. Swiping does not acknowledge and the notification may return at the next due interval. Single taps acknowledge the exact item; bundle taps open the channel and acknowledge their exact `contentIds`. Server DND defers unseen state until the first eligible aligned tick, while local mute keeps the push visible but silent. New livestream notifications retain their DND bypass contract.
 
@@ -272,8 +274,8 @@ shape and `clearAll` remain for released clients.
 1. Reads `device:{deviceId}:state:{channelId}` from KV
 2. Creates a **new** state object (copy, not reference — see aliasing bug below)
 3. Removes seen IDs from `state.unwatched`, or empties it if `clearAll`
-4. When `state.unwatched` becomes empty: resets `state.nagCount = 0` and `state.lastNagAt = null`
-5. Writes via `putKVIfChanged` (only writes if state actually changed)
+4. When `state.unwatched` becomes empty: resets the legacy fields, prunes that channel from the packed nag ledger, and removes its `nag:active` entry
+5. Writes via `putKVIfChanged` (only writes if state actually changed); a batch prunes the packed ledger once
 6. Returns `{ ok: true, unwatchedCount: N }`
 
 **What `/seen` does NOT do:**
@@ -516,7 +518,7 @@ message may still show actions because the app locally presents foreground messa
 verify both components together rather than diagnosing that mixed transitional behavior as random
 Android action loss.
 
-**Dead-token detection and cleanup:** FCM returns a structured error when a token is no longer valid (user uninstalled, app data cleared, token rotated without our knowledge). The error code is `UNREGISTERED` (HTTP 404) or `NotRegistered` in the body. When `sendFCMPush` sees this, it returns `{ sent: false, deadToken: true }` to the caller, which then calls `cleanupDeadDevice()` to remove the device's full state. Other error codes (`INVALID_ARGUMENT`, `INTERNAL`, `UNAVAILABLE`, `SENDER_ID_MISMATCH`) are transient or config errors and do **not** trigger cleanup — see §11 for the full policy.
+**Dead-token detection and cleanup:** FCM returns a structured error when a token is no longer valid (user uninstalled, app data cleared, token rotated without our knowledge). The error code is `UNREGISTERED` (HTTP 404) or `NotRegistered` in the body. When `sendFCMPush` sees this, it returns `{ sent: false, deadToken: true }` to the caller, which then calls `cleanupDeadDevice()` to remove the profile/token index and queue bounded removal of the remaining device state. Other error codes (`INVALID_ARGUMENT`, `INTERNAL`, `UNAVAILABLE`, `SENDER_ID_MISMATCH`) are transient or config errors and do **not** trigger cleanup — see §11 for the full policy.
 
 ---
 
@@ -670,12 +672,12 @@ async function cleanupDeadChannel(channelId, env, reason)
 // Idempotent. Safe to call on a never-cached channel.
 
 async function cleanupDeadDevice(deviceId, env, reason)
-// Reads device:{id}:channels to find every channel the device was on
-// For each: removes the device from that channel's subscribers list
-//   - if the list goes empty, also calls cleanupDeadChannel
-// Deletes device:{id}:profile, :settings, :channels
-// Deletes device:{id}:state:{channelId} + :override:{channelId} for each channel
-// Idempotent. Safe to call on a never-registered device.
+// Removes the dead profile and FCM reverse index immediately.
+// Creates cleanup:dead-device:{id} with the captured channel list.
+// Home drains at most 20 channels per minute, removing reverse subscriber
+// links, channel lifecycle data where this was the last subscriber, and
+// device state/override records before deleting the remaining device keys.
+// Idempotent. A returning /register restores detached indexes and cancels it.
 ```
 
 **Trigger policy:**
@@ -692,15 +694,16 @@ async function cleanupDeadDevice(deviceId, env, reason)
 
 **Why no time-based expiry for unused channels?** Same reason — the user might be on holiday, between projects, or temporarily using a different device. The KV cost of a few hundred cached channels is negligible; the user-experience cost of "I came back and my watch list is empty" is high.
 
-**Where the helpers live:** the API retains its WebSub-path cleanup implementation; scheduled workers import shared cleanup helpers from `worker/tubepulse-cron/shared.mjs`.
+**Where the helpers live:** API and scheduled/Home paths use the shared cleanup helpers in `worker/tubepulse-cron/shared.mjs`; the API keeps only a compatibility wrapper around the shared dead-device queue operation.
 
-**Idempotency and races:** `kv.delete()` is a no-op on missing keys. If the API and a scheduled worker detect the same dead device in the same window, the second cleanup performs a few extra reads and no-op deletes without corrupting state.
+**Idempotency and races:** the cleanup-plan key is mutation-locked and idempotent. After the first permanent response, later notification intents for that installation are resolved without another FCM call. Repeated detections observe the existing plan; a returning `/register` restores any already-detached subscriber indexes before cancelling it.
 
 **Log format:** every cleanup emits a single structured line. Watch for sudden spikes — >5 cleanups in a day usually means an app-version bug, a mass uninstall, or someone manually nuking test devices:
 
 ```
 [Cleanup] channel <id>: reason=<reason> deletedKeys=3 removedFromActive=true
-[Cleanup] device <id>: reason=<reason> channelsAffected=<n> channelsCleaned=<n> devicesDeleted=<n>
+[Cleanup] device <id>: reason=<reason> queued=true channelsAffected=<n>
+[Cleanup] device <id>: completed=true channelsCleaned=<n>
 ```
 
 Reason values you may see:
@@ -737,7 +740,7 @@ The scan is one `kv.list` per `register` call, costing ~1 KV op per app launch. 
 - Copies per-channel `state:*` and `override:*` to the new device (new device takes precedence if it already has a value)
 - Writes the union of old + new channel lists to `device:{newId}:channels`
 - Copies old device's `settings` to the new device (new device takes precedence)
-- Calls `cleanupDeadDevice(oldId, env, 'migrated_to_new_device')` to clean up the old device's profile/settings/channels/state/override and its `fcm:lookup` entry
+- Calls `cleanupDeadDevice(oldId, env, 'migrated_to_new_device')` to remove the old profile/token index and queue bounded cleanup of its settings/channels/state/override records
 
 **Settings merge rule:** when both old and new devices have settings, the new device's settings are kept. Rationale: the user just installed the new version, so the latest settings (which may have been edited through the new version) are what they want.
 

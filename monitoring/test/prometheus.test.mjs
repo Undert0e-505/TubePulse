@@ -69,8 +69,8 @@ test('Prometheus exposition contains aggregate labels and excludes identifiers',
           publicationProjection: { rows: 72000, ratio: 72000 / 70000, exhaustionRisk: true },
           publicationMutations: {
             localMutations: 8, uniqueKeys: 6,
-            byFamily: { 'channel-recent-videos': 4 },
-            byReason: { 'metrics-only': 4 },
+            byFamily: { 'channel-recent-videos': 4, 'nag-ledger': 1 },
+            byReason: { 'metrics-only': 4, 'packed-nag-ledger': 1 },
           },
           requestTelemetry: {
             total: 50, acquireContention: 2,
@@ -139,7 +139,9 @@ test('Prometheus exposition contains aggregate labels and excludes identifiers',
   assert.match(metrics, /tubepulse_authority_d1_publication_exhaustion_risk 1/);
   assert.match(metrics, /tubepulse_authority_publication_mutations\{kind="local_mutations"\} 8/);
   assert.match(metrics, /tubepulse_authority_publication_mutations_by_family\{family="channel-recent-videos"\} 4/);
+  assert.match(metrics, /tubepulse_authority_publication_mutations_by_family\{family="nag-ledger"\} 1/);
   assert.match(metrics, /tubepulse_authority_publication_mutations_by_reason\{reason="metrics-only"\} 4/);
+  assert.match(metrics, /tubepulse_authority_publication_mutations_by_reason\{reason="packed-nag-ledger"\} 1/);
   assert.match(metrics, /# HELP tubepulse_live_watch_quota_units_used/);
   assert.match(metrics, /tubepulse_live_watch_quota_units_used 30/);
   assert.match(metrics, /tubepulse_live_watch_requests_total 30/);

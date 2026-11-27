@@ -8,12 +8,12 @@ const PUBLICATION_MUTATION_FAMILIES = [
   'channels-active', 'nag-active', 'upcoming-events', 'fcm-token-cache', 'prewarn-sent',
   'upcoming-legacy', 'channel-known-videos', 'channel-known-posts', 'channel-recent-posts',
   'channel-recent-videos', 'channel-meta', 'channel-post-first-poll', 'channel-subscribers',
-  'device-state', 'device-record', 'other',
+  'device-state', 'nag-ledger', 'device-record', 'other',
 ];
 const PUBLICATION_MUTATION_REASONS = [
   'cleanup', 'metrics-only', 'new-content-cache', 'post-metrics-only',
   'post-observation-metadata-only', 'community-content-cache', 'dedupe-watermark',
-  'notification-state', 'token-cache', 'channel-metadata', 'first-run-suppression', 'state',
+  'notification-state', 'packed-nag-ledger', 'token-cache', 'channel-metadata', 'first-run-suppression', 'state',
 ];
 const COORDINATOR_TELEMETRY_ROUTES = [
   '/status', '/acquire', '/release', '/commit', '/snapshot', '/activate', '/stale',
